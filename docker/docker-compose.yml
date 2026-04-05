@@ -1,0 +1,55 @@
+# docker/docker-compose.yml
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: evnx_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: evnx_dev
+      POSTGRES_USER: evnx
+      POSTGRES_PASSWORD: evnx_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evnx -d evnx_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: evnx_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass evnx_redis_dev
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --loglevel warning
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "evnx_redis_dev", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # LocalStack: local S3-compatible storage (no AWS account needed for dev)
+  localstack:
+    image: localstack/localstack:3
+    container_name: evnx_localstack
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3
+      DEFAULT_REGION: us-east-1
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./docker/localstack/init-s3.sh:/etc/localstack/init/ready.d/init-s3.sh
+
+volumes:
+  postgres_data:
+  redis_data:
+  localstack_data:
