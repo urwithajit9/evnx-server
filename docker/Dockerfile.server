@@ -1,0 +1,33 @@
+# docker/Dockerfile.server
+
+# ── Stage 1: Build ───────────────────────────────────────────────────────────
+FROM rust:1.76-slim AS builder
+
+WORKDIR /app
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+
+# Cache dependencies: copy manifests first, build with stubs, then copy source
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+RUN cargo build --release && rm -rf src
+
+# Build real source
+COPY . .
+ENV SQLX_OFFLINE=true
+RUN touch src/main.rs && cargo build --release
+
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS production
+
+RUN apt-get update && apt-get install -y ca-certificates libssl3 curl && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/evnx-server /usr/local/bin/evnx-server
+
+RUN useradd -r -s /bin/false evnx
+USER evnx
+
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+  CMD curl -f http://localhost:8080/health || exit 1
+
+CMD ["evnx-server"]

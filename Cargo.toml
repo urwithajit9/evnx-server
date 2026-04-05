@@ -38,6 +38,48 @@ anyhow    = "1"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# Auth & validation
+validator   = { version = "0.16", features = ["derive"] }
+blake3      = "1"       # for hashing tokens and IPs
+hex         = "0.4"     # encode/decode hex strings (SRP values are hex)
+base64ct    = { version = "1", features = ["alloc"] }
+
+# Redis
+redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
+
+# SRP server-side (evnx-server runs the server half)
+srp  = "0.6"
+sha2 = "0.10"
+
+
+# JWT
+jsonwebtoken = "9"
+
+# TOTP
+totp-rs = { version = "5", features = ["qr"] }
+
+# Axum extras for header extraction
+axum-extra = { version = "0.9", features = ["typed-header"] }
+headers    = "0.4"
+
+# evnx-crypto (for type reuse — CryptoError, etc.)
+# evnx-crypto = { git = "https://github.com/urwithajit9/evnx-crypto", tag = "v0.1.0" }
+# For local development, use the path dependency to avoid needing to publish evnx-crypto to crates.io or tag a git release every time we make a change:
+evnx-crypto = { path = "../evnx-crypto" }
+rand = "0.10.0"
+
+# AWS SDK (S3 only — don't pull the full SDK)
+aws-sdk-s3         = "1"
+aws-config         = { version = "1", features = ["behavior-version-latest"] }
+aws-credential-types = "1"
+
+# HTTP client for Resend
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+
+# Streaming response body
+tokio-util = { version = "0.7", features = ["io"] }
+bytes      = "1"
+
 [dev-dependencies]
 # Testing HTTP endpoints without running a real server
 axum-test = "14"

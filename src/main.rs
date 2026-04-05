@@ -1,19 +1,22 @@
 // src/main.rs
 
-use axum::{Router, routing::get};
+use axum::Router;
 use std::net::SocketAddr;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 mod config;
-mod errors;
-mod state;
-mod routes;
-mod middleware;
-mod services;
 mod db;
+mod errors;
+mod middleware;
+mod routes;
+mod services;
+mod state;
 
-use state::AppState;
 use config::Config;
+use state::AppState;
+
+use crate::services::jwt::JwtService;
 
 #[tokio::main]
 async fn main() {
@@ -22,7 +25,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_env("RUST_LOG")
-                .add_directive("evnx_server=info".parse().unwrap())
+                .add_directive("evnx_server=info".parse().unwrap()),
         )
         .init();
 
@@ -49,6 +52,20 @@ async fn main() {
 
     tracing::info!("✓ Database connected");
 
+    let redis_client = redis::Client::open(config.redis_url.as_str()).unwrap_or_else(|e| {
+        tracing::error!("Failed to create Redis client: {}", e);
+        std::process::exit(1);
+    });
+
+    let redis = redis::aio::ConnectionManager::new(redis_client)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to connect to Redis: {}", e);
+            std::process::exit(1);
+        });
+
+    tracing::info!("✓ Redis connected");
+
     // Step 4: Run pending migrations automatically on startup.
     // Safe to run repeatedly — sqlx tracks what's been applied.
     sqlx::migrate!("./migrations")
@@ -60,9 +77,19 @@ async fn main() {
         });
 
     tracing::info!("✓ Migrations applied");
+    let jwt = JwtService::new(&config.jwt_secret, config.jwt_expiry_minutes);
+
+    let storage = StorageService::new(
+        &config.aws_access_key_id,
+        &config.aws_secret_access_key,
+        &config.s3_region,
+        config.s3_bucket.clone(),
+        config.s3_endpoint.as_deref(),
+    )
+    .await;
 
     // Step 5: Build shared application state.
-    let state = AppState::new(db, config.clone());
+    let state = AppState::new(db, cache, redis, config.clone(), jwt, storage);
 
     // Step 6: Build the router.
     let app = build_router(state);
@@ -74,7 +101,8 @@ async fn main() {
 
     tracing::info!("✓ Listening on http://{}", addr);
 
-    let listener = tokio::net::TcpListener::bind(addr).await
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
         .unwrap_or_else(|e| {
             tracing::error!("Failed to bind to {}: {}", addr, e);
             std::process::exit(1);
@@ -86,15 +114,25 @@ async fn main() {
         .unwrap();
 }
 
+// fn build_router(state: AppState) -> Router {
+//     Router::new()
+//         // Health check — no auth required
+//         .route("/health", get(health_check))
+//         // All API routes (added week by week)
+//         .nest("/api/v1", Router::new())
+//         // Request tracing — logs every request and response status
+//         .layer(TraceLayer::new_for_http())
+//         .with_state(state)
+// }
+
 fn build_router(state: AppState) -> Router {
-    Router::new()
-        // Health check — no auth required
-        .route("/health", get(health_check))
-        // All API routes (added week by week)
-        .nest("/api/v1", Router::new())
+    // Reject oversized request bodies before parsing (protect against memory exhaustion)
+    routes::create_router(state)
+        .layer(RequestBodyLimitLayer::new(
+            (state.config.max_request_size_kb * 1024) as usize,
+        ))
         // Request tracing — logs every request and response status
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
 }
 
 /// Health check endpoint.
@@ -113,7 +151,9 @@ async fn health_check() -> axum::Json<serde_json::Value> {
 /// Axum will stop accepting new requests and wait for in-flight requests to finish.
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c().await.expect("Failed to install Ctrl+C handler");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
     };
 
     #[cfg(unix)]

@@ -55,9 +55,9 @@ pub enum Environment {
 impl Environment {
     fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
-            "staging"    => Self::Staging,
+            "staging" => Self::Staging,
             "production" => Self::Production,
-            _            => Self::Development,
+            _ => Self::Development,
         }
     }
 }
@@ -93,18 +93,20 @@ impl Config {
         }
 
         let database_url = require!("DATABASE_URL");
-        let redis_url    = require!("REDIS_URL");
-        let jwt_secret   = require!("JWT_SECRET");
+        let redis_url = require!("REDIS_URL");
+        let jwt_secret = require!("JWT_SECRET");
         let frontend_url = require!("FRONTEND_URL");
         let resend_api_key = require!("RESEND_API_KEY");
-        let email_from   = require!("EMAIL_FROM");
-        let s3_bucket    = require!("S3_BUCKET");
-        let s3_region    = require!("S3_REGION");
-        let aws_access_key_id     = require!("AWS_ACCESS_KEY_ID");
+        let email_from = require!("EMAIL_FROM");
+        let s3_bucket = require!("S3_BUCKET");
+        let s3_region = require!("S3_REGION");
+        let aws_access_key_id = require!("AWS_ACCESS_KEY_ID");
         let aws_secret_access_key = require!("AWS_SECRET_ACCESS_KEY");
 
         if !missing.is_empty() {
-            return Err(ConfigError::MissingVariables(missing.iter().map(|s| s.to_string()).collect()));
+            return Err(ConfigError::MissingVariables(
+                missing.iter().map(|s| s.to_string()).collect(),
+            ));
         }
 
         Ok(Config {
@@ -113,11 +115,14 @@ impl Config {
             environment: Environment::from_str(&optional!("ENVIRONMENT", "development")),
             database_url,
             database_max_connections: optional!("DATABASE_MAX_CONNECTIONS", "20")
-                .parse().unwrap_or(20),
+                .parse()
+                .unwrap_or(20),
             redis_url,
             jwt_secret,
             jwt_expiry_minutes: optional!("JWT_EXPIRY_MINUTES", "15").parse().unwrap_or(15),
-            refresh_token_expiry_days: optional!("REFRESH_TOKEN_EXPIRY_DAYS", "30").parse().unwrap_or(30),
+            refresh_token_expiry_days: optional!("REFRESH_TOKEN_EXPIRY_DAYS", "30")
+                .parse()
+                .unwrap_or(30),
             frontend_url,
             resend_api_key,
             email_from,

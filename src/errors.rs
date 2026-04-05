@@ -79,20 +79,52 @@ impl IntoResponse for AppError {
         }
 
         let (status, code, message) = match self {
-            AppError::Unauthorized        => (StatusCode::UNAUTHORIZED,          "UNAUTHORIZED",        "Authentication failed".to_string()),
-            AppError::EmailNotVerified    => (StatusCode::FORBIDDEN,             "EMAIL_NOT_VERIFIED",  "Please verify your email first".to_string()),
-            AppError::AccountLocked       => (StatusCode::LOCKED,                "LOCKED",              "Account temporarily locked".to_string()),
-            AppError::Forbidden           => (StatusCode::FORBIDDEN,             "FORBIDDEN",           "Insufficient permissions".to_string()),
-            AppError::NotFound            => (StatusCode::NOT_FOUND,             "NOT_FOUND",           "Resource not found".to_string()),
-            AppError::Conflict(msg)       => (StatusCode::CONFLICT,              "CONFLICT",            msg),
-            AppError::Validation(msg)     => (StatusCode::UNPROCESSABLE_ENTITY,  "VALIDATION_ERROR",    msg),
-            AppError::RateLimited { retry_after_seconds } => (
+            AppError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "UNAUTHORIZED",
+                "Authentication failed".to_string(),
+            ),
+            AppError::EmailNotVerified => (
+                StatusCode::FORBIDDEN,
+                "EMAIL_NOT_VERIFIED",
+                "Please verify your email first".to_string(),
+            ),
+            AppError::AccountLocked => (
+                StatusCode::LOCKED,
+                "LOCKED",
+                "Account temporarily locked".to_string(),
+            ),
+            AppError::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "FORBIDDEN",
+                "Insufficient permissions".to_string(),
+            ),
+            AppError::NotFound => (
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                "Resource not found".to_string(),
+            ),
+            AppError::Conflict(msg) => (StatusCode::CONFLICT, "CONFLICT", msg),
+            AppError::Validation(msg) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "VALIDATION_ERROR", msg)
+            }
+            AppError::RateLimited {
+                retry_after_seconds,
+            } => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "RATE_LIMITED",
                 format!("Too many requests. Try again in {retry_after_seconds} seconds."),
             ),
-            AppError::Database(_)  => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "An internal error occurred".to_string()),
-            AppError::Internal(_)  => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "An internal error occurred".to_string()),
+            AppError::Database(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "An internal error occurred".to_string(),
+            ),
+            AppError::Internal(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "An internal error occurred".to_string(),
+            ),
         };
 
         (status, Json(json!({ "error": message, "code": code }))).into_response()
