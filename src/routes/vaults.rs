@@ -9,7 +9,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use crate::{
-    db::{members, users as db_users, vaults},
+    db::{members, vaults},
     errors::AppError,
     services::jwt::Claims,
     state::AppState,

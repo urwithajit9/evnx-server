@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::{
     db::{vaults, versions},
     errors::AppError,
-    services::{audit::AuditService, jwt::Claims},
+    services::jwt::Claims,
     state::AppState,
 };
 
@@ -237,4 +237,35 @@ pub async fn download_blob(
 fn base64_decode(s: &str) -> Result<Vec<u8>, base64ct::Error> {
     use base64ct::{Base64, Encoding};
     Base64::decode_vec(s)
+}
+
+pub async fn list_versions(
+    State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<Claims>,
+    Path(vault_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
+
+    vaults::find_member_role(&state.db, vault_id, user_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    let versions = versions::list(&state.db, vault_id).await?;
+
+    let list: Vec<serde_json::Value> = versions
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "version_num":     v.version_num,
+                "blob_hash":       v.blob_hash,
+                "key_count":       v.key_count,
+                "key_names":       v.key_names,
+                "blob_size_bytes": v.blob_size_bytes,
+                "pushed_by":       v.pushed_by,
+                "pushed_at":       v.pushed_at,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "versions": list })))
 }

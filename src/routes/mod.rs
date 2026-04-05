@@ -1,6 +1,6 @@
 // src/routes/mod.rs
 
-use crate::{middleware::auth, state::AppState};
+use crate::state::AppState;
 use axum::http::{HeaderName, Method};
 use axum::{
     middleware,
@@ -9,12 +9,13 @@ use axum::{
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-// pub mod auth;
+pub mod auth;
 pub mod members;
 pub mod tokens;
 pub mod users;
 pub mod vaults;
 pub mod versions;
+use crate::middleware::auth::{require_auth, require_verified};
 
 pub fn create_router(state: AppState) -> Router {
     let allowed_origin = state
@@ -48,10 +49,18 @@ pub fn create_router(state: AppState) -> Router {
             "/:vault_id/members/:user_id",
             delete(members::remove_member),
         )
-        // Week 7: .route("/:vault_id/versions", get(...).post(...))
+        .route(
+            "/:vault_id/versions",
+            get(versions::list_versions).post(versions::push_version),
+        )
+        .route(
+            "/:vault_id/versions/latest",
+            get(versions::get_latest_version),
+        )
+        .route("/:vault_id/versions/:n/blob", get(versions::download_blob))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            auth::require_verified,
+            require_verified,
         ));
 
     // Auth routes — mostly public
@@ -65,11 +74,19 @@ pub fn create_router(state: AppState) -> Router {
         // Protected auth routes
         .route("/logout", post(auth::logout))
         .route("/totp/setup", post(auth::totp_setup))
-        .route("/totp/confirm", post(auth::totp_confirm));
+        .route("/totp/confirm", post(auth::totp_confirm))
+        .route("/me", get(auth::me));
 
     Router::new()
         .route("/health", get(crate::health_check))
         .nest("/api/v1/auth", auth_routes)
         .nest("/api/v1/vaults", vault_routes)
+        .nest(
+            "/api/v1/users",
+            Router::new()
+                .route("/:email/public-key", get(users::get_public_key))
+                .route_layer(middleware::from_fn_with_state(state.clone(), require_auth)),
+        )
+        .layer(cors)// CORS middleware applied to all routes
         .with_state(state)
 }

@@ -2,7 +2,8 @@
 
 use crate::config::Config;
 use crate::services::cache::CacheService;
-use crate::services::storage;
+use crate::services::jwt::JwtService;
+use crate::services::storage::StorageService;
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -45,11 +46,11 @@ impl AppState {
     ) -> Self {
         Self {
             db,
-            cache: CacheService::new(redis.clone()),
+            cache,
             redis,
             config: Arc::new(config),
-            jwt,
-            storage,
+            jwt: Arc::new(jwt),
+            storage: Arc::new(storage),
         }
     }
 }

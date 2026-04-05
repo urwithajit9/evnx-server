@@ -16,7 +16,9 @@ mod state;
 use config::Config;
 use state::AppState;
 
+use crate::services::cache::CacheService;
 use crate::services::jwt::JwtService;
+use crate::services::storage::StorageService;
 
 #[tokio::main]
 async fn main() {
@@ -88,6 +90,8 @@ async fn main() {
     )
     .await;
 
+    let cache = CacheService::new(redis.clone());
+
     // Step 5: Build shared application state.
     let state = AppState::new(db, cache, redis, config.clone(), jwt, storage);
 
@@ -126,11 +130,11 @@ async fn main() {
 // }
 
 fn build_router(state: AppState) -> Router {
+    // Extract config value BEFORE moving state
+    let request_size_limit = (state.config.max_request_size_kb * 1024) as usize;
     // Reject oversized request bodies before parsing (protect against memory exhaustion)
     routes::create_router(state)
-        .layer(RequestBodyLimitLayer::new(
-            (state.config.max_request_size_kb * 1024) as usize,
-        ))
+        .layer(RequestBodyLimitLayer::new(request_size_limit))
         // Request tracing — logs every request and response status
         .layer(TraceLayer::new_for_http())
 }

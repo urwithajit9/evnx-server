@@ -2,4 +2,5 @@
 pub mod audit;
 pub mod cache;
 pub mod email;
+pub mod jwt;
 pub mod storage;

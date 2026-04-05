@@ -13,6 +13,7 @@ pub struct CreateUser {
     pub srp_salt: String,
     pub argon2_salt: String,
     pub ed25519_public_key: String,
+    pub x25519_public_key: String,
     pub encrypted_private_key: String,
 }
 
@@ -42,6 +43,39 @@ pub struct SrpUserData {
     pub totp_enabled: bool,
 }
 
+// Add to src/db/users.rs
+
+pub struct UserPublicProfile {
+    pub id: Uuid,
+    pub email: String,
+    pub email_verified: bool,
+    pub x25519_public_key: String,
+    pub ed25519_public_key: String,
+}
+
+pub async fn find_by_email(
+    pool: &PgPool,
+    email: &str,
+) -> Result<Option<UserPublicProfile>, sqlx::Error> {
+    sqlx::query_as!(
+        UserPublicProfile,
+        r#"
+        SELECT id, email, email_verified,
+            ed25519_public_key AS "ed25519_public_key!",
+            x25519_public_key AS "x25519_public_key!"  -- ✅ Select the actual x25519 column
+        FROM users
+        WHERE email = $1 AND is_active = true
+        "#,
+        // NOTE: we store ed25519_public_key in the users table.
+        // x25519_public_key is derived from ed25519 seed — but for sharing,
+        // we need the x25519 public key which must ALSO be stored separately.
+        // See 2.2 below.
+        email,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
 /// Check if an email is already registered.
 pub async fn exists_by_email(pool: &PgPool, email: &str) -> Result<bool, sqlx::Error> {
     let row = sqlx::query!(
@@ -59,8 +93,8 @@ pub async fn create(pool: &PgPool, input: CreateUser) -> Result<Uuid, sqlx::Erro
         r#"
         INSERT INTO users (
             id, email, srp_verifier, srp_salt, argon2_salt,
-            ed25519_public_key, encrypted_private_key, email_verified
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, false)
+            ed25519_public_key, x25519_public_key, encrypted_private_key, email_verified
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false)
         "#,
         input.id,
         input.email,
@@ -68,7 +102,8 @@ pub async fn create(pool: &PgPool, input: CreateUser) -> Result<Uuid, sqlx::Erro
         input.srp_salt,
         input.argon2_salt,
         input.ed25519_public_key,
-        input.encrypted_private_key,
+        input.x25519_public_key,
+        input.encrypted_private_key, // Now correctly mapped to $8
     )
     .execute(pool)
     .await?;
