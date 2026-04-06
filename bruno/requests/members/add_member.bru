@@ -1,0 +1,30 @@
+meta {
+  name: Add Vault Member
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{base_url}}/api/v1/vaults/{{vault_id}}/members
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+body:json {
+  {
+    "user_email": "collab@evnx.dev",
+    "role": "developer",
+    "encrypted_vault_key": "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE",
+    "eph_pub_key": "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+  }
+}
+
+tests {
+  test("status is 201 or 404 (collab not registered)", function() {
+    expect([201, 404]).to.include(res.getStatus());
+  });
+}

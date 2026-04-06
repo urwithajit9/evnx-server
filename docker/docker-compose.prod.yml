@@ -1,0 +1,54 @@
+# docker/docker-compose.prod.yml — updated
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    # ... (unchanged) ...
+
+  redis:
+    image: redis:7-alpine
+    # ... (unchanged) ...
+
+  migrator:
+    image: ghcr.io/urwithajit9/evnx-server:latest
+    container_name: evnx_migrator
+    command: ["/usr/local/bin/evnx-server", "migrate"]
+    # Note: your binary needs a "migrate" subcommand, OR use a separate sqlx-cli image:
+    # image: ghcr.io/launchbadge/sqlx-cli:latest
+    # command: ["sqlx", "migrate", "run"]
+    env_file: .env.prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+
+  server:
+    image: ghcr.io/urwithajit9/evnx-server:latest
+    container_name: evnx_server
+    restart: unless-stopped
+    env_file: .env.prod
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+networks:
+  backend:
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres_data:
+  redis_data:

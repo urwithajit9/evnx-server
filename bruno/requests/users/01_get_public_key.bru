@@ -1,0 +1,25 @@
+meta {
+  name: Get User Public Key (for vault sharing)
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/api/v1/users/{{test_email}}/public-key
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+
+  test("x25519_public_key in response", function() {
+    expect(res.getBody()).to.have.property("x25519_public_key");
+  });
+}

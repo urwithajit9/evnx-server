@@ -1,0 +1,25 @@
+meta {
+  name: List Tokens
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{base_url}}/api/v1/auth/tokens
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+
+  test("tokens array in response", function() {
+    expect(res.getBody()).to.have.property("tokens");
+  });
+}

@@ -1,0 +1,21 @@
+meta {
+  name: Use Revoked Token (expect 401)
+  type: http
+  seq: 11
+}
+
+get {
+  url: {{base_url}}/api/v1/vaults
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("revoked token returns 401", function() {
+    expect(res.getStatus()).to.equal(401);
+  });
+}

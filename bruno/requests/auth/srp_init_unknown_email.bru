@@ -1,0 +1,30 @@
+meta {
+  name: SRP Init - Unknown Email (same response shape)
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{base_url}}/api/v1/auth/srp/init
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "email": "nobody@example.com",
+    "client_public": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}
+
+tests {
+  test("status is 200 even for unknown email (no user enumeration)", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+
+  test("response has same shape as known email", function() {
+    expect(res.getBody()).to.have.property("session_id");
+    expect(res.getBody()).to.have.property("server_public");
+    expect(res.getBody()).to.have.property("srp_salt");
+  });
+}

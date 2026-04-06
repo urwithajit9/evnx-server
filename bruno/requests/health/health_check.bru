@@ -1,0 +1,25 @@
+meta {
+  name: Health Check
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/health
+  body: none
+  auth: none
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+
+  test("status field is ok", function() {
+    expect(res.getBody().status).to.equal("ok");
+  });
+
+  test("version field exists", function() {
+    expect(res.getBody()).to.have.property("version");
+  });
+}

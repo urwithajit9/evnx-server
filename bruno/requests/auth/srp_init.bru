@@ -1,0 +1,38 @@
+meta {
+  name: SRP Init
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{base_url}}/api/v1/auth/srp/init
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "email": "test@evnx.dev",
+    "client_public": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}
+
+script:post-response {
+  if (res.getStatus() === 200) {
+    bru.setVar("session_id", res.getBody().session_id);
+    bru.setVar("srp_salt", res.getBody().srp_salt);
+    bru.setVar("server_public", res.getBody().server_public);
+  }
+}
+
+tests {
+  test("Status is 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+  test("Response has session_id", function() {
+    expect(res.getBody()).to.have.property("session_id");
+  });
+  test("Response has server_public", function() {
+    expect(res.getBody()).to.have.property("server_public");
+  });
+}

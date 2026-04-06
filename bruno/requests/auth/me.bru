@@ -1,0 +1,32 @@
+meta {
+  name: Get My Profile
+  type: http
+  seq: 9
+}
+
+get {
+  url: {{base_url}}/api/v1/auth/me
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("status is 200 or 401", function() {
+    expect([200, 401]).to.include(res.getStatus());
+  });
+
+  test("if 200 - has required fields", function() {
+    if (res.getStatus() === 200) {
+      var body = res.getBody();
+      expect(body).to.have.property("user_id");
+      expect(body).to.have.property("email");
+      expect(body).to.have.property("email_verified");
+      expect(body).to.have.property("encrypted_private_key");
+      expect(body).to.have.property("argon2_salt");
+    }
+  });
+}

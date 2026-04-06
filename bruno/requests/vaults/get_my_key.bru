@@ -1,0 +1,29 @@
+meta {
+  name: Get My Vault Key
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{base_url}}/api/v1/vaults/{{vault_id}}/my-key
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+
+  test("encrypted_vault_key in response", function() {
+    expect(res.getBody()).to.have.property("encrypted_vault_key");
+  });
+
+  test("eph_pub_key in response", function() {
+    expect(res.getBody()).to.have.property("eph_pub_key");
+  });
+}

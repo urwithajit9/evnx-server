@@ -81,7 +81,16 @@ async fn main() {
     tracing::info!("✓ Migrations applied");
     let jwt = JwtService::new(&config.jwt_secret, config.jwt_expiry_minutes);
 
-    let storage = StorageService::new(
+    // let storage = StorageService::new(
+    //     &config.aws_access_key_id,
+    //     &config.aws_secret_access_key,
+    //     &config.s3_region,
+    //     config.s3_bucket.clone(),
+    //     config.s3_endpoint.as_deref(),
+    // )
+    // .await;
+
+    let storage = StorageService::from_config(
         &config.aws_access_key_id,
         &config.aws_secret_access_key,
         &config.s3_region,
@@ -89,6 +98,12 @@ async fn main() {
         config.s3_endpoint.as_deref(),
     )
     .await;
+
+    tracing::info!(
+        provider = storage.provider_name(),
+        bucket = %config.s3_bucket,
+        "✓ Object storage configured"
+    );
 
     let cache = CacheService::new(redis.clone());
 

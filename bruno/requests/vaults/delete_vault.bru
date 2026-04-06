@@ -1,0 +1,21 @@
+meta {
+  name: Delete Vault
+  type: http
+  seq: 5
+}
+
+delete {
+  url: {{base_url}}/api/v1/vaults/{{vault_id}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("status is 204", function() {
+    expect(res.getStatus()).to.equal(204);
+  });
+}

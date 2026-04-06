@@ -1,0 +1,187 @@
+### ──────────────────────────────────────────────────────────────────────────
+### evnx-server API Tests
+### VS Code: Install "REST Client" extension, then click "Send Request" above each ###
+### ──────────────────────────────────────────────────────────────────────────
+
+@base_url = http://localhost:8080
+@test_email = test@evnx.dev
+
+### ── Health ────────────────────────────────────────────────────────────────
+
+### Health Check
+GET {{base_url}}/health
+
+### ── Authentication ─────────────────────────────────────────────────────────
+
+### Register (use real evnx-crypto output for production)
+POST {{base_url}}/api/v1/auth/register
+Content-Type: application/json
+
+{
+  "email": "{{test_email}}",
+  "srp_verifier": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "srp_salt": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  "argon2_salt": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+  "ed25519_public_key": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+  "x25519_public_key": "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+  "encrypted_private_key": "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
+}
+
+### Duplicate email → 409
+POST {{base_url}}/api/v1/auth/register
+Content-Type: application/json
+
+{
+  "email": "{{test_email}}",
+  "srp_verifier": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "srp_salt": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  "argon2_salt": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+  "ed25519_public_key": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+  "x25519_public_key": "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+  "encrypted_private_key": "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
+}
+
+### SRP Init — login step 1
+POST {{base_url}}/api/v1/auth/srp/init
+Content-Type: application/json
+
+{
+  "email": "{{test_email}}",
+  "client_public": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}
+
+### SRP Init — unknown email (same shape expected, no user enumeration)
+POST {{base_url}}/api/v1/auth/srp/init
+Content-Type: application/json
+
+{
+  "email": "nobody@doesnotexist.com",
+  "client_public": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}
+
+### SRP Verify — paste real session_id from srp/init response
+# Replace SESSION_ID with the actual UUID from srp/init response
+# This will return 401 with fake proof — use CLI for real login
+POST {{base_url}}/api/v1/auth/srp/verify
+Content-Type: application/json
+
+{
+  "session_id": "SESSION_ID_FROM_INIT_RESPONSE",
+  "client_proof": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}
+
+### Get Profile (requires valid JWT — paste from evnx auth login output)
+# Replace YOUR_JWT_TOKEN with real token from: evnx auth login
+GET {{base_url}}/api/v1/auth/me
+Authorization: Bearer YOUR_JWT_TOKEN
+
+### Refresh Token
+POST {{base_url}}/api/v1/auth/refresh
+Content-Type: application/json
+
+{
+  "refresh_token": "YOUR_REFRESH_TOKEN"
+}
+
+### Logout
+POST {{base_url}}/api/v1/auth/logout
+Authorization: Bearer YOUR_JWT_TOKEN
+
+### ── TOTP ──────────────────────────────────────────────────────────────────
+
+### TOTP Setup (requires valid JWT)
+POST {{base_url}}/api/v1/auth/totp/setup
+Authorization: Bearer YOUR_JWT_TOKEN
+
+### TOTP Confirm (use code from authenticator app after scanning QR)
+POST {{base_url}}/api/v1/auth/totp/confirm
+Authorization: Bearer YOUR_JWT_TOKEN
+Content-Type: application/json
+
+{
+  "totp_code": "123456"
+}
+
+### ── Vaults ─────────────────────────────────────────────────────────────────
+
+### List Vaults
+GET {{base_url}}/api/v1/vaults
+Authorization: Bearer YOUR_JWT_TOKEN
+
+### List Vaults — No Auth → 401
+GET {{base_url}}/api/v1/vaults
+
+### Create Vault
+POST {{base_url}}/api/v1/vaults
+Authorization: Bearer YOUR_JWT_TOKEN
+Content-Type: application/json
+
+{
+  "name": "myapp",
+  "environment": "production",
+  "encrypted_vault_key": "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE",
+  "eph_pub_key": "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+}
+
+### Get My Vault Key — replace VAULT_ID
+GET {{base_url}}/api/v1/vaults/VAULT_ID/my-key
+Authorization: Bearer YOUR_JWT_TOKEN
+
+### Delete Vault — replace VAULT_ID
+DELETE {{base_url}}/api/v1/vaults/VAULT_ID
+Authorization: Bearer YOUR_JWT_TOKEN
+
+### ── Versions ────────────────────────────────────────────────────────────────
+
+### Push Version — replace VAULT_ID
+POST {{base_url}}/api/v1/vaults/VAULT_ID/versions
+Authorization: Bearer YOUR_JWT_TOKEN
+Content-Type: application/json
+
+{
+  "nonce": "AAAAAAAAAAAAAAAAAAAAAAAA",
+  "ciphertext": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+  "blob_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "key_names": ["DATABASE_URL", "API_KEY", "DEBUG"],
+  "key_count": 3,
+  "base_version": 0
+}
+
+### List Versions — replace VAULT_ID
+GET {{base_url}}/api/v1/vaults/VAULT_ID/versions
+Authorization: Bearer YOUR_JWT_TOKEN
+
+### Get Latest Version — replace VAULT_ID
+GET {{base_url}}/api/v1/vaults/VAULT_ID/versions/latest
+Authorization: Bearer YOUR_JWT_TOKEN
+
+### ── API Tokens ──────────────────────────────────────────────────────────────
+
+### List API Tokens
+GET {{base_url}}/api/v1/auth/tokens
+Authorization: Bearer YOUR_JWT_TOKEN
+
+### Create API Token
+POST {{base_url}}/api/v1/auth/tokens
+Authorization: Bearer YOUR_JWT_TOKEN
+Content-Type: application/json
+
+{
+  "name": "ci-github-actions",
+  "scope": "read",
+  "expires_in_days": 90
+}
+
+### Revoke API Token — replace TOKEN_ID
+DELETE {{base_url}}/api/v1/auth/tokens/TOKEN_ID
+Authorization: Bearer YOUR_JWT_TOKEN
+
+### Use API Token (evnx_tok_...) to list vaults
+GET {{base_url}}/api/v1/vaults
+Authorization: Bearer evnx_tok_YOUR_RAW_TOKEN
+
+### ── Users ───────────────────────────────────────────────────────────────────
+
+### Get Public Key for Vault Sharing
+GET {{base_url}}/api/v1/users/test@evnx.dev/public-key
+Authorization: Bearer YOUR_JWT_TOKEN

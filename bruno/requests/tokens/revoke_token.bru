@@ -1,0 +1,21 @@
+meta {
+  name: Revoke Token
+  type: http
+  seq: 4
+}
+
+delete {
+  url: {{base_url}}/api/v1/auth/tokens/{{api_token_id}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("status is 204", function() {
+    expect(res.getStatus()).to.equal(204);
+  });
+}

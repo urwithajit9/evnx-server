@@ -1,0 +1,26 @@
+meta {
+  name: List Vaults
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{base_url}}/api/v1/vaults
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+
+  test("vaults array in response", function() {
+    expect(res.getBody()).to.have.property("vaults");
+    expect(res.getBody().vaults).to.be.an("array");
+  });
+}

@@ -1,0 +1,185 @@
+# .github/workflows/deploy.yml
+
+name: CI/CD — Test, Build, Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}    # urwithajit9/evnx-server
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: true                      # Use cached queries — no live DB needed in CI
+
+jobs:
+  # ─── Job 1: Test ──────────────────────────────────────────────────────────
+  test:
+    name: Test & Lint
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: evnx_test
+          POSTGRES_USER: evnx
+          POSTGRES_PASSWORD: test_password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy (zero warnings)
+        run: cargo clippy -- -D warnings
+
+      - name: Run tests
+        env:
+          DATABASE_URL: postgresql://evnx:test_password@localhost:5432/evnx_test
+          REDIS_URL: redis://localhost:6379/0
+          SQLX_OFFLINE: true
+        run: cargo test --all
+
+      - name: Security audit
+        run: |
+          cargo install cargo-audit --quiet
+          cargo audit
+
+  # ─── Job 2: Build & Push Docker Image ────────────────────────────────────
+  build:
+    name: Build & Push Image
+    needs: test
+    runs-on: ubuntu-latest
+    # Only build on push to main (not on PRs)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      packages: write    # Required to push to ghcr.io
+
+    outputs:
+      image_digest: ${{ steps.build.outputs.digest }}
+      image_tag: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.server
+          target: production
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            SQLX_OFFLINE=true
+
+  # ─── Job 3: Deploy to Hetzner ────────────────────────────────────────────
+  deploy:
+    name: Deploy to Hetzner
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    environment:
+      name: production
+      url: https://api.evnx.dev
+
+    steps:
+      - name: Checkout (for docker-compose file)
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: deploy
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          port: 22
+          script: |
+            set -euo pipefail
+            cd ~/evnx-server
+
+            echo "📦 Pulling latest image..."
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker pull ghcr.io/${{ github.repository }}:${{ needs.build.outputs.image_digest || 'latest' }}
+
+            echo "🔄 Updating image tag in compose..."
+            # Update the image tag in the prod compose file
+            export EVNX_IMAGE=ghcr.io/${{ github.repository }}:latest
+
+            echo "📊 Running database migrations..."
+            docker compose -f docker-compose.prod.yml run --rm migrator
+
+            echo "🚀 Rolling restart (zero downtime)..."
+            docker compose -f docker-compose.prod.yml up -d --no-deps --wait server
+
+            echo "🏥 Health check..."
+            sleep 5
+            curl -sf https://api.evnx.dev/health || (echo "Health check FAILED" && exit 1)
+
+            echo "🧹 Removing old images..."
+            docker image prune -f
+
+            echo "✓ Deployment complete"
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "Deployment FAILED for commit ${{ github.sha }}"
+          # Add Slack/Discord webhook here if needed

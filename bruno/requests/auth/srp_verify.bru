@@ -1,0 +1,39 @@
+meta {
+  name: SRP Verify (Login Step 2)
+  type: http
+  seq: 7
+}
+
+post {
+  url: {{base_url}}/api/v1/auth/srp/verify
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "session_id": "{{session_id}}",
+    "client_proof": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}
+
+script:post-response {
+  if (res.getStatus() === 200) {
+    var body = res.getBody();
+    if (body.access_token) {
+      bru.setVar("access_token", body.access_token);
+    }
+    if (body.refresh_token) {
+      bru.setVar("refresh_token", body.refresh_token);
+    }
+  }
+}
+
+tests {
+  test("status is 200 or 401", function() {
+    // With fake proof this will be 401 — that's correct behavior
+    // With real CLI-generated proof from evnx auth login, this will be 200
+    var status = res.getStatus();
+    expect([200, 401]).to.include(status);
+  });
+}

@@ -1,0 +1,44 @@
+meta {
+  name: Create Vault
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{base_url}}/api/v1/vaults
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+body:json {
+  {
+    "name": "myapp",
+    "environment": "production",
+    "encrypted_vault_key": "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE",
+    "eph_pub_key": "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+  }
+}
+
+script:post-response {
+  if (res.getStatus() === 201) {
+    bru.setVar("vault_id", res.getBody().vault_id);
+  }
+}
+
+tests {
+  test("status is 201", function() {
+    expect(res.getStatus()).to.equal(201);
+  });
+
+  test("vault_id in response", function() {
+    expect(res.getBody()).to.have.property("vault_id");
+  });
+
+  test("name matches", function() {
+    expect(res.getBody().name).to.equal("myapp");
+  });
+}

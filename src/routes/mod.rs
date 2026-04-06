@@ -87,6 +87,6 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/:email/public-key", get(users::get_public_key))
                 .route_layer(middleware::from_fn_with_state(state.clone(), require_auth)),
         )
-        .layer(cors)// CORS middleware applied to all routes
+        .layer(cors) // CORS middleware applied to all routes
         .with_state(state)
 }

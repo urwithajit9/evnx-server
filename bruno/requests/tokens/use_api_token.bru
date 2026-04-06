@@ -1,0 +1,21 @@
+meta {
+  name: List Vaults Using API Token
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{base_url}}/api/v1/vaults
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{raw_api_token}}
+}
+
+tests {
+  test("API token works for listing vaults", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+}
