@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, email, email_verified,\n            ed25519_public_key AS \"ed25519_public_key!\",\n            x25519_public_key AS \"x25519_public_key!\"  -- ✅ Select the actual x25519 column\n        FROM users\n        WHERE email = $1 AND is_active = true\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "email",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "email_verified",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 3,
+        "name": "ed25519_public_key!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "x25519_public_key!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "93eb9e2aa9986b2e3b1b3bf68fc9194a74ebbffb35261a3b0aabb0ed2b338934"
+}

@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            v.id, v.name, v.environment, v.owner_id,\n            vm.role,\n            COUNT(vv.id)::BIGINT AS \"version_count!\",\n            v.updated_at\n        FROM vaults v\n        JOIN vault_members vm ON vm.vault_id = v.id AND vm.user_id = $1\n        LEFT JOIN vault_versions vv ON vv.vault_id = v.id\n        WHERE v.deleted_at IS NULL\n        GROUP BY v.id, vm.role\n        ORDER BY v.updated_at DESC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "environment",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "owner_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "role",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "version_count!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      null,
+      false
+    ]
+  },
+  "hash": "b1e279b883429c34e0e11f646f8da1411f045287e323f70044dd0b615975e0f8"
+}

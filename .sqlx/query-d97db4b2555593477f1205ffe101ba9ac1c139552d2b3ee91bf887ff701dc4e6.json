@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT * FROM vault_versions WHERE vault_id = $1 ORDER BY version_num DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "vault_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "version_num",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "blob_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "blob_size_bytes",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "blob_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "key_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "key_names",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 8,
+        "name": "pushed_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "pushed_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "d97db4b2555593477f1205ffe101ba9ac1c139552d2b3ee91bf887ff701dc4e6"
+}

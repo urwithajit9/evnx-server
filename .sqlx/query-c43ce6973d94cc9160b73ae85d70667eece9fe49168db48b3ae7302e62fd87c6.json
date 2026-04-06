@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO users (\n            id, email, srp_verifier, srp_salt, argon2_salt,\n            ed25519_public_key, x25519_public_key, encrypted_private_key, email_verified\n        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c43ce6973d94cc9160b73ae85d70667eece9fe49168db48b3ae7302e62fd87c6"
+}

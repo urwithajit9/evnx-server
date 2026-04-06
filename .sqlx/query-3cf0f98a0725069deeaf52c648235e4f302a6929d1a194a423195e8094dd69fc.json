@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, srp_verifier, srp_salt, argon2_salt, totp_enabled\n        FROM users\n        WHERE email = $1 AND is_active = true\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "srp_verifier",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "srp_salt",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "argon2_salt",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "totp_enabled",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "3cf0f98a0725069deeaf52c648235e4f302a6929d1a194a423195e8094dd69fc"
+}

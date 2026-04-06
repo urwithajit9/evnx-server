@@ -1,0 +1,94 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, email, email_verified, srp_verifier, srp_salt,\n               argon2_salt, ed25519_public_key, encrypted_private_key,\n               totp_secret_enc, totp_enabled, is_active, last_login_at, created_at\n        FROM users WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "email",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "email_verified",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 3,
+        "name": "srp_verifier",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "srp_salt",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "argon2_salt",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "ed25519_public_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "encrypted_private_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "totp_secret_enc",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "totp_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "is_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 11,
+        "name": "last_login_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "8e568c9b5a2d87c8a22ecd422bba3e8c33eb9e0b5daaf32a1e03ffbaf804d823"
+}

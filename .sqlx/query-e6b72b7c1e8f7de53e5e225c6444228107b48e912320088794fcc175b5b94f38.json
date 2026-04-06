@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT encrypted_vault_key, eph_pub_key\n        FROM vault_members\n        WHERE vault_id = $1 AND user_id = $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "encrypted_vault_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "eph_pub_key",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "e6b72b7c1e8f7de53e5e225c6444228107b48e912320088794fcc175b5b94f38"
+}

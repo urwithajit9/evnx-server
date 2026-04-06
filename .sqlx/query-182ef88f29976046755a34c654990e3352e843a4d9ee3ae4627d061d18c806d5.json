@@ -1,0 +1,83 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO vault_versions\n            (vault_id, version_num, blob_key, blob_size_bytes, blob_hash,\n             key_count, key_names, pushed_by)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n        RETURNING *\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "vault_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "version_num",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "blob_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "blob_size_bytes",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "blob_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "key_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "key_names",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 8,
+        "name": "pushed_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "pushed_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Text",
+        "Int4",
+        "Text",
+        "Int4",
+        "TextArray",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "182ef88f29976046755a34c654990e3352e843a4d9ee3ae4627d061d18c806d5"
+}
