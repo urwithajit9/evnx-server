@@ -15,7 +15,7 @@ pub mod tokens;
 pub mod users;
 pub mod vaults;
 pub mod versions;
-use crate::middleware::auth::{require_auth, require_verified};
+use crate::middleware::auth::{require_auth, require_user_session, require_verified};
 
 pub fn create_router(state: AppState) -> Router {
     let allowed_origin = state
@@ -63,19 +63,38 @@ pub fn create_router(state: AppState) -> Router {
             require_verified,
         ));
 
-    // Auth routes — mostly public
-    let auth_routes = Router::new()
+    // Auth routes — unauthenticated. Each of these either establishes a session
+    // or carries its own credential in the request body (refresh token, email
+    // verification token, totp_pending token), so no guard applies.
+    let public_auth_routes = Router::new()
         .route("/register", post(auth::register))
         .route("/srp/init", post(auth::srp_init))
         .route("/srp/verify", post(auth::srp_verify))
         .route("/totp/verify", post(auth::totp_verify_login))
         .route("/refresh", post(auth::refresh))
-        .route("/verify-email", post(auth::verify_email))
-        // Protected auth routes
+        .route("/verify-email", post(auth::verify_email));
+
+    // Account management — a real user session only. An `evnx_tok_` CI token that
+    // could reach these would be able to enrol its own authenticator on the
+    // account or revoke the owner's sessions.
+    let account_routes = Router::new()
         .route("/logout", post(auth::logout))
         .route("/totp/setup", post(auth::totp_setup))
         .route("/totp/confirm", post(auth::totp_confirm))
-        .route("/me", get(auth::me));
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_user_session,
+        ));
+
+    // `require_auth`, not `require_verified`: the CLI calls GET /auth/me
+    // immediately after registration to fetch `encrypted_private_key` and
+    // `argon2_salt`, before the user has clicked the verification email.
+    // Requiring a verified email here would make first login impossible.
+    let me_route = Router::new()
+        .route("/me", get(auth::me))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+
+    let auth_routes = public_auth_routes.merge(account_routes).merge(me_route);
 
     Router::new()
         .route("/health", get(crate::health_check))
