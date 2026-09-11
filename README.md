@@ -56,7 +56,7 @@ Edit `.env` — the minimum required fields for local dev:
 ```bash
 # Required immediately:
 DATABASE_URL=postgresql://evnx:evnx_dev_password@localhost:5432/evnx_dev
-REDIS_URL=redis://:evnx_redis_dev@localhost:6379/0
+VALKEY_URL=redis://:evnx_valkey_dev@127.0.0.1:6379/0
 JWT_SECRET=<generate: openssl rand -hex 64>
 FRONTEND_URL=http://localhost:3000
 
@@ -74,8 +74,8 @@ S3_ENDPOINT=http://localhost:4566   # LocalStack endpoint
 ### 2. Start infrastructure
 
 ```bash
-# Start PostgreSQL + Redis (and optionally LocalStack for S3)
-docker compose up postgres redis localstack -d
+# Start PostgreSQL + Valkey (and optionally LocalStack for S3)
+docker compose up postgres valkey localstack -d
 
 # Verify all healthy
 docker compose ps
@@ -123,7 +123,7 @@ evnx-server/
 ├── migrations/
 │   └── 001_initial.sql          ← full schema (users, vaults, members, versions, tokens, audit)
 ├── docker/
-│   ├── docker-compose.yml       ← dev: postgres, redis, localstack, server
+│   ├── docker-compose.yml       ← dev: postgres, valkey, localstack, server
 │   ├── docker-compose.prod.yml  ← prod: override for ECS Fargate
 │   ├── Dockerfile.server        ← multi-stage: dev, migrator, production
 │   └── localstack/
@@ -131,7 +131,7 @@ evnx-server/
 └── src/
     ├── main.rs                  ← server startup, graceful shutdown
     ├── config.rs                ← Config struct from env vars (dotenvy)
-    ├── state.rs                 ← AppState: db pool, redis pool, email, storage, config
+    ├── state.rs                 ← AppState: db pool, valkey pool, email, storage, config
     ├── errors.rs                ← AppError → axum IntoResponse (consistent JSON errors)
     ├── routes/
     │   ├── mod.rs               ← create_router(), CORS, middleware stacking
@@ -143,10 +143,10 @@ evnx-server/
     │   └── users.rs             ← GET /users/{email}/public-key
     ├── middleware/
     │   ├── auth.rs              ← JWT + API token extraction, email_verified check
-    │   └── rate_limit.rs        ← Redis-backed sliding window rate limiter
+    │   └── rate_limit.rs        ← Valkey-backed sliding window rate limiter
     ├── services/
     │   ├── email.rs             ← Resend API integration (verification, login alert, token alert)
-    │   ├── cache.rs             ← Redis: SRP state, JWT blocklist, rate limit counters
+    │   ├── cache.rs             ← Valkey: SRP state, JWT blocklist, rate limit counters
     │   ├── storage.rs           ← S3: PutObject, GetObject, presigned URLs
     │   └── audit.rs             ← INSERT audit_events (async, non-blocking)
     └── db/
@@ -209,7 +209,7 @@ SRP Step 1 — exchange ephemeral public keys.
 **Responses:**
 - `200 OK` — `{ "srp_salt": "...", "argon2_salt": "...", "server_public": "hex_B", "session_id": "uuid" }`
 
-**Security:** Returns identical response shape and timing for unknown emails (constant-time). The `session_id` is server-generated (prevents fixation attacks). SRP state stored in Redis with 5-minute TTL.
+**Security:** Returns identical response shape and timing for unknown emails (constant-time). The `session_id` is server-generated (prevents fixation attacks). SRP state stored in Valkey with 5-minute TTL.
 
 ---
 
@@ -284,7 +284,7 @@ Exchange a refresh token for a new access token + new refresh token (rotation).
 ```
 POST /api/v1/auth/totp/setup
   → 200 { "totp_uri": "otpauth://...", "secret_base32": "..." }
-  Server stores secret in Redis (unconfirmed). NOT written to DB yet.
+  Server stores secret in Valkey (unconfirmed). NOT written to DB yet.
 
 POST /api/v1/auth/totp/confirm
   Body: { "totp_code": "123456" }
@@ -297,7 +297,7 @@ POST /api/v1/auth/totp/confirm
 ```
 POST /api/v1/auth/logout
   → 204 No Content
-  Adds JWT sid to Redis blocklist (TTL = remaining JWT lifetime).
+  Adds JWT sid to Valkey blocklist (TTL = remaining JWT lifetime).
   Marks refresh tokens for this session as revoked.
 ```
 
@@ -376,7 +376,7 @@ GET  /api/v1/users/{email}/public-key
 
 ---
 
-## Redis Key Patterns
+## Valkey Key Patterns
 
 | Pattern | Value | TTL | Purpose |
 |---------|-------|-----|---------|
@@ -415,8 +415,8 @@ DATABASE_URL=postgresql://evnx:password@localhost:5432/evnx_dev
 DATABASE_MAX_CONNECTIONS=20
 DATABASE_MIN_CONNECTIONS=2
 
-# ─── Redis ───────────────────────────────────────────────────────────
-REDIS_URL=redis://:password@localhost:6379/0
+# ─── Valkey ──────────────────────────────────────────────────────────
+VALKEY_URL=redis://:password@localhost:6379/0   # scheme stays redis://
 
 # ─── JWT ─────────────────────────────────────────────────────────────
 # Generate: openssl rand -hex 64   (minimum 512 bits)
@@ -455,7 +455,7 @@ SENTRY_DSN=                         # Optional
 ## Running Tests
 
 ```bash
-# Unit + integration tests (requires postgres + redis running)
+# Unit + integration tests (requires postgres + valkey running)
 cargo test
 
 # Watch mode
@@ -481,10 +481,10 @@ cargo clippy -- -D warnings
 ### Development
 
 ```bash
-# Start everything (server with hot reload, postgres, redis, localstack)
+# Start everything (server with hot reload, postgres, valkey, localstack)
 docker compose up
 
-# Server only (postgres + redis already running externally)
+# Server only (postgres + valkey already running externally)
 docker compose up server
 
 # Rebuild after Cargo.toml changes
@@ -555,7 +555,7 @@ All errors return consistent JSON — never expose internal details:
 - **No password stored.** The `users` table has no password column. Only the SRP verifier.
 - **Constant-time SRP init.** Unknown email addresses receive the same response shape as known ones, generated with a fake verifier to equalize timing.
 - **Refresh token rotation.** Each `/auth/refresh` call invalidates the old token and issues a new one. Token replay is detected and triggers session revocation.
-- **JWT blocklist.** Logout adds the JWT `sid` claim to Redis with TTL = remaining JWT lifetime. Checked on every authenticated request.
+- **JWT blocklist.** Logout adds the JWT `sid` claim to Valkey with TTL = remaining JWT lifetime. Checked on every authenticated request.
 - **Audit log.** All vault operations, logins, and token events are recorded with BLAKE3-hashed IP and user-agent (privacy-preserving). Never deleted.
 - **S3 blob integrity.** Upload stores `blob_hash = BLAKE3(ciphertext)` in the DB. Download verifies hash before streaming to client.
 

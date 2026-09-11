@@ -4,6 +4,8 @@ use crate::config::Config;
 use crate::services::cache::CacheService;
 use crate::services::jwt::JwtService;
 use crate::services::storage::StorageService;
+// The `redis` crate speaks the Valkey wire protocol unchanged — only the
+// server binary and the env var name differ.
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -27,8 +29,8 @@ pub struct AppState {
 
     /// Application configuration loaded from environment variables.
     pub config: Arc<Config>,
-    /// Redis connection manager — shared across all requests.
-    pub redis: ConnectionManager,
+    /// Valkey connection manager — shared across all requests.
+    pub valkey: ConnectionManager,
     pub jwt: Arc<JwtService>,
     // Email service added in Week 7
     /// Storage service for encrypted blobs. Need to migrate to Hetzner Spaces o
@@ -39,7 +41,7 @@ impl AppState {
     pub fn new(
         db: PgPool,
         cache: CacheService,
-        redis: ConnectionManager,
+        valkey: ConnectionManager,
         config: Config,
         jwt: JwtService,
         storage: StorageService,
@@ -47,7 +49,7 @@ impl AppState {
         Self {
             db,
             cache,
-            redis,
+            valkey,
             config: Arc::new(config),
             jwt: Arc::new(jwt),
             storage: Arc::new(storage),

@@ -210,7 +210,7 @@ pub async fn srp_init(
     let server_public_bytes = srp_server.compute_public_ephemeral(&b_bytes, &verifier_bytes);
     let server_public_hex = hex::encode(&server_public_bytes);
 
-    // Store session state in Redis (5-min TTL)
+    // Store session state in Valkey (5-min TTL)
     let session_id = Uuid::new_v4();
     let srp_state = SrpSessionState {
         user_id,
@@ -274,7 +274,7 @@ pub async fn srp_verify(
     State(state): State<AppState>,
     Json(req): Json<SrpVerifyRequest>,
 ) -> Result<Json<SrpVerifyResponse>, AppError> {
-    // Fetch session from Redis
+    // Fetch session from Valkey
     let session_key = format!("srp:{}", req.session_id);
     let srp_state: Option<SrpSessionState> = state.cache.get_json(&session_key).await?;
     let srp_state = srp_state.ok_or(AppError::Unauthorized)?;
@@ -550,7 +550,7 @@ pub async fn logout(
 }
 
 /// TOTP Setup — Step 1: generate secret, return QR URI.
-/// Secret is stored in Redis (unconfirmed) until verify_totp_setup confirms it.
+/// Secret is stored in Valkey (unconfirmed) until verify_totp_setup confirms it.
 pub async fn totp_setup(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<Claims>,
@@ -585,7 +585,7 @@ pub async fn totp_setup(
     let totp_uri = totp.get_url();
     // let qr_code = totp.get_qr_base64()?; // Base64-encoded PNG data for QR code (optional, can be generated client-side)
 
-    // Store unconfirmed secret in Redis (10-min TTL — user has time to scan QR)
+    // Store unconfirmed secret in Valkey (10-min TTL — user has time to scan QR)
     state
         .cache
         .set_json(&format!("totp_setup:{}", user_id), &secret_base32, 600)
@@ -610,7 +610,7 @@ pub async fn totp_confirm(
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::Validation("totp_code required".into()))?;
 
-    // Fetch unconfirmed secret from Redis
+    // Fetch unconfirmed secret from Valkey
     let secret_base32: Option<String> = state
         .cache
         .get_json(&format!("totp_setup:{}", user_id))

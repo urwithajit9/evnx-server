@@ -3,7 +3,11 @@
 use redis::{aio::ConnectionManager, AsyncCommands};
 use serde::{de::DeserializeOwned, Serialize};
 
-/// Wrapper around Redis operations used by evnx-server.
+/// Wrapper around the Valkey operations used by evnx-server.
+///
+/// Only six commands are used — SETEX, GET, DEL, INCR, EXPIRE, EXISTS — all
+/// core primitives with identical semantics in Redis and Valkey. No Lua, no
+/// streams, no modules, so the backing store is interchangeable.
 ///
 /// Key naming convention:
 ///   srp:{session_id}            → SRP server state (5-min TTL)
@@ -31,13 +35,13 @@ impl CacheService {
             serde_json::to_string(value).map_err(|e| CacheError::Serialization(e.to_string()))?;
         conn.set_ex::<_, _, ()>(key, serialized, ttl_seconds)
             .await
-            .map_err(CacheError::Redis)
+            .map_err(CacheError::Valkey)
     }
 
     /// Get and deserialize a JSON value. Returns None if key doesn't exist.
     pub async fn get_json<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, CacheError> {
         let mut conn = self.0.clone();
-        let raw: Option<String> = conn.get(key).await.map_err(CacheError::Redis)?;
+        let raw: Option<String> = conn.get(key).await.map_err(CacheError::Valkey)?;
         match raw {
             None => Ok(None),
             Some(s) => serde_json::from_str(&s)
@@ -49,7 +53,7 @@ impl CacheService {
     /// Delete a key.
     pub async fn del(&self, key: &str) -> Result<(), CacheError> {
         let mut conn = self.0.clone();
-        conn.del::<_, ()>(key).await.map_err(CacheError::Redis)
+        conn.del::<_, ()>(key).await.map_err(CacheError::Valkey)
     }
 
     /// Increment a counter and set TTL on first increment.
@@ -57,12 +61,12 @@ impl CacheService {
     pub async fn incr_with_ttl(&self, key: &str, ttl_seconds: u64) -> Result<u64, CacheError> {
         let mut conn = self.0.clone();
         // INCR atomically increments (or creates at 0 then increments)
-        let count: u64 = conn.incr(key, 1).await.map_err(CacheError::Redis)?;
+        let count: u64 = conn.incr(key, 1).await.map_err(CacheError::Valkey)?;
         if count == 1 {
             // First increment — set the expiry
             conn.expire::<_, ()>(key, ttl_seconds as i64)
                 .await
-                .map_err(CacheError::Redis)?;
+                .map_err(CacheError::Valkey)?;
         }
         Ok(count)
     }
@@ -81,7 +85,7 @@ impl CacheService {
     /// Check if a key exists (used for JWT blocklist).
     pub async fn exists(&self, key: &str) -> Result<bool, CacheError> {
         let mut conn = self.0.clone();
-        let n: u64 = conn.exists(key).await.map_err(CacheError::Redis)?;
+        let n: u64 = conn.exists(key).await.map_err(CacheError::Valkey)?;
         Ok(n > 0)
     }
 
@@ -90,14 +94,15 @@ impl CacheService {
         let mut conn = self.0.clone();
         conn.set_ex::<_, _, ()>(key, "1", ttl_seconds)
             .await
-            .map_err(CacheError::Redis)
+            .map_err(CacheError::Valkey)
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
-    #[error("Redis error: {0}")]
-    Redis(#[from] redis::RedisError),
+    /// Wraps `redis::RedisError` — the crate name, not the server.
+    #[error("Valkey error: {0}")]
+    Valkey(#[from] redis::RedisError),
     #[error("Serialization error: {0}")]
     Serialization(String),
 }

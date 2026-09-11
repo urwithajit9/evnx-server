@@ -18,20 +18,24 @@ services:
       timeout: 5s
       retries: 5
 
-  redis:
-    image: redis:7-alpine
-    container_name: evnx_redis
+  # Valkey — BSD-licensed Redis fork, wire-compatible.
+  # The `redis` Rust crate is the client; the URL scheme stays redis://.
+  valkey:
+    image: valkey/valkey:9-alpine
+    container_name: evnx_valkey
     restart: unless-stopped
     command: >
-      redis-server
-      --requirepass evnx_redis_dev
+      valkey-server
+      --requirepass evnx_valkey_dev
       --maxmemory 256mb
       --maxmemory-policy allkeys-lru
       --loglevel warning
     ports:
       - "6379:6379"
+    volumes:
+      - valkey_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "evnx_redis_dev", "ping"]
+      test: ["CMD", "valkey-cli", "-a", "evnx_valkey_dev", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -51,5 +55,5 @@ services:
 
 volumes:
   postgres_data:
-  redis_data:
+  valkey_data:
   localstack_data:

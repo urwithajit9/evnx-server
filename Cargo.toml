@@ -44,7 +44,7 @@ blake3      = "1"       # for hashing tokens and IPs
 hex         = "0.4"     # encode/decode hex strings (SRP values are hex)
 base64ct    = { version = "1", features = ["alloc"] }
 
-# Redis
+# Valkey client — the `redis` crate speaks the Valkey wire protocol unchanged
 redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
 
 # SRP server-side (evnx-server runs the server half)

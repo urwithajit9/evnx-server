@@ -16,8 +16,8 @@ pub struct Config {
     pub database_url: String,
     pub database_max_connections: u32,
 
-    // Redis
-    pub redis_url: String,
+    // Valkey (Redis-compatible; the `redis` crate is the client)
+    pub valkey_url: String,
 
     // JWT (added Week 5 — placeholder now)
     pub jwt_secret: String,
@@ -93,7 +93,7 @@ impl Config {
         }
 
         let database_url = require!("DATABASE_URL");
-        let redis_url = require!("REDIS_URL");
+        let valkey_url = require!("VALKEY_URL");
         let jwt_secret = require!("JWT_SECRET");
         let frontend_url = require!("FRONTEND_URL");
         let resend_api_key = require!("RESEND_API_KEY");
@@ -117,7 +117,7 @@ impl Config {
             database_max_connections: optional!("DATABASE_MAX_CONNECTIONS", "20")
                 .parse()
                 .unwrap_or(20),
-            redis_url,
+            valkey_url,
             jwt_secret,
             jwt_expiry_minutes: optional!("JWT_EXPIRY_MINUTES", "15").parse().unwrap_or(15),
             refresh_token_expiry_days: optional!("REFRESH_TOKEN_EXPIRY_DAYS", "30")

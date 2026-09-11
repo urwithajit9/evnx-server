@@ -54,19 +54,21 @@ async fn main() {
 
     tracing::info!("✓ Database connected");
 
-    let redis_client = redis::Client::open(config.redis_url.as_str()).unwrap_or_else(|e| {
-        tracing::error!("Failed to create Redis client: {}", e);
+    // Valkey. The `redis` crate is the client and the URL scheme is still
+    // redis:// — Valkey is wire-compatible, so only VALKEY_URL differs.
+    let valkey_client = redis::Client::open(config.valkey_url.as_str()).unwrap_or_else(|e| {
+        tracing::error!("Failed to create Valkey client: {}", e);
         std::process::exit(1);
     });
 
-    let redis = redis::aio::ConnectionManager::new(redis_client)
+    let valkey = redis::aio::ConnectionManager::new(valkey_client)
         .await
         .unwrap_or_else(|e| {
-            tracing::error!("Failed to connect to Redis: {}", e);
+            tracing::error!("Failed to connect to Valkey: {}", e);
             std::process::exit(1);
         });
 
-    tracing::info!("✓ Redis connected");
+    tracing::info!("✓ Valkey connected");
 
     // Step 4: Run pending migrations automatically on startup.
     // Safe to run repeatedly — sqlx tracks what's been applied.
@@ -105,10 +107,10 @@ async fn main() {
         "✓ Object storage configured"
     );
 
-    let cache = CacheService::new(redis.clone());
+    let cache = CacheService::new(valkey.clone());
 
     // Step 5: Build shared application state.
-    let state = AppState::new(db, cache, redis, config.clone(), jwt, storage);
+    let state = AppState::new(db, cache, valkey, config.clone(), jwt, storage);
 
     // Step 6: Build the router.
     let app = build_router(state);
@@ -157,7 +159,7 @@ fn build_router(state: AppState) -> Router {
 /// Health check endpoint.
 ///
 /// Returns 200 OK if the server is running.
-/// Does NOT check DB/Redis — use a readiness probe for that.
+/// Does NOT check DB/Valkey — use a readiness probe for that.
 /// (We keep health simple so it never fails due to infra issues)
 async fn health_check() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({

@@ -6,4 +6,4 @@
 .env.*.local
 
 docker/postgres/data/
-docker/redis/data/
+docker/valkey/data/

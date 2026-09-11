@@ -5,9 +5,25 @@ services:
     image: postgres:16-alpine
     # ... (unchanged) ...
 
-  redis:
-    image: redis:7-alpine
-    # ... (unchanged) ...
+  valkey:
+    image: valkey/valkey:9-alpine
+    container_name: evnx_valkey
+    restart: unless-stopped
+    command: >
+      valkey-server
+      --requirepass ${VALKEY_PASSWORD}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --loglevel warning
+    volumes:
+      - valkey_data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   migrator:
     image: ghcr.io/urwithajit9/evnx-server:latest
@@ -33,7 +49,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
+      valkey:
         condition: service_healthy
     networks:
       - backend
@@ -51,4 +67,4 @@ networks:
 
 volumes:
   postgres_data:
-  redis_data:
+  valkey_data:
