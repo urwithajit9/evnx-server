@@ -1,28 +1,20 @@
 // src/main.rs
 
-use axum::Router;
+//! Binary entry point. All application logic lives in the library
+//! (`src/lib.rs`) so integration tests can exercise it; this file only wires
+//! configuration to live infrastructure and serves the router.
+
 use std::net::SocketAddr;
-use tower_http::limit::RequestBodyLimitLayer;
-use tower_http::trace::TraceLayer;
 
-mod config;
-mod db;
-mod errors;
-mod middleware;
-mod routes;
-mod services;
-mod state;
-
-use config::Config;
-use state::AppState;
-
-use crate::services::cache::CacheService;
-use crate::services::jwt::JwtService;
-use crate::services::storage::StorageService;
+use evnx_server::config::Config;
+use evnx_server::services::cache::CacheService;
+use evnx_server::services::jwt::JwtService;
+use evnx_server::services::storage::StorageService;
+use evnx_server::{build_router, AppState};
 
 #[tokio::main]
 async fn main() {
-    // Step 1: Initialize logging FIRST — before anything else.
+    // Logging first — before anything that might need to report a failure.
     // RUST_LOG=evnx_server=debug,tower_http=debug controls verbosity.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -33,7 +25,7 @@ async fn main() {
 
     tracing::info!("🚀 evnx-server starting up");
 
-    // Step 2: Load config — fails fast if any required env var is missing.
+    // Fails fast and lists every missing variable, not just the first.
     let config = Config::from_env().unwrap_or_else(|e| {
         tracing::error!("Configuration error: {}", e);
         std::process::exit(1);
@@ -41,8 +33,6 @@ async fn main() {
 
     tracing::info!(environment = ?config.environment, "Configuration loaded");
 
-    // Step 3: Connect to PostgreSQL.
-    // PgPoolOptions lets you set connection limits.
     let db = sqlx::postgres::PgPoolOptions::new()
         .max_connections(config.database_max_connections)
         .connect(&config.database_url)
@@ -70,8 +60,7 @@ async fn main() {
 
     tracing::info!("✓ Valkey connected");
 
-    // Step 4: Run pending migrations automatically on startup.
-    // Safe to run repeatedly — sqlx tracks what's been applied.
+    // Safe to run repeatedly — sqlx tracks what has already been applied.
     sqlx::migrate!("./migrations")
         .run(&db)
         .await
@@ -81,16 +70,8 @@ async fn main() {
         });
 
     tracing::info!("✓ Migrations applied");
-    let jwt = JwtService::new(&config.jwt_secret, config.jwt_expiry_minutes);
 
-    // let storage = StorageService::new(
-    //     &config.aws_access_key_id,
-    //     &config.aws_secret_access_key,
-    //     &config.s3_region,
-    //     config.s3_bucket.clone(),
-    //     config.s3_endpoint.as_deref(),
-    // )
-    // .await;
+    let jwt = JwtService::new(&config.jwt_secret, config.jwt_expiry_minutes);
 
     let storage = StorageService::from_config(
         &config.aws_access_key_id,
@@ -108,19 +89,12 @@ async fn main() {
     );
 
     let cache = CacheService::new(valkey.clone());
-
-    // Step 5: Build shared application state.
     let state = AppState::new(db, cache, valkey, config.clone(), jwt, storage);
-
-    // Step 6: Build the router.
     let app = build_router(state);
 
-    // Step 7: Bind and serve.
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
         .expect("Invalid server address");
-
-    tracing::info!("✓ Listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -129,47 +103,18 @@ async fn main() {
             std::process::exit(1);
         });
 
+    tracing::info!("✓ Listening on http://{}", addr);
+
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .unwrap();
+        .unwrap_or_else(|e| {
+            tracing::error!("Server error: {}", e);
+            std::process::exit(1);
+        });
 }
 
-// fn build_router(state: AppState) -> Router {
-//     Router::new()
-//         // Health check — no auth required
-//         .route("/health", get(health_check))
-//         // All API routes (added week by week)
-//         .nest("/api/v1", Router::new())
-//         // Request tracing — logs every request and response status
-//         .layer(TraceLayer::new_for_http())
-//         .with_state(state)
-// }
-
-fn build_router(state: AppState) -> Router {
-    // Extract config value BEFORE moving state
-    let request_size_limit = (state.config.max_request_size_kb * 1024) as usize;
-    // Reject oversized request bodies before parsing (protect against memory exhaustion)
-    routes::create_router(state)
-        .layer(RequestBodyLimitLayer::new(request_size_limit))
-        // Request tracing — logs every request and response status
-        .layer(TraceLayer::new_for_http())
-}
-
-/// Health check endpoint.
-///
-/// Returns 200 OK if the server is running.
-/// Does NOT check DB/Valkey — use a readiness probe for that.
-/// (We keep health simple so it never fails due to infra issues)
-async fn health_check() -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION"),
-    }))
-}
-
-/// Listen for Ctrl+C and SIGTERM for graceful shutdown.
-/// Axum will stop accepting new requests and wait for in-flight requests to finish.
+/// Wait for Ctrl+C or SIGTERM, then let Axum drain in-flight requests.
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()

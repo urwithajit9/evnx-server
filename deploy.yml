@@ -61,14 +61,27 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy (zero warnings)
-        run: cargo clippy -- -D warnings
+        # --all-targets so tests and benches are linted too, not just the lib.
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Run tests
         env:
           DATABASE_URL: postgresql://evnx:test_password@localhost:5432/evnx_test
           VALKEY_URL: redis://localhost:6379/0
           SQLX_OFFLINE: true
-        run: cargo test --all
+          # Config::from_env() hard-fails on any missing required variable, so
+          # the integration suite needs the full set even though these paths are
+          # never exercised in CI. Values are dummies, not secrets.
+          JWT_SECRET: ci_only_not_a_real_secret_0000000000000000000000000000000000000000000000000000000000000000
+          FRONTEND_URL: http://localhost:3000
+          RESEND_API_KEY: re_ci_placeholder
+          EMAIL_FROM: ci@evnx.dev
+          S3_BUCKET: evnx-vaults-ci
+          S3_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        # Serial: the suite shares one Postgres database and one Valkey instance.
+        run: cargo test --all -- --test-threads=1
 
       - name: Security audit
         run: |

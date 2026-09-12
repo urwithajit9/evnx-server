@@ -217,7 +217,7 @@ pub async fn srp_init(
         email: email_lower,
         verifier_hex: srp_verifier_hex,
         srp_salt: srp_salt_b64.clone(),
-        server_private_b_hex: hex::encode(&b_bytes), // Store b for later verification
+        server_private_b_hex: hex::encode(b_bytes), // Store b for later verification
         client_public_hex: req.client_public,
         is_real_user,
     };
@@ -313,7 +313,7 @@ pub async fn srp_verify(
 
     // Get server proof M2 (hex-encoded for JSON)
     let server_proof_bytes = server_verifier.proof();
-    let server_proof_hex = hex::encode(&server_proof_bytes);
+    let server_proof_hex = hex::encode(server_proof_bytes);
 
     // Optional: extract shared key for encryption if needed
     // let shared_key = server_verifier.key(); // Use HKDF to derive keys from this

@@ -116,8 +116,7 @@ pub async fn push_version(
     // 6. Record audit event (fire-and-forget — don't block response)
     tokio::spawn({
         let db = state.db.clone();
-        let vault_id = vault_id;
-        let user_id = user_id;
+        // vault_id and user_id are Copy — `async move` captures them directly.
         let version_num = new_version_num;
         async move {
             let _ = crate::services::audit::record(

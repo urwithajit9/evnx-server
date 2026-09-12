@@ -15,7 +15,7 @@ use std::sync::Arc;
 /// All fields must be cheaply cloneable. Use Arc<T> for anything expensive.
 ///
 /// ## How Axum uses this:
-/// ```
+/// ```text
 /// async fn my_handler(State(state): State<AppState>) -> impl IntoResponse {
 ///     let result = state.db.fetch_one(...).await?;
 /// }
@@ -54,5 +54,36 @@ impl AppState {
             jwt: Arc::new(jwt),
             storage: Arc::new(storage),
         }
+    }
+
+    /// Build an `AppState` for integration tests from an existing pool + config.
+    ///
+    /// Connects to the same Valkey and object storage the binary would, so tests
+    /// exercise real cache behaviour (rate limits, JWT blocklist, SRP sessions)
+    /// rather than a stub. Not `#[cfg(test)]`: integration tests in `tests/` are
+    /// separate crates and cannot see items behind that gate.
+    ///
+    /// # Panics
+    /// If Valkey is unreachable — a test run without infrastructure should fail
+    /// loudly rather than silently skip the paths it claims to cover.
+    pub async fn new_for_test(db: PgPool, config: Config) -> Self {
+        let valkey_client =
+            redis::Client::open(config.valkey_url.as_str()).expect("test: invalid VALKEY_URL");
+        let valkey = ConnectionManager::new(valkey_client)
+            .await
+            .expect("test: Valkey unreachable — run `docker compose up -d postgres valkey`");
+
+        let cache = CacheService::new(valkey.clone());
+        let jwt = JwtService::new(&config.jwt_secret, config.jwt_expiry_minutes);
+        let storage = StorageService::from_config(
+            &config.aws_access_key_id,
+            &config.aws_secret_access_key,
+            &config.s3_region,
+            config.s3_bucket.clone(),
+            config.s3_endpoint.as_deref(),
+        )
+        .await;
+
+        Self::new(db, cache, valkey, config, jwt, storage)
     }
 }

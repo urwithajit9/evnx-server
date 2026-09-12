@@ -14,7 +14,7 @@ use serde_json::json;
 /// (never reveal whether an email exists, etc.).
 ///
 /// ## Usage in handlers:
-/// ```rust
+/// ```text
 /// async fn my_handler() -> Result<Json<MyResponse>, AppError> {
 ///     let user = db::find_user(&pool, id)
 ///         .await
