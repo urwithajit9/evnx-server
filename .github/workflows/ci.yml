@@ -43,9 +43,25 @@ jobs:
         ports:
           - 6379:6379
 
+    # Cargo.toml declares `evnx-crypto = { path = "../evnx-crypto" }`, so the
+    # sibling repository must sit next to this one exactly as it does locally.
+    # A single-repo checkout cannot resolve it and every cargo command fails.
+    defaults:
+      run:
+        working-directory: evnx-server
+
     steps:
-      - name: Checkout
+      - name: Checkout evnx-server
         uses: actions/checkout@v4
+        with:
+          path: evnx-server
+
+      - name: Checkout evnx-crypto (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: urwithajit9/evnx-crypto
+          ref: main
+          path: evnx-crypto
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -56,6 +72,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          workspaces: evnx-server
 
       - name: Check formatting
         run: cargo fmt --check
