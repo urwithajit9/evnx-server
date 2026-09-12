@@ -72,7 +72,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/srp/verify", post(auth::srp_verify))
         .route("/totp/verify", post(auth::totp_verify_login))
         .route("/refresh", post(auth::refresh))
-        .route("/verify-email", post(auth::verify_email));
+        // POST takes the token in a JSON body (CLI / frontend).
+        // GET is what the emailed link points at — a browser click.
+        .route(
+            "/verify-email",
+            post(auth::verify_email).get(auth::verify_email_link),
+        );
 
     // Account management — a real user session only. An `evnx_tok_` CI token that
     // could reach these would be able to enrol its own authenticator on the

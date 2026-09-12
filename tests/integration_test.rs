@@ -503,3 +503,140 @@ async fn vault_scoped_token_cannot_list_all_vaults() {
     let resp = bearer(server.get("/api/v1/vaults"), &raw).await;
     assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
 }
+
+// ─── B6 regression: email wiring and the verification-token leak ───────────────
+//
+// EmailService was never constructed or called, and register logged the raw
+// verification token unconditionally at info level — a bearer credential written
+// to stdout on every signup. Nobody could verify an email either, which meant
+// require_verified blocked every vault route: the product was unusable.
+
+#[tokio::test]
+async fn registration_no_longer_logs_the_verification_token() {
+    // The guarantee is structural: the only place a token can now be surfaced is
+    // the `log` email transport, which Config::from_env refuses outside
+    // development. Assert the source itself carries no token-logging statement,
+    // since a passing runtime check would not prove absence on other paths.
+    let src = std::fs::read_to_string("src/routes/auth.rs").unwrap();
+    assert!(
+        !src.contains("Email verification token"),
+        "register still logs the raw verification token"
+    );
+    assert!(
+        !src.contains("raw_token\n    );"),
+        "raw_token still appears in a tracing macro"
+    );
+}
+
+#[tokio::test]
+async fn log_email_transport_is_refused_outside_development() {
+    // This is the guard that keeps a live verification token out of staging and
+    // production logs. Env access is process-global, so this test is serial-safe
+    // only because the suite runs with --test-threads=1.
+    use evnx_server::config::Config;
+
+    let previous = std::env::var("ENVIRONMENT").ok();
+    std::env::set_var("ENVIRONMENT", "production");
+    std::env::set_var("EMAIL_TRANSPORT", "log");
+
+    let result = Config::from_env();
+
+    match previous {
+        Some(v) => std::env::set_var("ENVIRONMENT", v),
+        None => std::env::remove_var("ENVIRONMENT"),
+    }
+    std::env::set_var("EMAIL_TRANSPORT", "log");
+
+    let err = result.expect_err("EMAIL_TRANSPORT=log must be refused in production");
+    assert!(
+        err.to_string().contains("EMAIL_TRANSPORT=log"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn emailed_link_verifies_the_account_and_is_single_use() {
+    // End-to-end: register, redeem the token the way the emailed link does, and
+    // confirm the account can then reach vault routes it was locked out of.
+    let server = test_app().await;
+    let email = unique_email("verify");
+
+    let resp = server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&email))
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+    let user_id = Uuid::parse_str(
+        resp.json::<serde_json::Value>()["user_id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+
+    // The token is hashed at rest, so the test mints its own verification row
+    // rather than trying to recover the original — the redemption path is what
+    // is under test.
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    let raw = "b6-test-token-".to_string() + &Uuid::new_v4().to_string();
+    let hash = blake3::hash(raw.as_bytes()).to_hex().to_string();
+    sqlx::query(
+        "INSERT INTO email_verifications (user_id, token_hash, expires_at)
+         VALUES ($1, $2, NOW() + INTERVAL '24 hours')",
+    )
+    .bind(user_id)
+    .bind(&hash)
+    .execute(&db)
+    .await
+    .unwrap();
+
+    // Before verifying, vault routes are closed.
+    let jwt = jwt_service()
+        .await
+        .issue(user_id, Uuid::new_v4(), false)
+        .unwrap();
+    assert_eq!(
+        bearer(server.get("/api/v1/vaults"), &jwt)
+            .await
+            .status_code(),
+        StatusCode::FORBIDDEN
+    );
+
+    // GET is what the emailed link hits — an HTML page, not JSON.
+    let resp = server
+        .get("/api/v1/auth/verify-email")
+        .add_query_param("token", &raw)
+        .await;
+    resp.assert_status_ok();
+    assert!(resp.text().contains("Email verified"));
+
+    let verified: bool = sqlx::query_scalar("SELECT email_verified FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert!(verified, "email_verified was not set");
+
+    // Single-use: the same link must not work twice.
+    let resp = server
+        .get("/api/v1/auth/verify-email")
+        .add_query_param("token", &raw)
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn verify_email_rejects_an_unknown_token() {
+    let server = test_app().await;
+    let resp = server
+        .get("/api/v1/auth/verify-email")
+        .add_query_param("token", "not-a-real-token")
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+
+    let resp = server
+        .post("/api/v1/auth/verify-email")
+        .json(&serde_json::json!({ "token": "not-a-real-token" }))
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
+}

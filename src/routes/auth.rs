@@ -122,15 +122,23 @@ pub async fn register(
 
     db_tokens::create_email_verification(&state.db, user_id, &token_hash).await?;
 
-    // 7. Send verification email (async — don't block the response)
-    // Week 7 adds the email service. For now, log the token for testing.
-    tracing::info!(
-        user_id = %user_id,
-        "Email verification token (dev only, remove in prod): {}",
-        raw_token
-    );
-
-    // TODO Week 7: state.email.send_verification(&req.email, &raw_token).await?;
+    // 7. Send the verification email without blocking the response.
+    //
+    // Deliberately fire-and-forget: a mail outage must not fail registration,
+    // and awaiting it would make the response time reveal whether delivery
+    // succeeded. Failures are logged WITHOUT the token — the token is a bearer
+    // credential and must never reach the logs. In development the configured
+    // transport is `log`, which prints the link instead of sending it.
+    tokio::spawn({
+        let email = state.email.clone();
+        let recipient = req.email.clone();
+        let token = raw_token;
+        async move {
+            if let Err(e) = email.send_verification(&recipient, &token).await {
+                tracing::error!(error = %e, "Failed to send verification email");
+            }
+        }
+    });
 
     Ok((
         axum::http::StatusCode::CREATED,
@@ -369,7 +377,60 @@ pub async fn verify_email(
     State(state): State<AppState>,
     Json(req): Json<VerifyEmailRequest>,
 ) -> Result<axum::http::StatusCode, AppError> {
-    let token_hash = hash_token(&req.token);
+    redeem_verification_token(&state, &req.token).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VerifyEmailQuery {
+    pub token: String,
+}
+
+/// The endpoint the emailed link points at.
+///
+/// A click arrives as a GET from a browser, so this returns a small HTML page
+/// rather than JSON. The same redemption path as the POST endpoint — single-use,
+/// expiry-checked, transactional.
+///
+/// The token necessarily travels in the query string, which is how every
+/// verification link works; it is mitigated by being single-use and short-lived.
+/// Do not add query strings to the access log.
+pub async fn verify_email_link(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<VerifyEmailQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let (status, heading, detail) = match redeem_verification_token(&state, &query.token).await {
+        Ok(()) => (
+            axum::http::StatusCode::OK,
+            "Email verified",
+            "You can close this tab and return to the evnx CLI.",
+        ),
+        Err(_) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            "Link expired or already used",
+            "Request a new verification email and try again.",
+        ),
+    };
+
+    let body = format!(
+        r#"<!doctype html><meta charset="utf-8"><title>{heading}</title>
+        <div style="font-family:system-ui,sans-serif;max-width:520px;margin:80px auto;padding:32px;text-align:center">
+          <h1 style="font-size:20px;margin-bottom:8px">{heading}</h1>
+          <p style="color:#666">{detail}</p>
+        </div>"#
+    );
+
+    (status, axum::response::Html(body)).into_response()
+}
+
+/// Redeem a verification token: mark it used and flip `users.email_verified`.
+///
+/// Both writes happen in one transaction — a crash between them would otherwise
+/// burn the token while leaving the account unverified, with no way to recover.
+async fn redeem_verification_token(state: &AppState, token: &str) -> Result<(), AppError> {
+    let token_hash = hash_token(token);
 
     // Use a transaction: both operations succeed or both fail
     let mut tx = state.db.begin().await.map_err(AppError::Database)?;
@@ -407,7 +468,7 @@ pub async fn verify_email(
 
     tx.commit().await.map_err(AppError::Database)?;
 
-    Ok(axum::http::StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────

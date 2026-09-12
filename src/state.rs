@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use crate::services::cache::CacheService;
+use crate::services::email::EmailService;
 use crate::services::jwt::JwtService;
 use crate::services::storage::StorageService;
 // The `redis` crate speaks the Valkey wire protocol unchanged — only the
@@ -32,8 +33,9 @@ pub struct AppState {
     /// Valkey connection manager — shared across all requests.
     pub valkey: ConnectionManager,
     pub jwt: Arc<JwtService>,
-    // Email service added in Week 7
-    /// Storage service for encrypted blobs. Need to migrate to Hetzner Spaces o
+    /// Transactional email (verification, login alerts).
+    pub email: Arc<EmailService>,
+    /// Object storage for encrypted blobs.
     pub storage: Arc<StorageService>,
 }
 
@@ -44,6 +46,7 @@ impl AppState {
         valkey: ConnectionManager,
         config: Config,
         jwt: JwtService,
+        email: EmailService,
         storage: StorageService,
     ) -> Self {
         Self {
@@ -52,6 +55,7 @@ impl AppState {
             valkey,
             config: Arc::new(config),
             jwt: Arc::new(jwt),
+            email: Arc::new(email),
             storage: Arc::new(storage),
         }
     }
@@ -75,6 +79,7 @@ impl AppState {
 
         let cache = CacheService::new(valkey.clone());
         let jwt = JwtService::new(&config.jwt_secret, config.jwt_expiry_minutes);
+        let email = EmailService::from_config(&config);
         let storage = StorageService::from_config(
             &config.aws_access_key_id,
             &config.aws_secret_access_key,
@@ -84,6 +89,6 @@ impl AppState {
         )
         .await;
 
-        Self::new(db, cache, valkey, config, jwt, storage)
+        Self::new(db, cache, valkey, config, jwt, email, storage)
     }
 }

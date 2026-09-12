@@ -30,6 +30,11 @@ pub struct Config {
     // Email (Resend)
     pub resend_api_key: String,
     pub email_from: String,
+    /// How mail is delivered. `Log` is a development-only transport.
+    pub email_transport: EmailTransport,
+    /// Public base URL of this API, used to build the email verification link.
+    /// Production must set `PUBLIC_API_URL`; the default is only useful locally.
+    pub public_api_url: String,
 
     // S3 (blob storage)
     pub s3_bucket: String,
@@ -42,6 +47,18 @@ pub struct Config {
 
     // Security
     pub max_request_size_kb: u64,
+}
+
+/// How verification and alert email is delivered.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EmailTransport {
+    /// Send through the Resend API.
+    Resend,
+    /// **Development only.** Write the message to the log instead of sending it,
+    /// so a local developer can follow the verification link without a real
+    /// mailbox. `Config::from_env()` refuses this outside `development`, which is
+    /// what keeps a live verification token out of staging and production logs.
+    Log,
 }
 
 /// Application environment — affects logging verbosity and some behaviors.
@@ -109,10 +126,36 @@ impl Config {
             ));
         }
 
+        let environment = Environment::from_str(&optional!("ENVIRONMENT", "development"));
+        let port: u16 = optional!("SERVER_PORT", "8080").parse().unwrap_or(8080);
+
+        // Default to the log transport only in development, where there is no
+        // real mailbox. Anywhere else, mail must actually be sent.
+        let email_transport = match env::var("EMAIL_TRANSPORT").ok().as_deref() {
+            Some("log") => EmailTransport::Log,
+            Some("resend") => EmailTransport::Resend,
+            Some(other) => {
+                return Err(ConfigError::Invalid(format!(
+                    "EMAIL_TRANSPORT must be 'resend' or 'log', got '{other}'"
+                )))
+            }
+            None if environment == Environment::Development => EmailTransport::Log,
+            None => EmailTransport::Resend,
+        };
+
+        // The log transport writes a live verification token to the log. That is
+        // an acceptable local-development affordance and nothing else.
+        if email_transport == EmailTransport::Log && environment != Environment::Development {
+            return Err(ConfigError::Invalid(format!(
+                "EMAIL_TRANSPORT=log writes verification tokens to the log and is \
+                 refused when ENVIRONMENT={environment:?}"
+            )));
+        }
+
         Ok(Config {
             host: optional!("SERVER_HOST", "0.0.0.0"),
-            port: optional!("SERVER_PORT", "8080").parse().unwrap_or(8080),
-            environment: Environment::from_str(&optional!("ENVIRONMENT", "development")),
+            port,
+            environment,
             database_url,
             database_max_connections: optional!("DATABASE_MAX_CONNECTIONS", "20")
                 .parse()
@@ -126,6 +169,8 @@ impl Config {
             frontend_url,
             resend_api_key,
             email_from,
+            email_transport,
+            public_api_url: optional!("PUBLIC_API_URL", format!("http://localhost:{port}")),
             s3_bucket,
             s3_region,
             s3_endpoint: env::var("S3_ENDPOINT").ok().filter(|s| !s.is_empty()),
@@ -144,4 +189,6 @@ impl Config {
 pub enum ConfigError {
     #[error("Missing required environment variables: {}", .0.join(", "))]
     MissingVariables(Vec<String>),
+    #[error("Invalid configuration: {0}")]
+    Invalid(String),
 }

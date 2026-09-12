@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 
 use evnx_server::config::Config;
 use evnx_server::services::cache::CacheService;
+use evnx_server::services::email::EmailService;
 use evnx_server::services::jwt::JwtService;
 use evnx_server::services::storage::StorageService;
 use evnx_server::{build_router, AppState};
@@ -88,8 +89,11 @@ async fn main() {
         "✓ Object storage configured"
     );
 
+    let email = EmailService::from_config(&config);
+    tracing::info!(transport = email.transport_name(), "✓ Email configured");
+
     let cache = CacheService::new(valkey.clone());
-    let state = AppState::new(db, cache, valkey, config.clone(), jwt, storage);
+    let state = AppState::new(db, cache, valkey, config.clone(), jwt, email, storage);
     let app = build_router(state);
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
