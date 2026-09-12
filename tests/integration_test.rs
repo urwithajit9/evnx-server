@@ -640,3 +640,299 @@ async fn verify_email_rejects_an_unknown_token() {
         .await;
     assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
 }
+
+// ─── B2 regression: TOTP login ─────────────────────────────────────────────────
+//
+// srp_verify returned `totp_pending_token: Some("todo_week5")` — a literal
+// placeholder — so any user with TOTP enabled could not log in at all.
+//
+// These tests drive the real SRP-6a exchange using evnx-crypto as the client,
+// exactly as the CLI will. Nothing here is stubbed: the verifier, the ephemerals
+// and the proofs are genuine.
+
+use evnx_crypto::{
+    compute_client_proof, compute_verifier, derive_srp_password, generate_client_ephemeral,
+    generate_salt, salt_to_base64, verify_server_proof,
+};
+
+const TEST_PASSWORD: &[u8] = b"correct horse battery staple";
+
+struct SrpAccount {
+    email: String,
+    user_id: Uuid,
+    srp_salt: [u8; 32],
+}
+
+/// Register an account whose SRP verifier is genuinely derived from a password,
+/// so `/auth/srp/*` can complete for real.
+async fn register_srp_account(server: &TestServer) -> SrpAccount {
+    let email = unique_email("srp");
+    let srp_salt = generate_salt();
+    let argon2_salt = generate_salt();
+
+    let srp_password = derive_srp_password(TEST_PASSWORD, &srp_salt).unwrap();
+    let verifier = compute_verifier(&email, srp_password, srp_salt).unwrap();
+
+    let resp = server
+        .post("/api/v1/auth/register")
+        .json(&serde_json::json!({
+            "email": email,
+            "srp_verifier": verifier.verifier_hex(),
+            "srp_salt": verifier.srp_salt_base64(),
+            "argon2_salt": salt_to_base64(&argon2_salt),
+            "ed25519_public_key": "C".repeat(44),
+            "x25519_public_key": "D".repeat(44),
+            "encrypted_private_key": "E".repeat(96),
+        }))
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+
+    let user_id = Uuid::parse_str(
+        resp.json::<serde_json::Value>()["user_id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+
+    SrpAccount {
+        email,
+        user_id,
+        srp_salt,
+    }
+}
+
+/// Run the full SRP-6a login and return the server's `/srp/verify` response,
+/// after checking the server's proof M2 — so a wrong M2 fails the test rather
+/// than passing silently.
+async fn srp_login(server: &TestServer, account: &SrpAccount) -> serde_json::Value {
+    let ephemeral = generate_client_ephemeral().unwrap();
+
+    let init = server
+        .post("/api/v1/auth/srp/init")
+        .json(&serde_json::json!({
+            "email": account.email,
+            "client_public": hex::encode(&ephemeral.public_a),
+        }))
+        .await;
+    init.assert_status_ok();
+    let init = init.json::<serde_json::Value>();
+
+    let session_id = init["session_id"].as_str().unwrap().to_string();
+    let server_public = hex::decode(init["server_public"].as_str().unwrap()).unwrap();
+
+    let srp_password = derive_srp_password(TEST_PASSWORD, &account.srp_salt).unwrap();
+    let proof = compute_client_proof(
+        &account.email,
+        srp_password,
+        &account.srp_salt,
+        &server_public,
+        &ephemeral,
+    )
+    .unwrap();
+
+    let verify = server
+        .post("/api/v1/auth/srp/verify")
+        .json(&serde_json::json!({
+            "session_id": session_id,
+            "client_proof": hex::encode(&proof.client_proof),
+        }))
+        .await;
+    verify.assert_status_ok();
+    let body = verify.json::<serde_json::Value>();
+
+    // The client must authenticate the server too, or SRP buys nothing.
+    let server_proof = hex::decode(body["server_proof"].as_str().unwrap()).unwrap();
+    verify_server_proof(&server_proof, &proof).expect("server proof M2 did not verify");
+
+    body
+}
+
+#[tokio::test]
+async fn full_srp_login_issues_tokens_without_totp() {
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+
+    let body = srp_login(&server, &account).await;
+
+    assert_eq!(body["requires_totp"], false);
+    let access = body["access_token"].as_str().expect("no access token");
+    assert!(body["refresh_token"].as_str().is_some());
+
+    // The issued token must actually work.
+    bearer(server.get("/api/v1/auth/me"), access)
+        .await
+        .assert_status_ok();
+}
+
+#[tokio::test]
+async fn srp_login_with_wrong_password_is_rejected() {
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+    let ephemeral = generate_client_ephemeral().unwrap();
+
+    let init = server
+        .post("/api/v1/auth/srp/init")
+        .json(&serde_json::json!({
+            "email": account.email,
+            "client_public": hex::encode(&ephemeral.public_a),
+        }))
+        .await
+        .json::<serde_json::Value>();
+
+    let server_public = hex::decode(init["server_public"].as_str().unwrap()).unwrap();
+    let wrong = derive_srp_password(b"not the password", &account.srp_salt).unwrap();
+    let proof = compute_client_proof(
+        &account.email,
+        wrong,
+        &account.srp_salt,
+        &server_public,
+        &ephemeral,
+    )
+    .unwrap();
+
+    let resp = server
+        .post("/api/v1/auth/srp/verify")
+        .json(&serde_json::json!({
+            "session_id": init["session_id"].as_str().unwrap(),
+            "client_proof": hex::encode(&proof.client_proof),
+        }))
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::UNAUTHORIZED);
+}
+
+/// Enable TOTP on an account and return its base32 secret.
+async fn enable_totp(server: &TestServer, user_id: Uuid) -> String {
+    let jwt = jwt_service()
+        .await
+        .issue(user_id, Uuid::new_v4(), true)
+        .unwrap();
+
+    let setup = bearer(server.post("/api/v1/auth/totp/setup"), &jwt).await;
+    setup.assert_status_ok();
+    let secret = setup.json::<serde_json::Value>()["secret_base32"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = bearer(server.post("/api/v1/auth/totp/confirm"), &jwt)
+        .json(&serde_json::json!({ "totp_code": totp_code(&secret) }))
+        .await;
+    resp.assert_status(StatusCode::NO_CONTENT);
+
+    secret
+}
+
+/// Generate the code an authenticator app would show right now.
+fn totp_code(secret_base32: &str) -> String {
+    use totp_rs::{Algorithm, Secret, TOTP};
+    let bytes =
+        base32::decode(base32::Alphabet::Rfc4648 { padding: false }, secret_base32).unwrap();
+    TOTP::new(
+        Algorithm::SHA1,
+        6,
+        1,
+        30,
+        Secret::Raw(bytes).to_bytes().unwrap(),
+        Some("evnx".to_string()),
+        "evnx".to_string(),
+    )
+    .unwrap()
+    .generate_current()
+    .unwrap()
+}
+
+#[tokio::test]
+async fn totp_user_can_complete_login() {
+    // The B2 regression: this was impossible, because srp_verify handed back the
+    // string "todo_week5" instead of a token.
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+    let secret = enable_totp(&server, account.user_id).await;
+
+    let body = srp_login(&server, &account).await;
+
+    assert_eq!(body["requires_totp"], true);
+    assert!(
+        body["access_token"].is_null(),
+        "no session may be issued before the second factor"
+    );
+    let pending = body["totp_pending_token"]
+        .as_str()
+        .expect("no pending token");
+    assert_ne!(pending, "todo_week5");
+    assert!(
+        pending.split('.').count() == 3,
+        "pending token is not a JWT: {pending}"
+    );
+
+    let resp = server
+        .post("/api/v1/auth/totp/verify")
+        .json(&serde_json::json!({
+            "totp_pending_token": pending,
+            "totp_code": totp_code(&secret),
+        }))
+        .await;
+    resp.assert_status_ok();
+
+    let access = resp.json::<serde_json::Value>()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    bearer(server.get("/api/v1/auth/me"), &access)
+        .await
+        .assert_status_ok();
+}
+
+#[tokio::test]
+async fn totp_pending_token_is_single_use() {
+    // A successful login must spend the token. Otherwise the same pending token
+    // plus a still-valid 30-second code could mint further sessions for the rest
+    // of its 5-minute lifetime.
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+    let secret = enable_totp(&server, account.user_id).await;
+
+    let pending = srp_login(&server, &account).await["totp_pending_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let body = serde_json::json!({
+        "totp_pending_token": pending,
+        "totp_code": totp_code(&secret),
+    });
+
+    server
+        .post("/api/v1/auth/totp/verify")
+        .json(&body)
+        .await
+        .assert_status_ok();
+
+    let replay = server.post("/api/v1/auth/totp/verify").json(&body).await;
+    assert_eq!(
+        replay.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "pending token was accepted twice"
+    );
+}
+
+#[tokio::test]
+async fn totp_verify_rejects_a_wrong_code() {
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+    let _secret = enable_totp(&server, account.user_id).await;
+
+    let pending = srp_login(&server, &account).await["totp_pending_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = server
+        .post("/api/v1/auth/totp/verify")
+        .json(&serde_json::json!({
+            "totp_pending_token": pending,
+            "totp_code": "000000",
+        }))
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::UNAUTHORIZED);
+}

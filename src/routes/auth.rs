@@ -341,11 +341,30 @@ pub async fn srp_verify(
         .ok_or(AppError::Unauthorized)?;
 
     if user.totp_enabled {
-        // Issue short-lived TOTP-pending token (Week 5)
+        // The password is proven but the second factor is not. Issue a 5-minute
+        // token scoped `totp_pending`, which every auth guard rejects — its only
+        // use is POST /auth/totp/verify.
+        let pending = state
+            .jwt
+            .issue_totp_pending(user_id)
+            .map_err(|_| AppError::Internal("Failed to issue TOTP token".into()))?;
+
+        // Register it in Valkey so it can be consumed exactly once. Without this
+        // the token stays replayable for its full lifetime, and a successful
+        // login would not spend it — the same token plus a still-valid code
+        // could mint further sessions.
+        state
+            .cache
+            .set_flag(
+                &format!("totp_pending:{}", hash_token(&pending)),
+                TOTP_PENDING_TTL_SECONDS,
+            )
+            .await?;
+
         return Ok(Json(SrpVerifyResponse {
             server_proof: server_proof_hex,
             requires_totp: true,
-            totp_pending_token: Some("todo_week5".into()),
+            totp_pending_token: Some(pending),
             access_token: None,
             refresh_token: None,
         }));
@@ -470,6 +489,11 @@ async fn redeem_verification_token(state: &AppState, token: &str) -> Result<(), 
 
     Ok(())
 }
+
+/// Lifetime of a `totp_pending` token, in seconds. Must match the `exp` that
+/// `JwtService::issue_totp_pending` stamps, so the Valkey entry and the JWT
+/// expire together.
+const TOTP_PENDING_TTL_SECONDS: u64 = 300;
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -725,6 +749,14 @@ pub async fn totp_verify_login(
         return Err(AppError::Unauthorized);
     }
 
+    // The token must still be registered in Valkey. A token already spent by a
+    // successful verification is gone from the cache even though the JWT itself
+    // has not expired, which is what makes it single-use.
+    let pending_key = format!("totp_pending:{}", hash_token(totp_pending_token));
+    if !state.cache.exists(&pending_key).await? {
+        return Err(AppError::Unauthorized);
+    }
+
     let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
 
     // Check lockout
@@ -751,7 +783,11 @@ pub async fn totp_verify_login(
     // Verify code
     match verify_totp_code(&secret_base32, code) {
         Ok(()) => {
-            // Clear lockout counter
+            // Spend the pending token — one full session per SRP exchange.
+            // Deliberately not done on failure: a mistyped code should not force
+            // the user back through SRP. Brute force is bounded by the lockout
+            // counter below instead.
+            state.cache.del(&pending_key).await?;
             state.cache.del(&lockout_key).await?;
 
             // Issue real tokens
@@ -783,8 +819,11 @@ fn verify_totp_code(secret_base32: &str, code: &str) -> Result<(), AppError> {
         1,
         30,
         Secret::Raw(secret_bytes).to_bytes().unwrap(),
-        Some("evnx".to_string()), // ← issuer (can be None if not needed)
-        "test_email@evnx.dev".to_string(), // ← account_name (required, no colons allowed)
+        Some("evnx".to_string()),
+        // account_name is metadata for the otpauth:// provisioning URI only —
+        // RFC 6238 codes derive from the secret and the time step alone, so this
+        // value cannot affect verification. It was left as a test address.
+        "evnx".to_string(),
     )
     .map_err(|_| AppError::Internal("TOTP init failed".into()))?;
 
