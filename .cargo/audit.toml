@@ -1,0 +1,20 @@
+# cargo-audit configuration
+#
+# cargo-audit scans Cargo.lock, which records every crate the resolver *could*
+# select — not the set actually compiled for the enabled features. Entries below
+# are present in the lockfile but absent from the build graph.
+#
+# Re-verify any entry with:  cargo tree -i <crate>
+# "nothing to print" means the crate is not compiled. If it ever starts
+# resolving into the graph, remove the ignore and fix it properly.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — Marvin Attack (timing sidechannel) in `rsa`.
+    # Reached only through sqlx-mysql. This server is Postgres-only and sqlx is
+    # declared with default-features = false, so sqlx-mysql is never compiled;
+    # `cargo tree -i rsa` finds nothing. There is no fixed version of `rsa`
+    # available, so this cannot be resolved by upgrading.
+    # Verified 2026-09-12.
+    "RUSTSEC-2023-0071",
+]

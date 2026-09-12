@@ -1042,3 +1042,127 @@ async fn blob_keys_are_unique_per_push() {
     assert_ne!(a, b);
     assert!(a.starts_with(&format!("vaults/{vault}/00000007/")));
 }
+
+// ─── B10 regression: vault creation is atomic ──────────────────────────────────
+//
+// create_vault ran two inserts on separate pool connections. If the second
+// failed, the vault row survived with no row in vault_members — and list_vaults
+// inner joins that table, so the vault was invisible to its own owner while
+// still holding its unique (owner, name, environment). The owner could neither
+// see it nor reuse the name.
+
+#[tokio::test]
+async fn creating_a_vault_also_grants_the_owner_their_key() {
+    let server = test_app().await;
+    let (user_id, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+
+    // Visible in the listing — which requires the vault_members row to exist.
+    let listed = bearer(server.get("/api/v1/vaults"), &jwt).await;
+    listed.assert_status_ok();
+    let body = listed.json::<serde_json::Value>();
+    let found = body["vaults"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"].as_str() == Some(&vault.to_string()))
+        .expect("new vault missing from the owner's list");
+    assert_eq!(found["role"], "owner");
+
+    // And the owner's wrapped key is retrievable.
+    let key = bearer(server.get(&format!("/api/v1/vaults/{vault}/my-key")), &jwt).await;
+    key.assert_status_ok();
+    assert!(key.json::<serde_json::Value>()["encrypted_vault_key"].is_string());
+
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    let members: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM vault_members WHERE vault_id = $1 AND user_id = $2",
+    )
+    .bind(vault)
+    .bind(user_id)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(members, 1);
+}
+
+#[tokio::test]
+async fn a_failed_member_insert_rolls_the_vault_back() {
+    // Drives the two db functions the handler uses, in one transaction, and makes
+    // the second fail on its foreign key. Before B10 these ran on separate pool
+    // connections, so the vault row would have survived.
+    use evnx_server::db::{members, vaults};
+
+    let server = test_app().await;
+    let (owner_id, _jwt) = verified_user(&server).await;
+
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    let name = format!("rollback{}", Uuid::new_v4().simple());
+
+    let mut tx = db.begin().await.unwrap();
+    let vault_id = vaults::create(&mut *tx, owner_id, &name, "development")
+        .await
+        .unwrap();
+
+    // No such user — violates vault_members.user_id -> users(id).
+    let result = members::add_member(
+        &mut *tx,
+        vault_id,
+        Uuid::new_v4(),
+        "owner",
+        "Zm9v",
+        "YmFy",
+        owner_id,
+    )
+    .await;
+    assert!(result.is_err(), "expected a foreign key violation");
+
+    drop(tx); // rolls back
+
+    let surviving: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vaults WHERE id = $1")
+        .bind(vault_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        surviving, 0,
+        "vault survived a failed member insert — it would be invisible to its owner \
+         while still holding the name"
+    );
+
+    // The name is therefore free to use again.
+    let resp = bearer(server.post("/api/v1/vaults"), &_jwt)
+        .json(&serde_json::json!({
+            "name": name, "environment": "development",
+            "encrypted_vault_key": "Zm9v", "eph_pub_key": "YmFy",
+        }))
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn create_vault_handler_uses_a_transaction() {
+    // The behavioural test above proves the two db calls roll back when composed
+    // in a transaction, but it drives them directly — it would still pass if the
+    // handler went back to two separate pool connections. Forcing a mid-handler
+    // failure is not possible from the outside (role and user_id are fixed by the
+    // handler, and the key columns are unconstrained TEXT), so this pins the
+    // handler to the transaction at the source level instead.
+    let src = std::fs::read_to_string("src/routes/vaults.rs").unwrap();
+    let body = src
+        .split("pub async fn create_vault")
+        .nth(1)
+        .expect("create_vault not found");
+    let body = &body[..body.find("\n// ─").unwrap_or(body.len())];
+
+    assert!(
+        body.contains("state.db.begin()") && body.contains("tx.commit()"),
+        "create_vault must create the vault and the owner's member row in one transaction"
+    );
+    assert!(
+        !body.contains("vaults::create(&state.db"),
+        "create_vault is inserting outside the transaction"
+    );
+}

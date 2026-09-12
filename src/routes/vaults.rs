@@ -31,9 +31,11 @@ pub struct CreateVaultRequest {
     pub eph_pub_key: String,
 }
 
-// Regex for vault names: lowercase alphanumeric + hyphens
-static NAME_RE: once_cell::sync::Lazy<regex::Regex> =
-    once_cell::sync::Lazy::new(|| regex::Regex::new(r"^[a-z0-9\-]+$").unwrap());
+// Regex for vault names: lowercase alphanumeric + hyphens.
+// std::sync::LazyLock rather than once_cell::sync::Lazy — validator 0.21
+// implements its AsRegex trait for the former only.
+static NAME_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^[a-z0-9\-]+$").unwrap());
 
 #[derive(Serialize)]
 pub struct CreateVaultResponse {
@@ -61,8 +63,13 @@ pub async fn create_vault(
         )));
     }
 
-    // Create vault
-    let vault_id = vaults::create(&state.db, user_id, &req.name, &req.environment)
+    // One transaction for both inserts. A vault without its owner row in
+    // vault_members is invisible to list_vaults (which inner joins that table)
+    // yet still occupies its unique (owner, name, environment) — the owner could
+    // neither see the vault nor reuse the name.
+    let mut tx = state.db.begin().await.map_err(AppError::Database)?;
+
+    let vault_id = vaults::create(&mut *tx, user_id, &req.name, &req.environment)
         .await
         .map_err(|e| {
             if let sqlx::Error::Database(ref db_err) = e {
@@ -76,9 +83,10 @@ pub async fn create_vault(
             AppError::Database(e)
         })?;
 
-    // Add owner as vault member with their ECDH-wrapped vault key
+    // The owner's own copy of the vault key, ECDH-wrapped client-side. The server
+    // never sees the unwrapped key.
     members::add_member(
-        &state.db,
+        &mut *tx,
         vault_id,
         user_id,
         "owner",
@@ -87,6 +95,8 @@ pub async fn create_vault(
         user_id,
     )
     .await?;
+
+    tx.commit().await.map_err(AppError::Database)?;
 
     Ok((
         axum::http::StatusCode::CREATED,

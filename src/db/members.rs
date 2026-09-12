@@ -8,15 +8,22 @@ pub struct WrappedKeyRow {
     pub eph_pub_key: Option<String>,
 }
 
-pub async fn add_member(
-    pool: &PgPool,
+/// Grant a user access to a vault by storing their ECDH-wrapped vault key.
+///
+/// Generic over the executor so vault creation can insert the owner's row in the
+/// same transaction as the vault itself.
+pub async fn add_member<'e, E>(
+    executor: E,
     vault_id: Uuid,
     user_id: Uuid,
     role: &str,
     encrypted_vault_key: &str,
     eph_pub_key: &str,
     granted_by: Uuid,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query!(
         r#"
         INSERT INTO vault_members
@@ -36,7 +43,7 @@ pub async fn add_member(
         eph_pub_key,
         granted_by,
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }

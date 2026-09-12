@@ -24,12 +24,22 @@ pub struct VaultWithRole {
     pub updated_at: chrono::DateTime<Utc>,
 }
 
-pub async fn create(
-    pool: &PgPool,
+/// Insert a vault row.
+///
+/// Generic over the executor so it can run inside a transaction: a vault without
+/// an owner row in `vault_members` is invisible to `list_for_user` (which inner
+/// joins that table) while still holding its unique (owner, name, environment),
+/// so the owner can neither see it nor recreate the name. Callers creating a new
+/// vault must pair this with `members::add_member` in one transaction.
+pub async fn create<'e, E>(
+    executor: E,
     owner_id: Uuid,
     name: &str,
     environment: &str,
-) -> Result<Uuid, sqlx::Error> {
+) -> Result<Uuid, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let id = Uuid::new_v4();
     sqlx::query!(
         r#"
@@ -41,7 +51,7 @@ pub async fn create(
         environment,
         owner_id,
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(id)
 }

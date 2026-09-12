@@ -1,99 +1,30 @@
 # .github/workflows/deploy.yml
+#
+# Build the image and deploy it.
+#
+# MANUAL ONLY (`workflow_dispatch`). The deploy target is undecided: the Hetzner
+# host this job SSHes to is no longer functional, so running it automatically on
+# every push to main would fail every build. Restore the `push:` trigger below
+# once a target is chosen and HETZNER_HOST / HETZNER_SSH_KEY are set.
 
-name: CI/CD — Test, Build, Deploy
+name: Deploy
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
+  # push:
+  #   branches: [main]
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}    # urwithajit9/evnx-server
   CARGO_TERM_COLOR: always
-  SQLX_OFFLINE: true                      # Use cached queries — no live DB needed in CI
+  SQLX_OFFLINE: true
 
 jobs:
-  # ─── Job 1: Test ──────────────────────────────────────────────────────────
-  test:
-    name: Test & Lint
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_DB: evnx_test
-          POSTGRES_USER: evnx
-          POSTGRES_PASSWORD: test_password
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-      valkey:
-        image: valkey/valkey:9-alpine
-        options: >-
-          --health-cmd "valkey-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 5
-        ports:
-          - 6379:6379
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache Cargo registry
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-
-      - name: Check formatting
-        run: cargo fmt --check
-
-      - name: Clippy (zero warnings)
-        # --all-targets so tests and benches are linted too, not just the lib.
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Run tests
-        env:
-          DATABASE_URL: postgresql://evnx:test_password@localhost:5432/evnx_test
-          VALKEY_URL: redis://localhost:6379/0
-          SQLX_OFFLINE: true
-          # Config::from_env() hard-fails on any missing required variable, so
-          # the integration suite needs the full set even though these paths are
-          # never exercised in CI. Values are dummies, not secrets.
-          JWT_SECRET: ci_only_not_a_real_secret_0000000000000000000000000000000000000000000000000000000000000000
-          FRONTEND_URL: http://localhost:3000
-          RESEND_API_KEY: re_ci_placeholder
-          EMAIL_FROM: ci@evnx.dev
-          # Tests use the local filesystem backend — no cloud account needed.
-          STORAGE_BACKEND: local
-          STORAGE_LOCAL_PATH: ./target/test-blobs
-        # Serial: the suite shares one Postgres database and one Valkey instance.
-        run: cargo test --all -- --test-threads=1
-
-      - name: Security audit
-        run: |
-          cargo install cargo-audit --quiet
-          cargo audit
-
   # ─── Job 2: Build & Push Docker Image ────────────────────────────────────
   build:
     name: Build & Push Image
-    needs: test
     runs-on: ubuntu-latest
-    # Only build on push to main (not on PRs)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     permissions:
       contents: read
@@ -146,7 +77,6 @@ jobs:
     name: Deploy to Hetzner
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     environment:
       name: production
