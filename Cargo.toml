@@ -71,9 +71,10 @@ evnx-crypto = { path = "../evnx-crypto" }
 rand = "0.8.0"
 
 # AWS SDK (S3 only — don't pull the full SDK)
-aws-sdk-s3         = "1"
-aws-config         = { version = "1", features = ["behavior-version-latest"] }
-aws-credential-types = "1"
+# Provider-agnostic object storage: S3, GCS, Azure Blob, local filesystem and
+# any S3-compatible endpoint behind one trait. Replaces the direct AWS SDK so no
+# single cloud is privileged.
+object_store = { version = "0.14", features = ["aws", "gcp", "azure"] }
 
 # HTTP client for Resend
 reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }

@@ -536,14 +536,23 @@ async fn log_email_transport_is_refused_outside_development() {
     use evnx_server::config::Config;
 
     let previous = std::env::var("ENVIRONMENT").ok();
+    let prev_backend = std::env::var("STORAGE_BACKEND").ok();
     std::env::set_var("ENVIRONMENT", "production");
     std::env::set_var("EMAIL_TRANSPORT", "log");
+    // STORAGE_BACKEND=local is also refused in production and is validated
+    // first, so neutralise it — otherwise this test would pass on the wrong error.
+    std::env::set_var("STORAGE_BACKEND", "s3");
+    std::env::set_var("STORAGE_BUCKET", "evnx-test");
 
     let result = Config::from_env();
 
     match previous {
         Some(v) => std::env::set_var("ENVIRONMENT", v),
         None => std::env::remove_var("ENVIRONMENT"),
+    }
+    match prev_backend {
+        Some(v) => std::env::set_var("STORAGE_BACKEND", v),
+        None => std::env::remove_var("STORAGE_BACKEND"),
     }
     std::env::set_var("EMAIL_TRANSPORT", "log");
 
@@ -935,4 +944,101 @@ async fn totp_verify_rejects_a_wrong_code() {
         }))
         .await;
     assert_eq!(resp.status_code(), StatusCode::UNAUTHORIZED);
+}
+
+// ─── B7 regression: provider-agnostic storage ──────────────────────────────────
+//
+// storage.rs used aws-sdk-s3 and picked its "provider" by sniffing the endpoint
+// hostname (endpoint.contains("your-objectstorage.com")), which silently
+// misconfigured anything it did not recognise and could not reach GCS or Azure
+// at all. It is now object_store, with the backend named in configuration.
+
+#[tokio::test]
+async fn storage_backend_must_be_named_explicitly() {
+    use evnx_server::config::Config;
+
+    let previous = std::env::var("STORAGE_BACKEND").ok();
+    std::env::set_var("STORAGE_BACKEND", "hetzner"); // a provider, not a backend
+    let result = Config::from_env();
+    match previous {
+        Some(v) => std::env::set_var("STORAGE_BACKEND", v),
+        None => std::env::remove_var("STORAGE_BACKEND"),
+    }
+
+    let err = result.expect_err("an unknown STORAGE_BACKEND must be refused");
+    assert!(
+        err.to_string().contains("STORAGE_BACKEND"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn local_storage_backend_is_refused_outside_development() {
+    // The local filesystem is not shared between instances, so a multi-instance
+    // deployment would serve blobs that only exist on one node.
+    use evnx_server::config::Config;
+
+    let prev_env = std::env::var("ENVIRONMENT").ok();
+    let prev_backend = std::env::var("STORAGE_BACKEND").ok();
+    // EMAIL_TRANSPORT=log is also refused in production, so move it out of the
+    // way to be sure the error under test is the storage one.
+    std::env::set_var("ENVIRONMENT", "production");
+    std::env::set_var("EMAIL_TRANSPORT", "resend");
+    std::env::set_var("STORAGE_BACKEND", "local");
+
+    let result = Config::from_env();
+
+    match prev_env {
+        Some(v) => std::env::set_var("ENVIRONMENT", v),
+        None => std::env::remove_var("ENVIRONMENT"),
+    }
+    match prev_backend {
+        Some(v) => std::env::set_var("STORAGE_BACKEND", v),
+        None => std::env::remove_var("STORAGE_BACKEND"),
+    }
+    std::env::set_var("EMAIL_TRANSPORT", "log");
+
+    let err = result.expect_err("STORAGE_BACKEND=local must be refused in production");
+    assert!(err.to_string().contains("local"), "unexpected error: {err}");
+}
+
+#[tokio::test]
+async fn blob_round_trips_through_the_configured_backend() {
+    // Exercises the storage service itself: put, head, get, delete. Runs against
+    // whatever backend .env names — `local` by default, so no cloud account is
+    // needed, but pointing STORAGE_BACKEND at a real bucket runs the same checks.
+    use evnx_server::services::storage::StorageService;
+
+    let config = test_config().await;
+    let storage = StorageService::from_config(&config).expect("storage config");
+
+    let key = StorageService::blob_key(Uuid::new_v4(), 1);
+    let payload = bytes::Bytes::from_static(b"ciphertext-not-plaintext");
+
+    assert!(
+        !storage.blob_exists(&key).await.unwrap(),
+        "key already used"
+    );
+
+    storage.upload_blob(&key, payload.clone()).await.unwrap();
+    assert!(storage.blob_exists(&key).await.unwrap());
+    assert_eq!(storage.download_blob(&key).await.unwrap(), payload);
+
+    storage.delete_blob(&key).await.unwrap();
+    assert!(!storage.blob_exists(&key).await.unwrap());
+    assert!(
+        storage.download_blob(&key).await.is_err(),
+        "a deleted blob must not be downloadable"
+    );
+}
+
+#[tokio::test]
+async fn blob_keys_are_unique_per_push() {
+    // The trailing UUID means a retried push never overwrites an existing blob.
+    use evnx_server::services::storage::StorageService;
+    let vault = Uuid::new_v4();
+    let a = StorageService::blob_key(vault, 7);
+    let b = StorageService::blob_key(vault, 7);
+    assert_ne!(a, b);
+    assert!(a.starts_with(&format!("vaults/{vault}/00000007/")));
 }

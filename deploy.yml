@@ -76,10 +76,9 @@ jobs:
           FRONTEND_URL: http://localhost:3000
           RESEND_API_KEY: re_ci_placeholder
           EMAIL_FROM: ci@evnx.dev
-          S3_BUCKET: evnx-vaults-ci
-          S3_REGION: us-east-1
-          AWS_ACCESS_KEY_ID: test
-          AWS_SECRET_ACCESS_KEY: test
+          # Tests use the local filesystem backend — no cloud account needed.
+          STORAGE_BACKEND: local
+          STORAGE_LOCAL_PATH: ./target/test-blobs
         # Serial: the suite shares one Postgres database and one Valkey instance.
         run: cargo test --all -- --test-threads=1
 

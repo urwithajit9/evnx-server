@@ -1,103 +1,120 @@
 // src/services/storage.rs
 
-use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::{
-    config::{BehaviorVersion, Credentials, Region},
-    Client,
-};
+//! Object storage for encrypted vault blobs.
+//!
+//! The backend is named explicitly in configuration — `STORAGE_BACKEND` is one of
+//! `s3`, `gcs`, `azure` or `local` — and is **never inferred**. An earlier version
+//! guessed the provider by sniffing the endpoint hostname
+//! (`endpoint.contains("your-objectstorage.com")`), which silently misconfigured
+//! anything it did not recognise.
+//!
+//! `s3` covers AWS and every S3-compatible service (Hetzner, MinIO, Cloudflare R2,
+//! Wasabi, Backblaze B2) via `STORAGE_ENDPOINT`; some of those need path-style
+//! addressing, which `STORAGE_PATH_STYLE` controls.
+//!
+//! Only four operations are needed — put, get, head, delete — because the server
+//! handles nothing but opaque ciphertext it cannot read.
+
 use bytes::Bytes;
+use object_store::{
+    aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder,
+    local::LocalFileSystem, path::Path as ObjectPath, ObjectStore, PutPayload,
+};
+// The ergonomic put/get/head/delete live on this extension trait in 0.14;
+// `ObjectStore` itself only exposes the *_opts variants.
+use object_store::ObjectStoreExt;
+use std::sync::Arc;
 use uuid::Uuid;
 
-/// Storage provider type — determines addressing style and configuration.
-#[derive(Clone, Debug)]
-pub enum StorageProvider {
-    /// AWS S3 — virtual-hosted style, no endpoint override
-    Aws,
-    /// Hetzner Object Storage — virtual-hosted style WITH endpoint override
-    /// endpoint: e.g. "https://fsn1.your-objectstorage.com"
-    Hetzner { endpoint: String },
-    /// LocalStack (local dev) — path-style, endpoint override
-    /// endpoint: e.g. "http://localhost:4566"
-    LocalStack { endpoint: String },
-}
+use crate::config::{Config, StorageBackend};
 
 #[derive(Clone)]
 pub struct StorageService {
-    client: Client,
-    bucket: String,
-    provider: StorageProvider,
+    store: Arc<dyn ObjectStore>,
+    backend: &'static str,
 }
 
 impl StorageService {
-    /// Build from configuration.
+    /// Build the configured backend.
     ///
-    /// # Provider detection logic:
-    /// - `s3_endpoint` is None → AWS S3
-    /// - `s3_endpoint` contains "your-objectstorage.com" → Hetzner
-    /// - `s3_endpoint` contains "localhost" or "localstack" → LocalStack
-    pub async fn from_config(
-        access_key_id: &str,
-        secret_access_key: &str,
-        region: &str,
-        bucket: String,
-        s3_endpoint: Option<&str>,
-    ) -> Self {
-        let provider = match s3_endpoint {
-            None => StorageProvider::Aws,
-            Some(ep) if ep.contains("your-objectstorage.com") => StorageProvider::Hetzner {
-                endpoint: ep.to_string(),
-            },
-            Some(ep) => StorageProvider::LocalStack {
-                endpoint: ep.to_string(),
-            },
+    /// # Errors
+    /// Returns a message suitable for a startup failure. Misconfigured storage
+    /// must stop the process, not surface later as a failed push.
+    pub fn from_config(config: &Config) -> Result<Self, String> {
+        let store: Arc<dyn ObjectStore> = match config.storage_backend {
+            StorageBackend::S3 => {
+                let mut builder = AmazonS3Builder::from_env()
+                    .with_bucket_name(&config.storage_bucket)
+                    // Path-style is required by MinIO and LocalStack; AWS and
+                    // Hetzner use virtual-hosted style.
+                    .with_virtual_hosted_style_request(!config.storage_path_style);
+
+                if let Some(region) = &config.storage_region {
+                    builder = builder.with_region(region);
+                }
+                if let Some(endpoint) = &config.storage_endpoint {
+                    // Plain HTTP is only ever a local emulator (LocalStack/MinIO).
+                    let insecure = endpoint.starts_with("http://");
+                    builder = builder.with_endpoint(endpoint).with_allow_http(insecure);
+                }
+                // Credentials are optional: when absent, object_store resolves
+                // them from the environment or the instance role, which is how a
+                // production deployment should supply them.
+                if let Some(key) = &config.storage_access_key_id {
+                    builder = builder.with_access_key_id(key);
+                }
+                if let Some(secret) = &config.storage_secret_access_key {
+                    builder = builder.with_secret_access_key(secret);
+                }
+
+                Arc::new(builder.build().map_err(|e| format!("S3 storage: {e}"))?)
+            }
+
+            StorageBackend::Gcs => Arc::new(
+                // Reads GOOGLE_SERVICE_ACCOUNT / GOOGLE_SERVICE_ACCOUNT_KEY.
+                GoogleCloudStorageBuilder::from_env()
+                    .with_bucket_name(&config.storage_bucket)
+                    .build()
+                    .map_err(|e| format!("GCS storage: {e}"))?,
+            ),
+
+            StorageBackend::Azure => Arc::new(
+                // Reads AZURE_STORAGE_ACCOUNT_NAME / AZURE_STORAGE_ACCESS_KEY.
+                MicrosoftAzureBuilder::from_env()
+                    .with_container_name(&config.storage_bucket)
+                    .build()
+                    .map_err(|e| format!("Azure storage: {e}"))?,
+            ),
+
+            StorageBackend::Local => {
+                // Development and tests. Blobs are ciphertext, so a plain
+                // directory is no less safe than a bucket — but it is not shared
+                // between instances, so never use it for a real deployment.
+                std::fs::create_dir_all(&config.storage_local_path)
+                    .map_err(|e| format!("local storage {}: {e}", config.storage_local_path))?;
+                Arc::new(
+                    LocalFileSystem::new_with_prefix(&config.storage_local_path)
+                        .map_err(|e| format!("local storage: {e}"))?,
+                )
+            }
         };
 
-        let client = Self::build_client(access_key_id, secret_access_key, region, &provider).await;
-
-        Self {
-            client,
-            bucket,
-            provider,
-        }
+        Ok(Self {
+            store,
+            backend: config.storage_backend.as_str(),
+        })
     }
 
-    async fn build_client(
-        access_key_id: &str,
-        secret_access_key: &str,
-        region: &str,
-        provider: &StorageProvider,
-    ) -> Client {
-        let creds = Credentials::new(access_key_id, secret_access_key, None, None, "evnx-server");
-
-        let mut builder = aws_sdk_s3::config::Builder::new()
-            .behavior_version(BehaviorVersion::latest())
-            .credentials_provider(creds)
-            .region(Region::new(region.to_string()));
-
-        match provider {
-            StorageProvider::Aws => {
-                // No endpoint override — uses AWS default virtual-hosted endpoints
-            }
-            StorageProvider::Hetzner { endpoint } => {
-                // Hetzner: set endpoint override, use virtual-hosted style (default)
-                // IMPORTANT: force_path_style must be FALSE for Hetzner
-                // The bucket name goes in the subdomain: bucket.fsn1.your-objectstorage.com
-                builder = builder.endpoint_url(endpoint).force_path_style(false);
-            }
-            StorageProvider::LocalStack { endpoint } => {
-                // LocalStack: path-style required
-                builder = builder.endpoint_url(endpoint).force_path_style(true);
-            }
-        }
-
-        Client::from_conf(builder.build())
+    /// Backend name, for startup logging and health output.
+    pub fn backend_name(&self) -> &'static str {
+        self.backend
     }
 
-    /// Generate S3 object key for a vault version blob.
+    /// Object key for a vault version blob.
     ///
-    /// Format: `vaults/{vault_id}/{version_num:08}/{uuid}.enc`
-    /// This structure gives O(1) lookup by vault+version and
-    /// allows listing all versions of a vault efficiently.
+    /// `vaults/{vault_id}/{version:08}/{uuid}.enc` — sorts by version and keeps
+    /// every version of a vault under one prefix. The trailing UUID means a retry
+    /// never overwrites an existing blob.
     pub fn blob_key(vault_id: Uuid, version_num: i32) -> String {
         format!(
             "vaults/{}/{:08}/{}.enc",
@@ -107,100 +124,37 @@ impl StorageService {
         )
     }
 
-    /// Upload encrypted blob.
-    ///
-    /// For Hetzner: does NOT set ServerSideEncryption header (not supported).
-    /// For AWS: SSE-S3 header included for compliance.
-    /// All providers: Content-Type = application/octet-stream.
-    pub async fn upload_blob(&self, key: &str, data: Bytes) -> Result<String, StorageError> {
-        let content_length = data.len() as i64;
-        let stream = ByteStream::from(data);
-
-        let mut req = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .content_type("application/octet-stream")
-            .content_length(content_length)
-            .body(stream);
-
-        // Only set SSE for AWS — Hetzner ignores it but it wastes bandwidth
-        if matches!(self.provider, StorageProvider::Aws) {
-            req = req.server_side_encryption(aws_sdk_s3::types::ServerSideEncryption::Aes256);
-        }
-
-        let output = req
-            .send()
+    pub async fn upload_blob(&self, key: &str, data: Bytes) -> Result<(), StorageError> {
+        self.store
+            .put(&ObjectPath::from(key), PutPayload::from_bytes(data))
             .await
             .map_err(|e| StorageError::Upload(e.to_string()))?;
-
-        output
-            .e_tag()
-            .map(|s| s.trim_matches('"').to_string())
-            .ok_or_else(|| StorageError::Upload("No ETag returned from storage provider".into()))
-    }
-
-    /// Download blob and return raw bytes.
-    pub async fn download_blob(&self, key: &str) -> Result<Bytes, StorageError> {
-        let output = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| StorageError::Download(e.to_string()))?;
-
-        output
-            .body
-            .collect()
-            .await
-            .map(|data| data.into_bytes())
-            .map_err(|e| StorageError::Download(e.to_string()))
-    }
-
-    /// Check if a blob exists (used for integrity verification).
-    pub async fn blob_exists(&self, key: &str) -> Result<bool, StorageError> {
-        match self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                let service_err = e.into_service_error();
-                if service_err.is_not_found() {
-                    Ok(false)
-                } else {
-                    Err(StorageError::Download(service_err.to_string()))
-                }
-            }
-        }
-    }
-
-    /// Delete a blob (called when hard-deleting vault versions after 30-day soft-delete period).
-    pub async fn delete_blob(&self, key: &str) -> Result<(), StorageError> {
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| StorageError::Delete(e.to_string()))?;
         Ok(())
     }
 
-    /// Provider name for logging/health checks.
-    pub fn provider_name(&self) -> &str {
-        match &self.provider {
-            StorageProvider::Aws => "aws-s3",
-            StorageProvider::Hetzner { .. } => "hetzner-object-storage",
-            StorageProvider::LocalStack { .. } => "localstack",
+    pub async fn download_blob(&self, key: &str) -> Result<Bytes, StorageError> {
+        self.store
+            .get(&ObjectPath::from(key))
+            .await
+            .map_err(|e| StorageError::Download(e.to_string()))?
+            .bytes()
+            .await
+            .map_err(|e| StorageError::Download(e.to_string()))
+    }
+
+    pub async fn blob_exists(&self, key: &str) -> Result<bool, StorageError> {
+        match self.store.head(&ObjectPath::from(key)).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(StorageError::Download(e.to_string())),
         }
+    }
+
+    pub async fn delete_blob(&self, key: &str) -> Result<(), StorageError> {
+        self.store
+            .delete(&ObjectPath::from(key))
+            .await
+            .map_err(|e| StorageError::Delete(e.to_string()))
     }
 }
 

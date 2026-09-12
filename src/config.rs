@@ -36,17 +36,50 @@ pub struct Config {
     /// Production must set `PUBLIC_API_URL`; the default is only useful locally.
     pub public_api_url: String,
 
-    // S3 (blob storage)
-    pub s3_bucket: String,
-    pub s3_region: String,
-    pub s3_endpoint: Option<String>, // None = AWS; Some = LocalStack/MinIO/R2
-
-    // AWS credentials (used by S3 client)
-    pub aws_access_key_id: String,
-    pub aws_secret_access_key: String,
+    // Object storage — provider-agnostic, see services/storage.rs
+    pub storage_backend: StorageBackend,
+    /// Bucket (S3/GCS) or container (Azure). Unused by the `local` backend.
+    pub storage_bucket: String,
+    /// Custom endpoint for S3-compatible providers (Hetzner, MinIO, R2, …).
+    pub storage_endpoint: Option<String>,
+    pub storage_region: Option<String>,
+    /// Path-style addressing. Required by MinIO and LocalStack; AWS and Hetzner
+    /// use virtual-hosted style.
+    pub storage_path_style: bool,
+    /// Directory used by the `local` backend.
+    pub storage_local_path: String,
+    /// Optional; when absent, object_store resolves credentials from the
+    /// environment or the instance role.
+    pub storage_access_key_id: Option<String>,
+    pub storage_secret_access_key: Option<String>,
 
     // Security
     pub max_request_size_kb: u64,
+}
+
+/// Where encrypted vault blobs are stored. Named explicitly in configuration —
+/// never guessed from an endpoint hostname.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StorageBackend {
+    /// AWS S3 or any S3-compatible service (Hetzner, MinIO, R2, Wasabi, B2).
+    S3,
+    /// Google Cloud Storage.
+    Gcs,
+    /// Azure Blob Storage.
+    Azure,
+    /// Local filesystem — development and tests only; not shared between instances.
+    Local,
+}
+
+impl StorageBackend {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::S3 => "s3",
+            Self::Gcs => "gcs",
+            Self::Azure => "azure",
+            Self::Local => "local",
+        }
+    }
 }
 
 /// How verification and alert email is delivered.
@@ -115,10 +148,6 @@ impl Config {
         let frontend_url = require!("FRONTEND_URL");
         let resend_api_key = require!("RESEND_API_KEY");
         let email_from = require!("EMAIL_FROM");
-        let s3_bucket = require!("S3_BUCKET");
-        let s3_region = require!("S3_REGION");
-        let aws_access_key_id = require!("AWS_ACCESS_KEY_ID");
-        let aws_secret_access_key = require!("AWS_SECRET_ACCESS_KEY");
 
         if !missing.is_empty() {
             return Err(ConfigError::MissingVariables(
@@ -127,6 +156,33 @@ impl Config {
         }
 
         let environment = Environment::from_str(&optional!("ENVIRONMENT", "development"));
+
+        let storage_backend = match optional!("STORAGE_BACKEND", "s3").to_lowercase().as_str() {
+            "s3" => StorageBackend::S3,
+            "gcs" => StorageBackend::Gcs,
+            "azure" => StorageBackend::Azure,
+            "local" => StorageBackend::Local,
+            other => {
+                return Err(ConfigError::Invalid(format!(
+                    "STORAGE_BACKEND must be one of s3, gcs, azure, local — got '{other}'"
+                )))
+            }
+        };
+
+        // A bucket name is meaningless for the local backend and mandatory for
+        // every other one.
+        let storage_bucket = optional!("STORAGE_BUCKET", "");
+        if storage_backend != StorageBackend::Local && storage_bucket.is_empty() {
+            missing.push("STORAGE_BUCKET");
+        }
+
+        if storage_backend == StorageBackend::Local && environment != Environment::Development {
+            return Err(ConfigError::Invalid(format!(
+                "STORAGE_BACKEND=local is not shared between instances and is refused \
+                 when ENVIRONMENT={environment:?}"
+            )));
+        }
+
         let port: u16 = optional!("SERVER_PORT", "8080").parse().unwrap_or(8080);
 
         // Default to the log transport only in development, where there is no
@@ -171,11 +227,17 @@ impl Config {
             email_from,
             email_transport,
             public_api_url: optional!("PUBLIC_API_URL", format!("http://localhost:{port}")),
-            s3_bucket,
-            s3_region,
-            s3_endpoint: env::var("S3_ENDPOINT").ok().filter(|s| !s.is_empty()),
-            aws_access_key_id,
-            aws_secret_access_key,
+            storage_backend,
+            storage_bucket,
+            storage_endpoint: env::var("STORAGE_ENDPOINT").ok().filter(|s| !s.is_empty()),
+            storage_region: env::var("STORAGE_REGION").ok().filter(|s| !s.is_empty()),
+            storage_path_style: optional!("STORAGE_PATH_STYLE", "false")
+                .eq_ignore_ascii_case("true"),
+            storage_local_path: optional!("STORAGE_LOCAL_PATH", "./data/blobs"),
+            storage_access_key_id: env::var("AWS_ACCESS_KEY_ID").ok().filter(|s| !s.is_empty()),
+            storage_secret_access_key: env::var("AWS_SECRET_ACCESS_KEY")
+                .ok()
+                .filter(|s| !s.is_empty()),
             max_request_size_kb: optional!("MAX_REQUEST_SIZE_KB", "64").parse().unwrap_or(64),
         })
     }

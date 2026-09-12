@@ -80,14 +80,7 @@ impl AppState {
         let cache = CacheService::new(valkey.clone());
         let jwt = JwtService::new(&config.jwt_secret, config.jwt_expiry_minutes);
         let email = EmailService::from_config(&config);
-        let storage = StorageService::from_config(
-            &config.aws_access_key_id,
-            &config.aws_secret_access_key,
-            &config.s3_region,
-            config.s3_bucket.clone(),
-            config.s3_endpoint.as_deref(),
-        )
-        .await;
+        let storage = StorageService::from_config(&config).expect("test: storage config");
 
         Self::new(db, cache, valkey, config, jwt, email, storage)
     }

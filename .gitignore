@@ -7,3 +7,6 @@
 
 docker/postgres/data/
 docker/valkey/data/
+
+# Local object-storage backend (development)
+/data/

@@ -74,18 +74,14 @@ async fn main() {
 
     let jwt = JwtService::new(&config.jwt_secret, config.jwt_expiry_minutes);
 
-    let storage = StorageService::from_config(
-        &config.aws_access_key_id,
-        &config.aws_secret_access_key,
-        &config.s3_region,
-        config.s3_bucket.clone(),
-        config.s3_endpoint.as_deref(),
-    )
-    .await;
+    let storage = StorageService::from_config(&config).unwrap_or_else(|e| {
+        tracing::error!("Object storage configuration error: {}", e);
+        std::process::exit(1);
+    });
 
     tracing::info!(
-        provider = storage.provider_name(),
-        bucket = %config.s3_bucket,
+        backend = storage.backend_name(),
+        bucket = %config.storage_bucket,
         "✓ Object storage configured"
     );
 
