@@ -291,3 +291,215 @@ async fn srp_init_rate_limit_triggers_after_5_attempts() {
         .await
         .assert_status(StatusCode::TOO_MANY_REQUESTS);
 }
+
+// ─── B4 regression: CI/CD API token routes ─────────────────────────────────────
+//
+// routes/tokens.rs was fully implemented but never added to the router, so there
+// was no way to create an API token at all.
+
+/// Register a user and mint a JWT that claims a verified email, so the test can
+/// reach vault routes. The server only ever issues `email_verified: true` when the
+/// database says so; minting one here with the real secret is test setup, not a
+/// bypass under test.
+async fn verified_user(server: &TestServer) -> (Uuid, String) {
+    let user_id = register_user(server).await;
+    let token = jwt_service()
+        .await
+        .issue(user_id, Uuid::new_v4(), true)
+        .unwrap();
+    (user_id, token)
+}
+
+async fn create_vault(server: &TestServer, jwt: &str) -> Uuid {
+    let name = format!("v{}", Uuid::new_v4().simple()); // regex: ^[a-z0-9-]+$
+    let resp = bearer(server.post("/api/v1/vaults"), jwt)
+        .json(&serde_json::json!({
+            "name": name,
+            "environment": "development",
+            "encrypted_vault_key": "Zm9v",
+            "eph_pub_key": "YmFy",
+        }))
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+    Uuid::parse_str(
+        resp.json::<serde_json::Value>()["vault_id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+/// Mint an API token. `vault_id: None` means unscoped.
+async fn create_api_token(
+    server: &TestServer,
+    jwt: &str,
+    scope: &str,
+    vault_id: Option<Uuid>,
+) -> String {
+    let resp = bearer(server.post("/api/v1/auth/tokens"), jwt)
+        .json(&serde_json::json!({
+            "name": "ci",
+            "scope": scope,
+            "vault_id": vault_id,
+        }))
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+    let body = resp.json::<serde_json::Value>();
+    body["raw_token"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn api_token_can_be_created_listed_and_revoked() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+
+    let resp = bearer(server.post("/api/v1/auth/tokens"), &jwt)
+        .json(&serde_json::json!({ "name": "ci", "scope": "read" }))
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+    let created = resp.json::<serde_json::Value>();
+    let raw = created["raw_token"].as_str().unwrap();
+    assert!(
+        raw.starts_with("evnx_tok_"),
+        "token must carry the evnx_tok_ prefix so `evnx scan` can detect it"
+    );
+    let token_id = created["id"].as_str().unwrap().to_string();
+
+    let listed = bearer(server.get("/api/v1/auth/tokens"), &jwt).await;
+    listed.assert_status_ok();
+    let tokens = listed.json::<serde_json::Value>();
+    assert!(
+        tokens["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["id"].as_str() == Some(token_id.as_str())),
+        "created token missing from the list"
+    );
+    assert!(
+        !listed.text().contains(raw),
+        "the raw token must never be returned again after creation"
+    );
+
+    bearer(
+        server.delete(&format!("/api/v1/auth/tokens/{token_id}")),
+        &jwt,
+    )
+    .await
+    .assert_status(StatusCode::NO_CONTENT);
+
+    // A revoked token must stop authenticating.
+    let resp = bearer(server.get("/api/v1/vaults"), raw).await;
+    assert_eq!(resp.status_code(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn api_token_cannot_mint_another_token() {
+    // Otherwise a leaked CI token could mint itself a longer-lived, wider-scoped
+    // replacement and survive revocation of the original.
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let raw = create_api_token(&server, &jwt, "read_write", None).await;
+
+    for resp in [
+        bearer(server.post("/api/v1/auth/tokens"), &raw)
+            .json(&serde_json::json!({ "name": "escalate", "scope": "read_write" }))
+            .await,
+        bearer(server.get("/api/v1/auth/tokens"), &raw).await,
+    ] {
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::FORBIDDEN,
+            "an API token reached /auth/tokens — privilege escalation"
+        );
+    }
+}
+
+// ─── B3 regression: API tokens on vault routes, scope enforced ─────────────────
+
+#[tokio::test]
+async fn unscoped_read_token_can_read_but_not_write() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let raw = create_api_token(&server, &jwt, "read", None).await;
+
+    // Read is allowed — this is the whole point of B3 (CI `evnx cloud pull`).
+    bearer(server.get("/api/v1/vaults"), &raw)
+        .await
+        .assert_status_ok();
+
+    // Any mutation is refused for a read-only token.
+    let resp = bearer(server.post("/api/v1/vaults"), &raw)
+        .json(&serde_json::json!({
+            "name": "nope", "environment": "development",
+            "encrypted_vault_key": "Zm9v", "eph_pub_key": "YmFy",
+        }))
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn read_write_token_may_mutate() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+    let raw = create_api_token(&server, &jwt, "read_write", None).await;
+
+    // Reaches the handler rather than being refused by the guard. The push body
+    // is deliberately incomplete, so a 4xx from validation is fine — what matters
+    // is that it is not 403 from the scope check.
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault}/versions")),
+        &raw,
+    )
+    .json(&serde_json::json!({}))
+    .await;
+    assert_ne!(
+        resp.status_code(),
+        StatusCode::FORBIDDEN,
+        "a read_write token was refused a write"
+    );
+}
+
+#[tokio::test]
+async fn vault_scoped_token_cannot_reach_another_vault() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault_a = create_vault(&server, &jwt).await;
+    let vault_b = create_vault(&server, &jwt).await;
+
+    // Scoped to A only — both vaults belong to the same user, so this proves the
+    // guard enforces the token's scope and not merely vault membership.
+    let raw = create_api_token(&server, &jwt, "read", Some(vault_a)).await;
+
+    bearer(
+        server.get(&format!("/api/v1/vaults/{vault_a}/versions")),
+        &raw,
+    )
+    .await
+    .assert_status_ok();
+
+    let resp = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_b}/versions")),
+        &raw,
+    )
+    .await;
+    assert_eq!(
+        resp.status_code(),
+        StatusCode::FORBIDDEN,
+        "a token scoped to vault A reached vault B"
+    );
+}
+
+#[tokio::test]
+async fn vault_scoped_token_cannot_list_all_vaults() {
+    // GET /vaults has no :vault_id, so a vault-scoped token has no business
+    // there — enumerating every vault is outside what it was issued for.
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+    let raw = create_api_token(&server, &jwt, "read", Some(vault)).await;
+
+    let resp = bearer(server.get("/api/v1/vaults"), &raw).await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+}

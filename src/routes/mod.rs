@@ -76,11 +76,18 @@ pub fn create_router(state: AppState) -> Router {
 
     // Account management — a real user session only. An `evnx_tok_` CI token that
     // could reach these would be able to enrol its own authenticator on the
-    // account or revoke the owner's sessions.
+    // account, revoke the owner's sessions, or mint fresh tokens for itself.
     let account_routes = Router::new()
         .route("/logout", post(auth::logout))
         .route("/totp/setup", post(auth::totp_setup))
         .route("/totp/confirm", post(auth::totp_confirm))
+        // CI/CD API tokens. Minting a token is a privilege-granting act, so it
+        // requires a real login — a token must not be able to mint another.
+        .route(
+            "/tokens",
+            get(tokens::list_tokens).post(tokens::create_token),
+        )
+        .route("/tokens/:token_id", delete(tokens::revoke_token))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_user_session,
