@@ -35,9 +35,15 @@ pub fn build_router(state: AppState) -> Router {
     // Read the limit before `state` is moved into the router.
     let request_size_limit = (state.config.max_request_size_kb * 1024) as usize;
 
-    routes::create_router(state)
+    routes::create_router(state.clone())
         // Reject oversized bodies before parsing them — guards against memory exhaustion.
         .layer(RequestBodyLimitLayer::new(request_size_limit))
+        // Outermost so the headers land on every response, including rejections
+        // produced by the layers below (413 from the body limit, 404, 405).
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            middleware::security_headers::add_security_headers,
+        ))
         .layer(TraceLayer::new_for_http())
 }
 
