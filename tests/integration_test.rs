@@ -823,10 +823,11 @@ async fn enable_totp(server: &TestServer, user_id: Uuid) -> String {
         .unwrap()
         .to_string();
 
+    // 200, not 204 — confirm now returns the one-time recovery codes.
     let resp = bearer(server.post("/api/v1/auth/totp/confirm"), &jwt)
         .json(&serde_json::json!({ "totp_code": totp_code(&secret) }))
         .await;
-    resp.assert_status(StatusCode::NO_CONTENT);
+    resp.assert_status_ok();
 
     secret
 }
@@ -1165,4 +1166,316 @@ async fn create_vault_handler_uses_a_transaction() {
         !body.contains("vaults::create(&state.db"),
         "create_vault is inserting outside the transaction"
     );
+}
+
+// ─── B15 regression: TOTP must never be a one-way door ─────────────────────────
+//
+// Before this, /totp/confirm returned 204 with no recovery codes and there was no
+// disable or reset endpoint anywhere. A user who enabled TOTP and lost their
+// authenticator could never log in again — and since the server holds only
+// ciphertext, it could not recover their vaults either. That is data loss.
+
+/// Enable TOTP and return (secret, backup codes).
+async fn enable_totp_with_codes(server: &TestServer, jwt: &str) -> (String, Vec<String>) {
+    let setup = bearer(server.post("/api/v1/auth/totp/setup"), jwt).await;
+    setup.assert_status_ok();
+    let secret = setup.json::<serde_json::Value>()["secret_base32"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = bearer(server.post("/api/v1/auth/totp/confirm"), jwt)
+        .json(&serde_json::json!({ "totp_code": totp_code(&secret) }))
+        .await;
+    resp.assert_status_ok();
+
+    let codes: Vec<String> = resp.json::<serde_json::Value>()["backup_codes"]
+        .as_array()
+        .expect("confirm must return backup codes")
+        .iter()
+        .map(|c| c.as_str().unwrap().to_string())
+        .collect();
+    (secret, codes)
+}
+
+#[tokio::test]
+async fn totp_confirm_issues_recovery_codes() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let (_secret, codes) = enable_totp_with_codes(&server, &jwt).await;
+
+    assert_eq!(codes.len(), 10, "expected a full set of recovery codes");
+    let unique: std::collections::HashSet<_> = codes.iter().collect();
+    assert_eq!(unique.len(), codes.len(), "recovery codes must be distinct");
+    for c in &codes {
+        assert!(
+            c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-'),
+            "code should be transcribable by hand: {c}"
+        );
+        // Alphabet deliberately excludes 0/O and 1/l/I.
+        assert!(
+            !c.contains('0') && !c.contains('O') && !c.contains('1') && !c.contains('I'),
+            "code contains an easily-misread character: {c}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_lost_authenticator_does_not_lock_the_user_out() {
+    // The scenario in full: TOTP is on, the phone is gone, only the printed codes
+    // remain. The user must still be able to log in.
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+    let jwt = jwt_service()
+        .await
+        .issue(account.user_id, Uuid::new_v4(), true)
+        .unwrap();
+    let (_secret, codes) = enable_totp_with_codes(&server, &jwt).await;
+
+    let pending = srp_login(&server, &account).await["totp_pending_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // No authenticator — redeem a printed code instead.
+    let resp = server
+        .post("/api/v1/auth/totp/verify")
+        .json(&serde_json::json!({
+            "totp_pending_token": pending,
+            "totp_code": codes[0],
+        }))
+        .await;
+    resp.assert_status_ok();
+
+    let body = resp.json::<serde_json::Value>();
+    let access = body["access_token"].as_str().expect("no access token");
+    assert_eq!(
+        body["backup_codes_remaining"], 9,
+        "a redeemed code must be spent, and the remainder reported"
+    );
+
+    bearer(server.get("/api/v1/auth/me"), access)
+        .await
+        .assert_status_ok();
+}
+
+#[tokio::test]
+async fn a_recovery_code_works_only_once() {
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+    let jwt = jwt_service()
+        .await
+        .issue(account.user_id, Uuid::new_v4(), true)
+        .unwrap();
+    let (_secret, codes) = enable_totp_with_codes(&server, &jwt).await;
+
+    for attempt in 0..2 {
+        let pending = srp_login(&server, &account).await["totp_pending_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let resp = server
+            .post("/api/v1/auth/totp/verify")
+            .json(&serde_json::json!({
+                "totp_pending_token": pending,
+                "totp_code": codes[0],
+            }))
+            .await;
+        if attempt == 0 {
+            resp.assert_status_ok();
+        } else {
+            assert_eq!(
+                resp.status_code(),
+                StatusCode::UNAUTHORIZED,
+                "the same recovery code was accepted twice"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn totp_can_be_disabled_and_requires_a_second_factor() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let (secret, _codes) = enable_totp_with_codes(&server, &jwt).await;
+
+    // A live session alone is not enough — stealing one must not strip 2FA.
+    let resp = bearer(server.post("/api/v1/auth/totp/disable"), &jwt)
+        .json(&serde_json::json!({ "totp_code": "000000" }))
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::UNAUTHORIZED);
+
+    // With a real code it works.
+    bearer(server.post("/api/v1/auth/totp/disable"), &jwt)
+        .json(&serde_json::json!({ "totp_code": totp_code(&secret) }))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    // And it is genuinely off — enabling again is allowed, which it would not be
+    // if totp_enabled had been left set.
+    bearer(server.post("/api/v1/auth/totp/setup"), &jwt)
+        .await
+        .assert_status_ok();
+}
+
+#[tokio::test]
+async fn recovery_codes_can_be_regenerated_and_the_old_set_dies() {
+    // Codes are single-use, so a user who spends the last one would be back to a
+    // lockout without this.
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let (secret, old_codes) = enable_totp_with_codes(&server, &jwt).await;
+
+    let resp = bearer(server.post("/api/v1/auth/totp/backup-codes"), &jwt)
+        .json(&serde_json::json!({ "totp_code": totp_code(&secret) }))
+        .await;
+    resp.assert_status_ok();
+    let new_codes: Vec<String> = resp.json::<serde_json::Value>()["backup_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap().to_string())
+        .collect();
+
+    assert_eq!(new_codes.len(), 10);
+    let old: std::collections::HashSet<_> = old_codes.iter().collect();
+    assert!(
+        new_codes.iter().all(|c| !old.contains(c)),
+        "regeneration returned a code from the old set"
+    );
+
+    // An old code must no longer redeem.
+    let account_jwt = jwt.clone();
+    let resp = bearer(server.post("/api/v1/auth/totp/disable"), &account_jwt)
+        .json(&serde_json::json!({ "totp_code": old_codes[0] }))
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "a superseded recovery code still worked"
+    );
+}
+
+// ─── B5 regression: security headers ───────────────────────────────────────────
+
+#[tokio::test]
+async fn security_headers_are_served() {
+    // middleware/security_headers.rs existed from early on but was never declared
+    // in middleware/mod.rs, so it had never been compiled and none of these were
+    // ever sent.
+    let server = test_app().await;
+    let resp = server.get("/health").await;
+    resp.assert_status_ok();
+
+    let h = resp.headers();
+    assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
+    assert_eq!(h.get("x-frame-options").unwrap(), "DENY");
+    assert_eq!(h.get("referrer-policy").unwrap(), "no-referrer");
+    assert!(h
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("default-src 'none'"));
+
+    // HSTS is production-only: pinning localhost to HTTPS would be useless and
+    // painful to undo.
+    assert!(
+        h.get("strict-transport-security").is_none(),
+        "HSTS must not be sent in development"
+    );
+
+    // Obsolete and harmful in the browsers that honoured it.
+    assert!(h.get("x-xss-protection").is_none());
+}
+
+// ─── B14 regression: sessions ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn sessions_can_be_listed_and_revoked() {
+    // The login-alert email tells users to "revoke all sessions from your account
+    // settings" — until now there was no endpoint behind that sentence.
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+
+    // Two real logins = two sessions.
+    let first = srp_login(&server, &account).await;
+    let second = srp_login(&server, &account).await;
+    let second_access = second["access_token"].as_str().unwrap().to_string();
+
+    let listed = bearer(server.get("/api/v1/auth/sessions"), &second_access).await;
+    listed.assert_status_ok();
+    let sessions = listed.json::<serde_json::Value>();
+    let arr = sessions["sessions"].as_array().unwrap();
+    assert!(
+        arr.len() >= 2,
+        "expected at least two sessions, got {}",
+        arr.len()
+    );
+    assert_eq!(
+        arr.iter().filter(|s| s["current"] == true).count(),
+        1,
+        "exactly one session must be marked current"
+    );
+
+    // Revoking the others must not sign the caller out.
+    let resp = bearer(
+        server.delete("/api/v1/auth/sessions/others"),
+        &second_access,
+    )
+    .await;
+    resp.assert_status_ok();
+    assert!(
+        resp.json::<serde_json::Value>()["revoked"]
+            .as_i64()
+            .unwrap()
+            >= 1
+    );
+
+    bearer(server.get("/api/v1/auth/me"), &second_access)
+        .await
+        .assert_status_ok();
+
+    // The other session's access token is dead immediately, not in 15 minutes.
+    let first_access = first["access_token"].as_str().unwrap();
+    assert_eq!(
+        bearer(server.get("/api/v1/auth/me"), first_access)
+            .await
+            .status_code(),
+        StatusCode::UNAUTHORIZED,
+        "a revoked session's access token still worked"
+    );
+}
+
+#[tokio::test]
+async fn a_session_belonging_to_someone_else_cannot_be_revoked() {
+    let server = test_app().await;
+    let victim = register_srp_account(&server).await;
+    let attacker = register_srp_account(&server).await;
+
+    let victim_login = srp_login(&server, &victim).await;
+    let victim_access = victim_login["access_token"].as_str().unwrap().to_string();
+    let attacker_access = srp_login(&server, &attacker).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let victim_session = bearer(server.get("/api/v1/auth/sessions"), &victim_access)
+        .await
+        .json::<serde_json::Value>()["sessions"][0]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = bearer(
+        server.delete(&format!("/api/v1/auth/sessions/{victim_session}")),
+        &attacker_access,
+    )
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
+
+    // And the victim is still signed in.
+    bearer(server.get("/api/v1/auth/me"), &victim_access)
+        .await
+        .assert_status_ok();
 }
