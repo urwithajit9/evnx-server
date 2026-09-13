@@ -1,7 +1,21 @@
 # docker/Dockerfile.server
 
 # ── Stage 1: Build ───────────────────────────────────────────────────────────
-FROM rust:1.76-slim AS builder
+# Pinned, not floating: `rust:slim` would drift under the image and change what
+# gets shipped without a commit. 1.98 is the toolchain that resolved Cargo.lock.
+#
+# The floor is 1.85 — evnx-crypto declares `rust-version = "1.85"` (zeroize_derive
+# needs edition2024). This said 1.76 until 2026-09-13, which could not have built
+# the crate at all; it went unnoticed because the missing sibling checkout for the
+# old `path` dependency failed the build earlier still.
+#
+# ⚠️ The Debian release is pinned explicitly on BOTH stages and they must match.
+# The binary links dynamically against glibc, so a builder newer than the runtime
+# produces an image that builds cleanly and then dies on start with
+# `libc.so.6: version 'GLIBC_2.38' not found`. Bare `rust:1.98-slim` is trixie
+# while the runtime was bookworm — exactly that failure. Verified by running the
+# binary, which a successful `docker build` does not do.
+FROM rust:1.98-slim-trixie AS builder
 
 WORKDIR /app
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
@@ -17,7 +31,8 @@ ENV SQLX_OFFLINE=true
 RUN touch src/main.rs && cargo build --release
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
-FROM debian:bookworm-slim AS production
+# Same Debian release as the builder above — see the glibc note there.
+FROM debian:trixie-slim AS production
 
 RUN apt-get update && apt-get install -y ca-certificates libssl3 curl && rm -rf /var/lib/apt/lists/*
 

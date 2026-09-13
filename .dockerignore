@@ -1,0 +1,25 @@
+# Build context sent to the daemon. Without this file `COPY . .` ships the whole
+# working tree — 14 GB of target/ locally, and any .env sitting next to it.
+#
+# The .env exclusion is the important one. The production stage copies only the
+# compiled binary, so a secret in the builder never reaches the shipped image —
+# but deploy.yml exports every layer with `cache-to: type=gha,mode=max`, so a
+# JWT_SECRET or RESEND_API_KEY copied into the builder would land in the shared
+# Actions cache.
+
+target/
+.git/
+.github/
+
+.env
+.env.*
+!.env.example
+
+# Local object-storage backend and container state
+data/
+docker/postgres/data/
+docker/valkey/data/
+
+# Not needed to build
+*.md
+!README.md
