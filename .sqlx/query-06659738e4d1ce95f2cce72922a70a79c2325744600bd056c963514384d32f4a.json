@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            session_id                          AS \"session_id!\",\n            MIN(created_at)                     AS \"created_at!\",\n            MAX(created_at)                     AS \"last_used_at!\",\n            MAX(expires_at)                     AS \"expires_at!\"\n        FROM refresh_tokens\n        WHERE user_id = $1\n          AND revoked_at IS NULL\n          AND expires_at > NOW()\n        GROUP BY session_id\n        ORDER BY MAX(created_at) DESC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "session_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "created_at!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "last_used_at!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "expires_at!",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "06659738e4d1ce95f2cce72922a70a79c2325744600bd056c963514384d32f4a"
+}

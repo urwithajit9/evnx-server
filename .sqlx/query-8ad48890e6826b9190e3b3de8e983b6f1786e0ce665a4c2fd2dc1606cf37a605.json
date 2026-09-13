@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO totp_backup_codes (user_id, code_hash) VALUES ($1, $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8ad48890e6826b9190e3b3de8e983b6f1786e0ce665a4c2fd2dc1606cf37a605"
+}

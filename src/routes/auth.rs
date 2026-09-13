@@ -11,7 +11,7 @@ use srp::groups::G_2048;
 use srp::server::SrpServer;
 
 use crate::{
-    db::{tokens as db_tokens, users},
+    db::{tokens as db_tokens, totp as db_totp, users},
     errors::AppError,
     state::AppState,
 };
@@ -688,7 +688,7 @@ pub async fn totp_confirm(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<Claims>,
     Json(req): Json<serde_json::Value>,
-) -> Result<axum::http::StatusCode, AppError> {
+) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), AppError> {
     let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
     let code = req
         .get("totp_code")
@@ -718,10 +718,54 @@ pub async fn totp_confirm(
     .await
     .map_err(AppError::Database)?;
 
+    // Issue recovery codes. This is the whole reason enabling TOTP is safe: without
+    // them a lost authenticator locks the user out permanently, and the server
+    // cannot recover their vaults because it only holds ciphertext.
+    let codes = generate_backup_codes();
+    let hashes: Vec<String> = codes.iter().map(|c| hash_token(c)).collect();
+    db_totp::replace_all(&state.db, user_id, &hashes).await?;
+
     // Remove the pending setup key
     state.cache.del(&format!("totp_setup:{}", user_id)).await?;
 
-    Ok(axum::http::StatusCode::NO_CONTENT)
+    // 200, not 204: the codes are shown exactly once and cannot be retrieved
+    // again. A client that discards this response has locked its user out.
+    Ok((
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({
+            "backup_codes": codes,
+            "note": "Store these now — they are shown once and cannot be recovered.                      Each works once, in place of a TOTP code.",
+        })),
+    ))
+}
+
+/// Generate a fresh set of recovery codes.
+///
+/// Alphabet excludes the characters people misread when copying by hand
+/// (`0`/`O`, `1`/`l`/`I`), because these get written down. Each code carries
+/// ~51 bits of entropy, and redemption is bounded by the same TOTP lockout
+/// counter as ordinary codes.
+fn generate_backup_codes() -> Vec<String> {
+    use rand::RngCore;
+    const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+    const GROUPS: usize = 2;
+    const GROUP_LEN: usize = 5;
+
+    (0..db_totp::BACKUP_CODE_COUNT)
+        .map(|_| {
+            let mut raw = [0u8; GROUPS * GROUP_LEN];
+            rand::rngs::OsRng.fill_bytes(&mut raw);
+            let chars: Vec<char> = raw
+                .iter()
+                .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
+                .collect();
+            chars
+                .chunks(GROUP_LEN)
+                .map(|c| c.iter().collect::<String>())
+                .collect::<Vec<_>>()
+                .join("-")
+        })
+        .collect()
 }
 
 /// Verify TOTP code during login (when requires_totp = true).
@@ -780,8 +824,26 @@ pub async fn totp_verify_login(
         .totp_secret_enc
         .ok_or_else(|| AppError::Internal("TOTP enabled but no secret".into()))?;
 
-    // Verify code
-    match verify_totp_code(&secret_base32, code) {
+    // A recovery code is accepted wherever a TOTP code is. Try TOTP first — it is
+    // the common case and costs nothing — then fall back to redeeming a code.
+    // Redemption is a single atomic UPDATE, so two concurrent logins cannot spend
+    // the same code.
+    let outcome = match verify_totp_code(&secret_base32, code) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            if db_totp::redeem(&state.db, user_id, &hash_token(code)).await? {
+                tracing::info!(
+                    user_id = %user_id,
+                    "Login used a TOTP recovery code"
+                );
+                Ok(())
+            } else {
+                Err(AppError::Unauthorized)
+            }
+        }
+    };
+
+    match outcome {
         Ok(()) => {
             // Spend the pending token — one full session per SRP exchange.
             // Deliberately not done on failure: a mistyped code should not force
@@ -794,9 +856,13 @@ pub async fn totp_verify_login(
             let (access_token, refresh_token) =
                 issue_token_pair(&state, user_id, user.email_verified).await?;
 
+            let backup_codes_remaining = db_totp::remaining(&state.db, user_id).await?;
             Ok(Json(serde_json::json!({
                 "access_token": access_token,
                 "refresh_token": refresh_token,
+                // So a client can warn before the user reaches zero and locks
+                // themselves out the moment they change phones.
+                "backup_codes_remaining": backup_codes_remaining,
             })))
         }
         Err(_) => {
@@ -805,6 +871,103 @@ pub async fn totp_verify_login(
             Err(AppError::Unauthorized)
         }
     }
+}
+
+/// Turn TOTP off.
+///
+/// Requires a currently-valid TOTP code **or** an unused recovery code, not just
+/// a session. Someone who steals a live session should not be able to strip the
+/// second factor off the account with it.
+pub async fn totp_disable(
+    State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<Claims>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<axum::http::StatusCode, AppError> {
+    let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
+    let code = req
+        .get("totp_code")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Validation("totp_code required".into()))?;
+
+    let user = users::find_by_id(&state.db, user_id)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    if !user.totp_enabled {
+        return Err(AppError::Conflict("TOTP is not enabled".into()));
+    }
+    let secret = user
+        .totp_secret_enc
+        .ok_or_else(|| AppError::Internal("TOTP enabled but no secret".into()))?;
+
+    let authorised = verify_totp_code(&secret, code).is_ok()
+        || db_totp::redeem(&state.db, user_id, &hash_token(code)).await?;
+    if !authorised {
+        return Err(AppError::Unauthorized);
+    }
+
+    // Clear the secret and every recovery code together — leaving codes behind
+    // for a disabled factor would let them re-authorise a later re-enable.
+    let mut tx = state.db.begin().await.map_err(AppError::Database)?;
+    sqlx::query!(
+        "UPDATE users SET totp_secret_enc = NULL, totp_enabled = false, updated_at = NOW()
+         WHERE id = $1",
+        user_id,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(AppError::Database)?;
+    sqlx::query!("DELETE FROM totp_backup_codes WHERE user_id = $1", user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::Database)?;
+    tx.commit().await.map_err(AppError::Database)?;
+
+    tracing::info!(user_id = %user_id, "TOTP disabled");
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Issue a fresh set of recovery codes, invalidating the old set.
+///
+/// Needed because codes are single-use: a user who spends the last one would
+/// otherwise be one lost phone away from the lockout this feature prevents.
+/// Requires a valid TOTP or recovery code, for the same reason as disabling.
+pub async fn totp_regenerate_backup_codes(
+    State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<Claims>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
+    let code = req
+        .get("totp_code")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Validation("totp_code required".into()))?;
+
+    let user = users::find_by_id(&state.db, user_id)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    if !user.totp_enabled {
+        return Err(AppError::Conflict("TOTP is not enabled".into()));
+    }
+    let secret = user
+        .totp_secret_enc
+        .ok_or_else(|| AppError::Internal("TOTP enabled but no secret".into()))?;
+
+    let authorised = verify_totp_code(&secret, code).is_ok()
+        || db_totp::redeem(&state.db, user_id, &hash_token(code)).await?;
+    if !authorised {
+        return Err(AppError::Unauthorized);
+    }
+
+    let codes = generate_backup_codes();
+    let hashes: Vec<String> = codes.iter().map(|c| hash_token(c)).collect();
+    db_totp::replace_all(&state.db, user_id, &hashes).await?;
+
+    tracing::info!(user_id = %user_id, "TOTP recovery codes regenerated");
+    Ok(Json(serde_json::json!({
+        "backup_codes": codes,
+        "note": "Your previous codes no longer work. Store these now — they are \
+                 shown once and cannot be recovered.",
+    })))
 }
 
 /// Validate a 6-digit TOTP code against a base32 secret.

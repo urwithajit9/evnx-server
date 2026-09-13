@@ -11,6 +11,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 pub mod auth;
 pub mod members;
+pub mod sessions;
 pub mod tokens;
 pub mod users;
 pub mod vaults;
@@ -86,6 +87,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/logout", post(auth::logout))
         .route("/totp/setup", post(auth::totp_setup))
         .route("/totp/confirm", post(auth::totp_confirm))
+        // Disabling TOTP or reissuing recovery codes needs a valid second factor,
+        // not merely a live session — see the handlers.
+        .route("/totp/disable", post(auth::totp_disable))
+        .route(
+            "/totp/backup-codes",
+            post(auth::totp_regenerate_backup_codes),
+        )
         // CI/CD API tokens. Minting a token is a privilege-granting act, so it
         // requires a real login — a token must not be able to mint another.
         .route(
@@ -93,6 +101,10 @@ pub fn create_router(state: AppState) -> Router {
             get(tokens::list_tokens).post(tokens::create_token),
         )
         .route("/tokens/:token_id", delete(tokens::revoke_token))
+        // Sessions. The login-alert email points users here.
+        .route("/sessions", get(sessions::list_sessions))
+        .route("/sessions/others", delete(sessions::revoke_other_sessions))
+        .route("/sessions/:session_id", delete(sessions::revoke_session))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_user_session,
