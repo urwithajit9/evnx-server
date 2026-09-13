@@ -70,10 +70,21 @@ totp-rs = { version = "5", features = ["qr"] }
 axum-extra = { version = "0.9", features = ["typed-header"] }
 headers    = "0.4"
 
-# evnx-crypto (for type reuse — CryptoError, etc.)
-# evnx-crypto = { git = "https://github.com/urwithajit9/evnx-crypto", tag = "v0.1.0" }
-# For local development, use the path dependency to avoid needing to publish evnx-crypto to crates.io or tag a git release every time we make a change:
-evnx-crypto = { path = "../evnx-crypto" }
+# Zero-knowledge crypto primitives, shared with the evnx CLI so both ends of the
+# wire agree byte for byte. Published to crates.io on 2026-09-13, so this is a
+# plain registry dependency and CI, the Docker build and any fresh clone resolve
+# it without the sibling checkout a path dependency needed.
+#
+# To iterate on evnx-crypto locally, override it *outside* this manifest —
+# `.cargo/config.toml` is gitignored for exactly that:
+#
+#     [patch.crates-io]
+#     evnx-crypto = { path = "../evnx-crypto" }
+#
+# Adding `path` back here would undo the fix even alongside a `version`: cargo
+# always prefers the path and never falls back to the registry when it is
+# missing. Verified — it errors rather than resolving.
+evnx-crypto = "0.1"
 rand = "0.8.0"
 
 # Provider-agnostic object storage: S3, GCS, Azure Blob, local filesystem and

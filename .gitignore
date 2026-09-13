@@ -10,3 +10,9 @@ docker/valkey/data/
 
 # Local object-storage backend (development)
 /data/
+
+# Local-only cargo overrides. Used to point evnx-crypto at the sibling checkout
+# while iterating on it, without putting a `path` back into Cargo.toml:
+#     [patch.crates-io]
+#     evnx-crypto = { path = "../evnx-crypto" }
+.cargo/config.toml
