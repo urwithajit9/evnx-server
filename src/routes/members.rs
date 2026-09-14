@@ -60,7 +60,9 @@ pub async fn add_member(
         target.id,
         &req.role,
         &req.encrypted_vault_key,
-        &req.eph_pub_key,
+        // Always present here: sharing wraps by ECDH for the recipient's X25519
+        // key, which by definition produces an ephemeral.
+        Some(&req.eph_pub_key),
         requester_id,
     )
     .await?;

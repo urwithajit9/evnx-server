@@ -329,6 +329,30 @@ async fn create_vault(server: &TestServer, jwt: &str) -> Uuid {
     .unwrap()
 }
 
+/// A vault's creator wraps their own key under their master key, which uses no
+/// ECDH and so produces no ephemeral. Omitting `eph_pub_key` must be accepted.
+///
+/// This is not a shape preference. Solo vaults are post-quantum safe precisely
+/// because that path is Argon2id + XChaCha20 and never touches X25519; requiring
+/// an ephemeral would force the creator through ECDH and make every vault
+/// vulnerable to harvest-now-decrypt-later.
+#[tokio::test]
+async fn create_vault_accepts_a_master_key_wrap_with_no_ephemeral() {
+    let server = test_app().await;
+    let (_user_id, token) = verified_user(&server).await;
+
+    let resp = bearer(server.post("/api/v1/vaults"), &token)
+        .json(&serde_json::json!({
+            "name": format!("solo-{}", Uuid::new_v4().simple()),
+            "environment": "development",
+            "encrypted_vault_key": "d3JhcHBlZC11bmRlci10aGUtbWFzdGVyLWtleQ==",
+            // eph_pub_key deliberately absent
+        }))
+        .await;
+
+    resp.assert_status(StatusCode::CREATED);
+}
+
 /// Mint an API token. `vault_id: None` means unscoped.
 async fn create_api_token(
     server: &TestServer,
@@ -1114,7 +1138,7 @@ async fn a_failed_member_insert_rolls_the_vault_back() {
         Uuid::new_v4(),
         "owner",
         "Zm9v",
-        "YmFy",
+        None,
         owner_id,
     )
     .await;

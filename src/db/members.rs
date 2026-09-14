@@ -18,7 +18,7 @@ pub async fn add_member<'e, E>(
     user_id: Uuid,
     role: &str,
     encrypted_vault_key: &str,
-    eph_pub_key: &str,
+    eph_pub_key: Option<&str>,
     granted_by: Uuid,
 ) -> Result<(), sqlx::Error>
 where

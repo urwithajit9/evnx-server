@@ -26,9 +26,25 @@ pub struct CreateVaultRequest {
     #[validate(length(min = 1, max = 32))]
     pub environment: String,
 
-    /// ECDH-wrapped vault key for the owner (generated client-side).
+    /// The creator's own copy of the vault key, wrapped client-side. The server
+    /// never sees it unwrapped and never inspects it.
     pub encrypted_vault_key: String,
-    pub eph_pub_key: String,
+
+    /// Ephemeral X25519 public key, present **only** when the wrap was done by
+    /// ECDH — that is, for a key wrapped *for someone else*.
+    ///
+    /// A vault's creator wraps their own copy under their master key
+    /// (`wrap_vault_key_with_master_key`), which involves no ECDH and therefore
+    /// no ephemeral, so this is `None`. That is not a detail: solo vaults are
+    /// post-quantum safe precisely because that path is Argon2id + XChaCha20 and
+    /// never touches X25519. Requiring an ephemeral here would force the creator
+    /// through ECDH and silently make every vault vulnerable to
+    /// harvest-now-decrypt-later, contradicting the guarantee in CLAUDE.md and
+    /// `evnx-crypto/docs/security-model.md`.
+    ///
+    /// The column is nullable for the same reason.
+    #[serde(default)]
+    pub eph_pub_key: Option<String>,
 }
 
 // Regex for vault names: lowercase alphanumeric + hyphens.
@@ -83,15 +99,16 @@ pub async fn create_vault(
             AppError::Database(e)
         })?;
 
-    // The owner's own copy of the vault key, ECDH-wrapped client-side. The server
-    // never sees the unwrapped key.
+    // The owner's own copy of the vault key, wrapped client-side under their
+    // master key. The server never sees it unwrapped, and stores no ephemeral
+    // because that path uses no ECDH — see CreateVaultRequest::eph_pub_key.
     members::add_member(
         &mut *tx,
         vault_id,
         user_id,
         "owner",
         &req.encrypted_vault_key,
-        &req.eph_pub_key,
+        req.eph_pub_key.as_deref(),
         user_id,
     )
     .await?;
