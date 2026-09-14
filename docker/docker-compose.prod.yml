@@ -1,9 +1,45 @@
-# docker/docker-compose.prod.yml — updated
+# docker/docker-compose.prod.yml
+#
+# Production stack: Caddy (TLS) → evnx-server → Postgres + Valkey.
+#
+# Run with:  docker compose -f docker/docker-compose.prod.yml --env-file .env.prod up -d
+#
+# ─── Things this file gets deliberately right ────────────────────────────────
+#
+# *No database ports are published.* The dev compose binds 5432 and 6379 to
+# 0.0.0.0, which on a public host puts Postgres and Valkey on the internet. Here
+# they exist only on the `backend` network and are reachable by service name.
+#
+# *`backend` is NOT `internal: true`.* An internal network has no outbound route,
+# and the server must reach Resend for email and the object store for blobs. An
+# earlier revision of this file set it, which would have failed both silently at
+# runtime rather than loudly at boot.
+#
+# *There is no migrator service.* `main.rs` runs `sqlx::migrate!` at startup, so
+# migrations apply automatically. An earlier revision invoked a `migrate`
+# subcommand that has never existed.
+#
+# *Caddy terminates TLS.* The server binds inside the network only; nothing but
+# Caddy is exposed on 80/443.
 
 services:
   postgres:
     image: postgres:16-alpine
-    # ... (unchanged) ...
+    container_name: evnx_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-evnx}
+      POSTGRES_USER: ${POSTGRES_USER:-evnx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-evnx} -d ${POSTGRES_DB:-evnx}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   valkey:
     image: valkey/valkey:9-alpine
@@ -11,7 +47,7 @@ services:
     restart: unless-stopped
     command: >
       valkey-server
-      --requirepass ${VALKEY_PASSWORD}
+      --requirepass ${VALKEY_PASSWORD:?VALKEY_PASSWORD is required}
       --maxmemory 256mb
       --maxmemory-policy allkeys-lru
       --loglevel warning
@@ -20,51 +56,60 @@ services:
     networks:
       - backend
     healthcheck:
-      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD}", "ping"]
+      test: ["CMD-SHELL", "valkey-cli -a \"$$VALKEY_PASSWORD\" ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
-      retries: 5
-
-  migrator:
-    image: ghcr.io/urwithajit9/evnx-server:latest
-    container_name: evnx_migrator
-    command: ["/usr/local/bin/evnx-server", "migrate"]
-    # Note: your binary needs a "migrate" subcommand, OR use a separate sqlx-cli image:
-    # image: ghcr.io/launchbadge/sqlx-cli:latest
-    # command: ["sqlx", "migrate", "run"]
-    env_file: .env.prod
-    depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - backend
+      retries: 10
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD}
 
   server:
-    image: ghcr.io/urwithajit9/evnx-server:latest
+    image: ${EVNX_IMAGE:-ghcr.io/urwithajit9/evnx-server:latest}
     container_name: evnx_server
     restart: unless-stopped
-    env_file: .env.prod
-    ports:
-      - "127.0.0.1:8080:8080"
+    env_file: ../.env.prod
+    networks:
+      - backend
     depends_on:
       postgres:
         condition: service_healthy
       valkey:
         condition: service_healthy
+    healthcheck:
+      # The image has curl in the runtime stage for exactly this.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: evnx_caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # certificates — losing this re-issues, and Let's
+                              # Encrypt rate-limits, so it must be a volume
+      - caddy_config:/config
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?API_DOMAIN is required}
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL is required}
     networks:
       - backend
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
+    depends_on:
+      - server
 
 networks:
   backend:
     driver: bridge
-    internal: true
 
 volumes:
   postgres_data:
   valkey_data:
+  caddy_data:
+  caddy_config:

@@ -16,3 +16,6 @@ docker/valkey/data/
 #     [patch.crates-io]
 #     evnx-crypto = { path = "../evnx-crypto" }
 .cargo/config.toml
+
+# Production secrets — never committed.
+.env.prod

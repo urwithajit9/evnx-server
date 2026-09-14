@@ -1,0 +1,77 @@
+# .github/workflows/publish-image.yml
+#
+# Build the server image and push it to ghcr.io.
+#
+# Manual (`workflow_dispatch`) and on a `v*` tag. Deployment itself is a separate,
+# deliberate act — see docs/DEPLOYMENT.md — because pushing an image and
+# restarting a live database-backed service are different risks.
+#
+# This replaces the old deploy.yml, which SSHed to a Hetzner host that no longer
+# exists and had never run successfully.
+
+name: Publish image
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  publish:
+    name: Build & push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.server
+          target: production
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # linux/amd64 only. Add linux/arm64 here before deploying to an ARM
+          # host — an amd64 image fails to start on one, confusingly.
+          platforms: linux/amd64
+          # No SQLX_OFFLINE build-arg: the Dockerfile sets it as an ENV, and an
+          # unconsumed build-arg is silently ignored with a warning. The offline
+          # query cache in .sqlx is what makes a live database unnecessary here.
+
+      - name: Summary
+        run: |
+          echo "### Published" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "Deploy with the runbook in docs/DEPLOYMENT.md." >> "$GITHUB_STEP_SUMMARY"

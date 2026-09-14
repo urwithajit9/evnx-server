@@ -1,0 +1,34 @@
+# docker/Caddyfile — TLS termination for evnx-server.
+#
+# Caddy obtains and renews a Let's Encrypt certificate automatically. That needs
+# port 80 reachable from the internet for the HTTP-01 challenge, and the DNS A
+# record pointing here **DNS-only** — if Cloudflare proxies the record (orange
+# cloud), the challenge is answered by Cloudflare and Caddy never gets a cert.
+
+{
+	email {$ACME_EMAIL}
+}
+
+{$API_DOMAIN} {
+	# evnx-server sets its own security headers, including HSTS when
+	# ENVIRONMENT=production, so Caddy does not add a competing set.
+	reverse_proxy server:8080 {
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+
+	# Blob uploads are base64 JSON, so the encoded body is ~4/3 of the
+	# ciphertext. evnx-server enforces its own limit via MAX_REQUEST_SIZE_KB;
+	# this is a coarse outer bound so a hostile body never reaches it.
+	request_body {
+		max_size 12MB
+	}
+
+	log {
+		# Never log request bodies: a push body is ciphertext, but a register
+		# body carries an SRP verifier and a verify-email URL carries a
+		# single-use token in its query string.
+		output stdout
+		format console
+	}
+}
