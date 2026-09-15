@@ -59,6 +59,24 @@ BUCKET="${BACKUP_BUCKET:-evnx-backups}"
 [ -n "$AWS_ACCESS_KEY_ID" ]     || die "AWS_ACCESS_KEY_ID is empty"
 [ -n "$AWS_SECRET_ACCESS_KEY" ] || die "AWS_SECRET_ACCESS_KEY is empty"
 
+# MUST be exported. `docker run -e VAR` (no `=value`) copies VAR from this
+# process's *environment*; a plain shell assignment is not in it, so the aws-cli
+# container would start with no credentials and fail with "Unable to locate
+# credentials". Exporting is deliberately preferred over `-e VAR=$VAR`, which
+# would put the secret key into the command line where `ps` can read it.
+export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+
+# Check credentials and bucket BEFORE spending minutes on a dump. A missing
+# bucket and a bad key are the two common setup errors and are indistinguishable
+# from each other once they surface as "upload failed" at the very end.
+log "preflight: checking s3://$BUCKET is reachable"
+docker run --rm \
+  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION="$REGION" \
+  amazon/aws-cli:latest \
+  s3 ls "s3://$BUCKET/" --endpoint-url "$ENDPOINT" >/dev/null \
+  || die "cannot list s3://$BUCKET at $ENDPOINT — does the bucket exist, and does the API token have write access to it? (create it separately from evnx-vaults; see docs/DEPLOYMENT.md §8)"
+log "preflight ok"
+
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 FILE="evnx-${STAMP}.sql.gz"
 OUT="$WORK_DIR/$FILE"
