@@ -238,21 +238,73 @@ Check the inbox, click the link, then `evnx auth login` and `evnx cloud status -
 
 ---
 
-## 8. Backups
+## 8. Backups — do this on day one
 
-**Do this on day one, not later.** The database holds wrapped vault keys and
-version metadata. Losing it does not expose anything — everything is ciphertext —
-but it strands users who can still decrypt data they can no longer reach.
+**This is the single point of total data loss.** Postgres holds the *only* copy of
+every wrapped vault key (`vault_members.encrypted_vault_key`). The CLI does not
+cache it — it fetches and unwraps it per command. So losing this database does not
+merely lose metadata: **every blob in object storage becomes cryptographically
+unrecoverable, including by the owner who knows their master password.** The master
+key unwraps the vault key; the wrapped vault key exists nowhere else.
+
+Object storage does not save you here. R2 holds the ciphertext; Postgres holds the
+key that opens it.
+
+### Set it up
+
+Create a **separate** bucket — `evnx-backups` — in the same R2 account.
+
+> Separate, not a prefix, so it can carry its own lifecycle rules and ideally its
+> own API token. The dump contains every `srp_verifier`, which is
+> password-equivalent for an **offline** dictionary attack. Anyone who can read
+> backups can attack master passwords at their leisure, with no rate limiting and
+> no lockout. If the server's own token is ever compromised, it should not also be
+> able to read or delete the backups.
+
+Then on the server:
 
 ```bash
-# /home/deploy/backup.sh
-set -euo pipefail
-docker exec evnx_postgres pg_dump -U evnx evnx | gzip > /tmp/evnx-$(date +%F).sql.gz
-# then copy it off the box — rclone to the same R2 account is the cheap option
+sudo cp scripts/evnx-backup.service scripts/evnx-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now evnx-backup.timer
 ```
 
-A daily cron is enough at this scale. **Test a restore before you rely on it**; an
-untested backup is a hypothesis.
+Run one immediately rather than waiting for 03:00:
+
+```bash
+sudo systemctl start evnx-backup.service && journalctl -u evnx-backup -n 30 --no-pager
+```
+
+Check the schedule with `systemctl list-timers evnx-backup`.
+
+### What the script refuses to do
+
+It will not upload a dump under 1 KiB, one that fails `gzip -t`, or one that does
+not contain `CREATE TABLE public.vault_members`. An empty backup silently
+replacing a good one is worse than no backup, so each of those is a hard failure.
+Pruning happens only *after* a successful upload, so a failing upload cannot
+quietly erode the history.
+
+### Test the restore — an untested backup is a hypothesis
+
+```bash
+./scripts/restore.sh --list                     # what is in the bucket
+./scripts/restore.sh --dry-run <file.sql.gz>    # restore into a scratch database
+```
+
+`--dry-run` restores into a throwaway database and prints the row counts, proving
+the dump is genuinely restorable without touching production. **Do this monthly.**
+A real restore requires typing the database name to confirm, stops the server so
+nothing writes mid-restore, and starts it again afterwards.
+
+### What is *not* backed up, and why
+
+| | |
+|---|---|
+| **R2 blobs** | Already off-box and replicated by Cloudflare. Losing the server costs no ciphertext |
+| **Valkey** | Sessions, rate-limit counters, SRP state — all ephemeral. Losing it signs people out, nothing more |
+| **Caddy certificates** | Re-issued automatically |
+| **`.env.prod`** | ⚠️ **Your responsibility, and it is not automated on purpose.** Backing it up to R2 using credentials that live *inside it* is circular: lose the box and you need the file to reach the backup of the file. Keep a copy in a password manager. Without it the stack cannot be rebuilt, and `JWT_SECRET` in particular cannot be regenerated without signing every existing session out |
 
 ---
 

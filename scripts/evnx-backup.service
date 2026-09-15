@@ -1,0 +1,16 @@
+# /etc/systemd/system/evnx-backup.service
+#
+# A systemd timer rather than cron: output lands in the journal where it can be
+# read after the fact, failures are visible via `systemctl status`, and
+# Persistent=true means a backup missed while the box was off runs on boot.
+[Unit]
+Description=evnx-server Postgres backup
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/evnx-server
+ExecStart=/home/ubuntu/evnx-server/scripts/backup.sh
+# The script reads .env.prod itself and extracts only the variables it needs.

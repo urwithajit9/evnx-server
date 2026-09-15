@@ -1,0 +1,13 @@
+# /etc/systemd/system/evnx-backup.timer
+[Unit]
+Description=Nightly evnx-server Postgres backup
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 UTC
+# Run on boot if the scheduled time was missed while the machine was down.
+Persistent=true
+# Spread the load a little so every evnx host does not hit storage at once.
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target
