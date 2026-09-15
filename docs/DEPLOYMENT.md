@@ -57,31 +57,63 @@ dig +short api.evnx.dev    # must print 85.137.30.221
 ## 2. Object storage — Cloudflare R2
 
 `STORAGE_BACKEND=local` is **refused** when `ENVIRONMENT` is not `development`
-(`src/config.rs`), because a local filesystem is not shared between instances and
-a multi-instance deployment would serve blobs that exist on only one node. So
-production needs real object storage even for a demo.
+(`src/config.rs`): a local filesystem is not shared between instances, so a
+multi-instance deployment would serve blobs that exist on only one node.
+Production needs a real S3 API.
 
-1. Cloudflare dashboard → **R2** → *Create bucket* → `evnx-vaults`.
-2. **Manage R2 API Tokens** → *Create API token* → **Object Read & Write**,
-   scoped to that bucket only.
-3. Note the **Access Key ID**, **Secret Access Key**, and the endpoint
-   `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`.
+R2 is S3-compatible, so the existing `s3` backend drives it with an explicit
+endpoint. From the R2 dashboard you need three things:
 
-The server drives R2 through the `s3` backend with an explicit endpoint. R2
-ignores the region but the S3 client requires one, and it needs path-style
-addressing:
+| Value | Where |
+|---|---|
+| `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` | Bucket → Settings → S3 API |
+| Access Key ID | shown once when the R2 API token is created |
+| Secret Access Key | shown once, same place |
+
+Those go into `.env.prod` as:
 
 ```
 STORAGE_BACKEND=s3
+STORAGE_BUCKET=evnx-vaults
 STORAGE_ENDPOINT=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
 STORAGE_REGION=auto
 STORAGE_PATH_STYLE=true
+AWS_ACCESS_KEY_ID=<access key id>
+AWS_SECRET_ACCESS_KEY=<secret access key>
 ```
 
-> The bucket holds only ciphertext — AES-256-GCM blobs the server cannot read.
-> That is not a reason to make it public: blob keys are predictable from vault id
-> and version, so a public bucket would leak *which* vaults exist and how often
-> they change. Keep it private.
+Three things that go wrong here more often than anything else:
+
+- **`STORAGE_PATH_STYLE=true` is required.** R2's S3 endpoint only serves
+  `endpoint/bucket/key`. With virtual-hosted style the client resolves
+  `bucket.<account>.r2.cloudflarestorage.com`, which does not exist — and the
+  failure reads like a missing bucket rather than a config error.
+- **The endpoint carries no bucket name.** The client appends it.
+- **The keys are the Access Key ID and Secret Access Key from the R2 token**, not
+  a Cloudflare global API key and not the token string itself.
+
+**Keep the bucket private.** The contents are AES-256-GCM blobs the server cannot
+read, but blob keys are predictable from vault id and version — a public bucket
+would leak which vaults exist and how often they change.
+
+> ⚠️ **Verify a real round trip before trusting it.** S3-compatible providers
+> occasionally reject checksum headers that newer clients send, and the failure
+> surfaces only on the first upload — not at startup, where storage is merely
+> configured. Section 7 does a genuine `evnx cloud push` for this reason; do not
+> skip it.
+
+### If you ever need to self-host storage instead
+
+The stack carries an opt-in MinIO profile for hosts that cannot use a provider:
+
+```bash
+docker compose -f docker/docker-compose.prod.yml --env-file .env.prod \
+  --profile minio up -d
+```
+
+with `STORAGE_ENDPOINT=http://minio:9000` and `STORAGE_REGION=us-east-1`. Plain
+HTTP is deliberate — it never leaves the Docker bridge network, and
+`storage.rs` sets `allow_http` for an `http://` endpoint automatically.
 
 ---
 

@@ -63,6 +63,79 @@ services:
     environment:
       VALKEY_PASSWORD: ${VALKEY_PASSWORD}
 
+  # Object storage, self-hosted — **opt-in**, via `--profile minio`.
+  #
+  # The default deployment uses Cloudflare R2: blobs then live off the box, so a
+  # lost server costs no ciphertext and the backup story covers only Postgres.
+  # This profile exists for anyone who cannot use a hosted provider (R2 requires a
+  # payment method on file even for its free tier).
+  #
+  # Start it with:
+  #   docker compose -f docker/docker-compose.prod.yml --env-file .env.prod \
+  #     --profile minio up -d
+  # and set STORAGE_ENDPOINT=http://minio:9000 in .env.prod.
+  #
+  # Moving to R2, S3, GCS or Azure later is an env-var change and a data copy —
+  # nothing here or in the code is MinIO-specific. The server talks plain S3.
+  #
+  # Licence note: MinIO is AGPL-3.0. Running it as a separate service imposes
+  # nothing on evnx — there is no linking and nothing is distributed. It would
+  # only matter if you modified MinIO and shipped it.
+  minio:
+    image: minio/minio:latest
+    container_name: evnx_minio
+    profiles: ["minio"]
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      # Plain `${VAR}`, not `${VAR:?required}`. Compose interpolates variables
+      # **before** it filters by profile, so a required-marker here fails the
+      # entire file for everyone using R2 — the default path — even though this
+      # service never starts for them. MinIO refuses to boot without a password
+      # of its own accord, so the loud failure is preserved where it belongs.
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-}
+    volumes:
+      - minio_data:/data
+    networks:
+      - backend
+    # No ports published. MinIO is reachable only as http://minio:9000 on the
+    # internal network; its console on 9001 is deliberately not exposed either.
+    #
+    # Note the server does NOT depend_on minio-init: with the profile inactive
+    # that service does not exist, and an unsatisfiable dependency would stop the
+    # whole stack. Under `--profile minio`, start minio-init first or simply run
+    # `up -d` twice — the bucket only has to exist before the first push.
+
+  # One-shot: create the bucket MinIO does not create by itself.
+  #
+  # Retries rather than depending on a healthcheck, because the healthcheck tool
+  # available inside the MinIO image varies between releases and a wrong guess
+  # produces a container stuck "starting" forever.
+  minio-init:
+    image: minio/mc:latest
+    container_name: evnx_minio_init
+    profiles: ["minio"]
+    depends_on:
+      - minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-}
+      STORAGE_BUCKET: ${STORAGE_BUCKET:-evnx-vaults}
+    entrypoint: >
+      /bin/sh -c "
+      for i in $$(seq 1 30); do
+        mc alias set local http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\" && break;
+        echo 'waiting for minio...'; sleep 2;
+      done;
+      mc mb --ignore-existing local/$$STORAGE_BUCKET;
+      mc anonymous set none local/$$STORAGE_BUCKET;
+      echo 'bucket ready';
+      "
+    networks:
+      - backend
+    restart: "no"
+
   server:
     image: ${EVNX_IMAGE:-ghcr.io/urwithajit9/evnx-server:latest}
     container_name: evnx_server
@@ -111,5 +184,6 @@ networks:
 volumes:
   postgres_data:
   valkey_data:
+  minio_data:
   caddy_data:
   caddy_config:
