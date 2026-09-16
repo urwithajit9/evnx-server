@@ -400,6 +400,107 @@ pub async fn verify_email(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Deserialize, Validate)]
+pub struct ResendVerificationRequest {
+    #[validate(email)]
+    pub email: String,
+}
+
+/// Re-send the verification email.
+///
+/// Without this, an address whose verification email was lost, filtered or
+/// expired has **no route forward at all** — the account exists, cannot be
+/// verified, and the email is taken, so it cannot even be registered again.
+///
+/// # Why it always returns 202
+///
+/// The response is identical whether the address is unknown, already verified,
+/// or genuinely pending. Anything else turns this endpoint into an account
+/// oracle: an unauthenticated caller could enumerate which addresses are
+/// registered, which is exactly the enumeration `srp_init` already goes to
+/// trouble to prevent with its fake verifier. The work done differs; the
+/// observable response does not.
+///
+/// # Prior tokens are invalidated
+///
+/// Each resend expires every outstanding token for the account before issuing a
+/// new one. Otherwise repeated clicks would leave a widening set of live bearer
+/// credentials in mailboxes, each valid for 24 hours — and revoking one link
+/// would not revoke the others.
+pub async fn resend_verification(
+    State(state): State<AppState>,
+    Json(req): Json<ResendVerificationRequest>,
+) -> Result<axum::http::StatusCode, AppError> {
+    req.validate()
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+
+    let email = req.email.trim().to_lowercase();
+
+    // Rate limit on the address, matching `srp_init`'s shape. Deliberately
+    // tighter than a login: 3 per hour is generous for a human who lost an email
+    // and stingy for anyone using us to send mail at a third party.
+    //
+    // NOTE: per-IP limiting is not applied here because this server does not yet
+    // extract client IPs in handlers (audit events all pass `ip_hash: None`).
+    // Adding it means plumbing `ConnectInfo` and deciding how far to trust
+    // `X-Forwarded-For` from Caddy — a separate change, tracked rather than
+    // bolted on here.
+    let rate_key = format!(
+        "rate:resend_verify:{}",
+        blake3::hash(email.as_bytes()).to_hex()
+    );
+    if !state.cache.check_rate_limit(&rate_key, 3, 3600).await? {
+        return Err(AppError::RateLimited {
+            retry_after_seconds: 3600,
+        });
+    }
+
+    // From here on every path returns 202. Failures are logged, never surfaced.
+    if let Some(user) = users::find_by_email(&state.db, &email).await? {
+        if !user.email_verified {
+            // Expire outstanding tokens, then mint one, in a single transaction
+            // so a failure cannot leave the account with none at all.
+            let mut tx = state.db.begin().await?;
+            sqlx::query!(
+                "UPDATE email_verifications SET expires_at = NOW() \
+                 WHERE user_id = $1 AND used_at IS NULL AND expires_at > NOW()",
+                user.id
+            )
+            .execute(&mut *tx)
+            .await?;
+
+            let raw_token = generate_secure_token();
+            let token_hash = hash_token(&raw_token);
+            sqlx::query!(
+                "INSERT INTO email_verifications (user_id, token_hash, expires_at) \
+                 VALUES ($1, $2, NOW() + INTERVAL '24 hours')",
+                user.id,
+                token_hash
+            )
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+
+            // Fire-and-forget for the same reasons as registration: a mail outage
+            // must not fail the request, and awaiting delivery would let response
+            // timing reveal that this address exists. The token is a bearer
+            // credential and never reaches the logs.
+            tokio::spawn({
+                let email_svc = state.email.clone();
+                let recipient = email.clone();
+                let token = raw_token;
+                async move {
+                    if let Err(e) = email_svc.send_verification(&recipient, &token).await {
+                        tracing::error!(error = %e, "Failed to re-send verification email");
+                    }
+                }
+            });
+        }
+    }
+
+    Ok(axum::http::StatusCode::ACCEPTED)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct VerifyEmailQuery {
     pub token: String,

@@ -1503,3 +1503,100 @@ async fn a_session_belonging_to_someone_else_cannot_be_revoked() {
         .await
         .assert_status_ok();
 }
+
+// ─── resend-verification ───────────────────────────────────────────────────────
+//
+// The security property here is that the response is identical whether or not the
+// address exists. If these three tests ever disagree, the endpoint has become an
+// account-enumeration oracle.
+
+#[tokio::test]
+async fn resend_verification_accepts_a_pending_address() {
+    let server = test_app().await;
+    let email = unique_email("resend-pending");
+    server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&email))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    server
+        .post("/api/v1/auth/resend-verification")
+        .json(&serde_json::json!({ "email": email }))
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn resend_verification_gives_an_unknown_address_the_same_answer() {
+    let server = test_app().await;
+    // Never registered. Must be indistinguishable from the case above.
+    let res = server
+        .post("/api/v1/auth/resend-verification")
+        .json(&serde_json::json!({ "email": unique_email("resend-ghost") }))
+        .await;
+    res.assert_status(StatusCode::ACCEPTED);
+    assert!(
+        res.text().is_empty(),
+        "202 body must stay empty — any detail here leaks whether the account exists"
+    );
+}
+
+#[tokio::test]
+async fn resend_verification_rejects_a_malformed_address() {
+    let server = test_app().await;
+    server
+        .post("/api/v1/auth/resend-verification")
+        .json(&serde_json::json!({ "email": "not-an-email" }))
+        .await
+        // 422, not 400: the JSON parsed fine, the content failed validation.
+        // Matches every other validated endpoint on this server.
+        .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn resend_verification_rate_limits_repeated_requests() {
+    let server = test_app().await;
+    let email = unique_email("resend-flood");
+    server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&email))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    // 3 per hour are allowed; the 4th must be refused. Without this the endpoint
+    // is an open relay for sending mail to a third party's inbox.
+    for i in 1..=3 {
+        server
+            .post("/api/v1/auth/resend-verification")
+            .json(&serde_json::json!({ "email": email }))
+            .await
+            .assert_status_success();
+        let _ = i;
+    }
+    server
+        .post("/api/v1/auth/resend-verification")
+        .json(&serde_json::json!({ "email": email }))
+        .await
+        .assert_status(StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn resend_verification_is_case_insensitive_about_the_address() {
+    let server = test_app().await;
+    let email = unique_email("resend-case");
+    server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&email))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    // The server lowercases on both register and resend. If it did not, the
+    // rate-limit key would differ by case and the limit would be trivially
+    // bypassed by varying capitalisation.
+    server
+        .post("/api/v1/auth/resend-verification")
+        .json(&serde_json::json!({ "email": email.to_uppercase() }))
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+}

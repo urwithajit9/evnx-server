@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE email_verifications SET expires_at = NOW() WHERE user_id = $1 AND used_at IS NULL AND expires_at > NOW()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6f35c62f703f63b1c16f835d540ab4ed9f0d586e5250ec3d8600ca98861732f4"
+}

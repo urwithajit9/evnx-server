@@ -19,14 +19,25 @@ pub mod versions;
 use crate::middleware::auth::{require_auth, require_user_session, require_verified};
 
 pub fn create_router(state: AppState) -> Router {
-    let allowed_origin = state
+    // `AllowOrigin::list` rather than `exact`, so one deployment can serve
+    // `https://app.evnx.dev` and a developer's `http://localhost:3000` at the
+    // same time. Config has already rejected `*` and non-local plaintext http,
+    // so anything reaching here is a deliberate, named origin.
+    //
+    // This still echoes back only a matching origin — it is not a wildcard, and
+    // `allow_credentials(true)` stays safe.
+    let allowed_origins: Vec<axum::http::HeaderValue> = state
         .config
-        .frontend_url
-        .parse::<axum::http::HeaderValue>()
-        .expect("Invalid FRONTEND_URL");
+        .frontend_origins
+        .iter()
+        .map(|o| {
+            o.parse::<axum::http::HeaderValue>()
+                .unwrap_or_else(|_| panic!("Invalid origin in FRONTEND_URL: {o}"))
+        })
+        .collect();
 
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::exact(allowed_origin))
+        .allow_origin(AllowOrigin::list(allowed_origins))
         .allow_methods([
             Method::GET,
             Method::POST,
@@ -78,7 +89,11 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/verify-email",
             post(auth::verify_email).get(auth::verify_email_link),
-        );
+        )
+        // Unauthenticated by necessity: the caller cannot log in until verified.
+        // Safe because it always answers 202 and is rate-limited per address, so
+        // it reveals nothing about which emails are registered.
+        .route("/resend-verification", post(auth::resend_verification));
 
     // Account management — a real user session only. An `evnx_tok_` CI token that
     // could reach these would be able to enrol its own authenticator on the

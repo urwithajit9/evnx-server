@@ -26,6 +26,9 @@ pub struct Config {
 
     // Frontend (for CORS)
     pub frontend_url: String,
+    /// `frontend_url` split into individual origins, trimmed and validated.
+    /// This is what the CORS layer uses; `frontend_url` is kept as the raw value.
+    pub frontend_origins: Vec<String>,
 
     // Email (Resend)
     pub resend_api_key: String,
@@ -201,6 +204,8 @@ impl Config {
 
         // The log transport writes a live verification token to the log. That is
         // an acceptable local-development affordance and nothing else.
+        let frontend_origins = parse_frontend_origins(&frontend_url, &environment)?;
+
         if email_transport == EmailTransport::Log && environment != Environment::Development {
             return Err(ConfigError::Invalid(format!(
                 "EMAIL_TRANSPORT=log writes verification tokens to the log and is \
@@ -223,6 +228,7 @@ impl Config {
                 .parse()
                 .unwrap_or(30),
             frontend_url,
+            frontend_origins,
             resend_api_key,
             email_from,
             email_transport,
@@ -253,4 +259,116 @@ pub enum ConfigError {
     MissingVariables(Vec<String>),
     #[error("Invalid configuration: {0}")]
     Invalid(String),
+}
+
+/// Split `FRONTEND_URL` into individual CORS origins and refuse the unsafe ones.
+///
+/// Comma-separated so one deployment can serve the dashboard and a developer's
+/// local build at once. A single value — what every existing environment sets —
+/// still works unchanged.
+///
+/// Two forms are rejected rather than trusted:
+///
+/// * `*`, which combined with `allow_credentials(true)` would let any site on the
+///   internet make authenticated requests carrying the user's session. Browsers
+///   refuse that pairing anyway, so allowing it here would fail confusingly at
+///   runtime instead of loudly at boot.
+/// * plaintext `http://` outside development. Bearer tokens travel on these
+///   requests and an http origin means they are readable in transit.
+///   `http://localhost` and `http://127.0.0.1` are exempt — they never leave the
+///   machine, and refusing them would make local development impossible.
+pub fn parse_frontend_origins(
+    raw: &str,
+    environment: &Environment,
+) -> Result<Vec<String>, ConfigError> {
+    let origins: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if origins.is_empty() {
+        return Err(ConfigError::Invalid(
+            "FRONTEND_URL is set but contains no usable origin".into(),
+        ));
+    }
+
+    for origin in &origins {
+        if origin == "*" {
+            return Err(ConfigError::Invalid(
+                "FRONTEND_URL=* cannot be combined with credentialed CORS — \
+                 name the exact origins instead"
+                    .into(),
+            ));
+        }
+        let is_local =
+            origin.starts_with("http://localhost") || origin.starts_with("http://127.0.0.1");
+        if origin.starts_with("http://") && !is_local && *environment != Environment::Development {
+            return Err(ConfigError::Invalid(format!(
+                "FRONTEND_URL origin {origin} is plaintext http and is refused when \
+                 ENVIRONMENT={environment:?} — bearer tokens travel on these requests"
+            )));
+        }
+    }
+    Ok(origins)
+}
+
+#[cfg(test)]
+mod frontend_origin_tests {
+    use super::*;
+
+    #[test]
+    fn single_origin_still_works() {
+        let o = parse_frontend_origins("https://app.evnx.dev", &Environment::Production).unwrap();
+        assert_eq!(o, vec!["https://app.evnx.dev"]);
+    }
+
+    #[test]
+    fn splits_a_list_and_trims_whitespace_and_trailing_slash() {
+        let o = parse_frontend_origins(
+            " https://app.evnx.dev/ , http://localhost:3000 ",
+            &Environment::Production,
+        )
+        .unwrap();
+        assert_eq!(o, vec!["https://app.evnx.dev", "http://localhost:3000"]);
+    }
+
+    #[test]
+    fn wildcard_is_refused() {
+        // Credentialed CORS plus `*` would expose every session to every site.
+        assert!(parse_frontend_origins("*", &Environment::Production).is_err());
+        assert!(parse_frontend_origins("*", &Environment::Development).is_err());
+    }
+
+    #[test]
+    fn plaintext_http_is_refused_in_production_but_localhost_is_not() {
+        assert!(
+            parse_frontend_origins("http://evil.example.com", &Environment::Production).is_err()
+        );
+        assert!(parse_frontend_origins("http://localhost:3000", &Environment::Production).is_ok());
+        assert!(parse_frontend_origins("http://127.0.0.1:3000", &Environment::Production).is_ok());
+    }
+
+    #[test]
+    fn plaintext_http_is_allowed_in_development() {
+        assert!(
+            parse_frontend_origins("http://staging.internal", &Environment::Development).is_ok()
+        );
+    }
+
+    #[test]
+    fn empty_or_comma_only_is_refused() {
+        assert!(parse_frontend_origins("", &Environment::Production).is_err());
+        assert!(parse_frontend_origins("  , ,", &Environment::Production).is_err());
+    }
+
+    #[test]
+    fn one_bad_origin_poisons_the_whole_list() {
+        // Fail closed: a typo'd entry must not silently leave the good ones live.
+        assert!(parse_frontend_origins(
+            "https://app.evnx.dev,http://evil.example.com",
+            &Environment::Production
+        )
+        .is_err());
+    }
 }
