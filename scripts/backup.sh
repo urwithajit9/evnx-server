@@ -53,7 +53,12 @@ ENDPOINT="$(get STORAGE_ENDPOINT)"
 AWS_ACCESS_KEY_ID="$(get AWS_ACCESS_KEY_ID)"
 AWS_SECRET_ACCESS_KEY="$(get AWS_SECRET_ACCESS_KEY)"
 REGION="$(get STORAGE_REGION)";      REGION="${REGION:-auto}"
-BUCKET="${BACKUP_BUCKET:-evnx-backups}"
+# Environment beats .env.prod beats the default, so a one-off run can retarget
+# the bucket without editing the file. Read from .env.prod as well as the
+# environment — it is listed in .env.prod.example, and a setting that appears in
+# the example file but is silently ignored is a trap.
+BUCKET="${BACKUP_BUCKET:-$(get BACKUP_BUCKET)}"
+BUCKET="${BUCKET:-evnx-backups}"
 
 [ -n "$ENDPOINT" ]              || die "STORAGE_ENDPOINT is empty"
 [ -n "$AWS_ACCESS_KEY_ID" ]     || die "AWS_ACCESS_KEY_ID is empty"
@@ -124,5 +129,11 @@ docker run --rm \
           s3 rm "s3://$BUCKET/$old" --endpoint-url "$ENDPOINT" --only-show-errors || true
       fi
     done
+
+# Stamp the last success. OnFailure= reports a run that ran and failed; nothing
+# reports a run that never happened at all — a powered-off box, a disabled timer,
+# a broken systemd. This file is the only local evidence for that case. The
+# staleness check in DEPLOYMENT.md §8 reads it.
+date -u +%Y-%m-%dT%H:%M:%SZ > "$SCRIPT_DIR/.last-success"
 
 log "backup complete"

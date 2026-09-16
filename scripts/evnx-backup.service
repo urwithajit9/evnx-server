@@ -7,6 +7,10 @@
 Description=evnx-server Postgres backup
 After=docker.service
 Requires=docker.service
+# Without this, a failure at 03:00 is invisible until someone happens to look.
+# A silently failing backup is worse than a known-absent one, because it buys
+# false confidence. %n expands to this unit's name and reaches the handler as %i.
+OnFailure=evnx-backup-failure@%n.service
 
 [Service]
 Type=oneshot

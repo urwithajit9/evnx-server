@@ -261,10 +261,36 @@ Create a **separate** bucket — `evnx-backups` — in the same R2 account.
 > no lockout. If the server's own token is ever compromised, it should not also be
 > able to read or delete the backups.
 
-Then on the server:
+Create it in the Cloudflare dashboard (R2 → Create bucket → `evnx-backups`).
+An **Object** Read & Write token cannot create buckets, only use them, so the
+`aws s3 mb` shortcut usually fails with `AccessDenied` — use the dashboard.
+
+Confirm the server can reach it before going further:
 
 ```bash
-sudo cp scripts/evnx-backup.service scripts/evnx-backup.timer /etc/systemd/system/
+docker run --rm -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION=auto \
+  amazon/aws-cli:latest s3 ls s3://evnx-backups/ --endpoint-url "$STORAGE_ENDPOINT"
+```
+
+Empty output is success. `NoSuchBucket` means it was not created; `InvalidAccessKeyId`
+or `SignatureDoesNotMatch` means the token is wrong or lacks access to this bucket.
+
+### Set `.env.prod`
+
+```
+BACKUP_BUCKET=evnx-backups
+BACKUP_ALERT_EMAIL=you@example.com
+```
+
+`BACKUP_ALERT_EMAIL` is where failures are reported. **Leave it empty and failures
+are silent**, which for a backup is indistinguishable from having none — you find
+out at the moment you needed it. It reuses `RESEND_API_KEY`, so it costs nothing.
+
+### Install the units
+
+```bash
+sudo cp scripts/evnx-backup.service scripts/evnx-backup.timer \
+        scripts/evnx-backup-failure@.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now evnx-backup.timer
 ```
@@ -272,10 +298,43 @@ sudo systemctl enable --now evnx-backup.timer
 Run one immediately rather than waiting for 03:00:
 
 ```bash
-sudo systemctl start evnx-backup.service && journalctl -u evnx-backup -n 30 --no-pager
+sudo systemctl start evnx-backup.service; journalctl -u evnx-backup -n 40 --no-pager
 ```
 
+> Note the `;`. **Not `&&`** — `systemctl start` on a `Type=oneshot` unit exits
+> non-zero when the job fails, so `&&` short-circuits and swallows exactly the log
+> you need to diagnose the failure.
+
 Check the schedule with `systemctl list-timers evnx-backup`.
+
+### Failure alerting, and what it cannot catch
+
+`evnx-backup.service` carries `OnFailure=evnx-backup-failure@%n.service`, which
+emails the last 25 journal lines through Resend. The excerpt is passed through a
+redaction filter first (`re_…` keys, `evnx_tok_…`, any `*KEY=`/`*SECRET=`/`*TOKEN=`
+assignment, the R2 account ID, and any 40+ character high-entropy blob), because it
+leaves the machine.
+
+Test it without breaking anything real:
+
+```bash
+sudo systemctl start evnx-backup-failure@evnx-backup.service.service
+journalctl -u 'evnx-backup-failure@*' -n 20 --no-pager
+```
+
+**This only catches a backup that ran and failed.** Nothing on the box can report a
+backup that never ran at all — a powered-off host, a disabled timer, a broken
+systemd. Each success therefore stamps `scripts/.last-success`, and the check for
+that case is staleness:
+
+```bash
+cat scripts/.last-success        # UTC timestamp of the last successful upload
+systemctl list-timers evnx-backup   # confirm the timer is actually scheduled
+```
+
+Anything older than ~48 hours means backups have stopped even though nothing has
+alerted. A genuinely robust setup watches for that absence from **off** the box;
+until there is one, this check belongs in whatever routine you already have.
 
 ### What the script refuses to do
 

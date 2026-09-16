@@ -19,3 +19,6 @@ docker/valkey/data/
 
 # Production secrets — never committed.
 .env.prod
+
+# Written by scripts/backup.sh on each successful run (staleness check).
+scripts/.last-success

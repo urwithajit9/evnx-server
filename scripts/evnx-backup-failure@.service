@@ -1,0 +1,17 @@
+# /etc/systemd/system/evnx-backup-failure@.service
+#
+# Templated OnFailure handler. evnx-backup.service references it as
+# `OnFailure=evnx-backup-failure@%n.service`, so %n ("evnx-backup.service")
+# becomes the instance name and arrives here as %i — which is how the notifier
+# knows which unit's journal to quote.
+#
+# Templated rather than fixed so any future unit (a restore drill, a second
+# database) can reuse it by adding the same one-line OnFailure=.
+[Unit]
+Description=Send an alert when %i fails
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/evnx-server
+ExecStart=/home/ubuntu/evnx-server/scripts/notify-failure.sh %i
