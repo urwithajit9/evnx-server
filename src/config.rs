@@ -39,6 +39,22 @@ pub struct Config {
     /// Production must set `PUBLIC_API_URL`; the default is only useful locally.
     pub public_api_url: String,
 
+    /// Canonical URL of the web dashboard, e.g. `https://app.evnx.dev`.
+    ///
+    /// When set, the verification email links **here** instead of at the API, so
+    /// the token stops travelling to the API in a query string where it lands in
+    /// access logs. The dashboard reads it from the URL and POSTs it in a body;
+    /// both paths redeem through the same transactional handler, so the two can
+    /// coexist while the change rolls out.
+    ///
+    /// Deliberately its own variable rather than reusing `FRONTEND_URL`. That one
+    /// is the CORS allow-list and is now a comma-separated set that includes
+    /// `http://localhost:3000` for local development — picking "the first entry"
+    /// would mean a reordered list silently mails production users a link to
+    /// localhost. Which origin may *call* the API and which URL belongs in an
+    /// email are different questions.
+    pub public_app_url: Option<String>,
+
     // Object storage — provider-agnostic, see services/storage.rs
     pub storage_backend: StorageBackend,
     /// Bucket (S3/GCS) or container (Azure). Unused by the `local` backend.
@@ -206,6 +222,8 @@ impl Config {
         // an acceptable local-development affordance and nothing else.
         let frontend_origins = parse_frontend_origins(&frontend_url, &environment)?;
 
+        let public_app_url = parse_public_app_url(env::var("PUBLIC_APP_URL").ok(), &environment)?;
+
         if email_transport == EmailTransport::Log && environment != Environment::Development {
             return Err(ConfigError::Invalid(format!(
                 "EMAIL_TRANSPORT=log writes verification tokens to the log and is \
@@ -233,6 +251,7 @@ impl Config {
             email_from,
             email_transport,
             public_api_url: optional!("PUBLIC_API_URL", format!("http://localhost:{port}")),
+            public_app_url,
             storage_backend,
             storage_bucket,
             storage_endpoint: env::var("STORAGE_ENDPOINT").ok().filter(|s| !s.is_empty()),
@@ -259,6 +278,44 @@ pub enum ConfigError {
     MissingVariables(Vec<String>),
     #[error("Invalid configuration: {0}")]
     Invalid(String),
+}
+
+/// Validate `PUBLIC_APP_URL` — the dashboard URL the verification email points at.
+///
+/// `None` (unset or blank) is a normal, supported state: the email then links at
+/// the API, which is what every deployment did before the dashboard existed.
+///
+/// Refuses, for the same reason as the CORS origins but more sharply — the
+/// verification token is a bearer credential and it rides inside this URL:
+///
+/// * plaintext `http://` outside development, `localhost`/`127.0.0.1` exempted.
+/// * anything without a scheme. `app.evnx.dev` with no `https://` would produce
+///   a relative link in an email client, which silently goes nowhere.
+pub fn parse_public_app_url(
+    raw: Option<String>,
+    environment: &Environment,
+) -> Result<Option<String>, ConfigError> {
+    let Some(raw) = raw else { return Ok(None) };
+    let url = raw.trim().trim_end_matches('/').to_string();
+    if url.is_empty() {
+        return Ok(None);
+    }
+
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(ConfigError::Invalid(format!(
+            "PUBLIC_APP_URL {url} must start with http:// or https://"
+        )));
+    }
+
+    let is_local = url.starts_with("http://localhost") || url.starts_with("http://127.0.0.1");
+    if url.starts_with("http://") && !is_local && *environment != Environment::Development {
+        return Err(ConfigError::Invalid(format!(
+            "PUBLIC_APP_URL {url} is plaintext http and is refused when \
+             ENVIRONMENT={environment:?} — the verification token travels in it"
+        )));
+    }
+
+    Ok(Some(url))
 }
 
 /// Split `FRONTEND_URL` into individual CORS origins and refuse the unsafe ones.
@@ -311,6 +368,70 @@ pub fn parse_frontend_origins(
         }
     }
     Ok(origins)
+}
+
+#[cfg(test)]
+mod public_app_url_tests {
+    use super::*;
+
+    #[test]
+    fn unset_or_blank_is_fine_and_means_link_at_the_api() {
+        assert_eq!(
+            parse_public_app_url(None, &Environment::Production).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_public_app_url(Some("   ".into()), &Environment::Production).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn https_is_accepted_and_the_trailing_slash_is_trimmed() {
+        assert_eq!(
+            parse_public_app_url(
+                Some("https://app.evnx.dev/".into()),
+                &Environment::Production
+            )
+            .unwrap(),
+            Some("https://app.evnx.dev".to_string()),
+            "left in, the link would read https://app.evnx.dev//verify-email/"
+        );
+    }
+
+    #[test]
+    fn plaintext_http_is_refused_in_production_because_the_token_is_in_the_url() {
+        assert!(
+            parse_public_app_url(Some("http://app.evnx.dev".into()), &Environment::Production)
+                .is_err()
+        );
+        // Loopback is exempt, or local development could not test the flow.
+        assert!(parse_public_app_url(
+            Some("http://localhost:3000".into()),
+            &Environment::Production
+        )
+        .is_ok());
+        assert!(parse_public_app_url(
+            Some("http://127.0.0.1:3000".into()),
+            &Environment::Production
+        )
+        .is_ok());
+        // Development may use plaintext anywhere.
+        assert!(parse_public_app_url(
+            Some("http://staging.internal".into()),
+            &Environment::Development
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_missing_scheme_is_refused() {
+        // `app.evnx.dev/verify-email/?token=…` is a relative URL in an email
+        // client, so the link silently goes nowhere.
+        assert!(
+            parse_public_app_url(Some("app.evnx.dev".into()), &Environment::Production).is_err()
+        );
+    }
 }
 
 #[cfg(test)]

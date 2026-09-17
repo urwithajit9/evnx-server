@@ -27,6 +27,7 @@ pub struct EmailService {
     from: String,
     /// Public base URL of this API — the verification link is built from it.
     public_api_url: String,
+    public_app_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -51,6 +52,7 @@ impl EmailService {
             transport,
             from: config.email_from.clone(),
             public_api_url: config.public_api_url.trim_end_matches('/').to_string(),
+            public_app_url: config.public_app_url.clone(),
         }
     }
 
@@ -63,11 +65,28 @@ impl EmailService {
     }
 
     /// The URL a user clicks to verify their address.
+    ///
+    /// Prefers the dashboard when `PUBLIC_APP_URL` is configured. The token is a
+    /// bearer credential, and sending it to the API in a query string writes it
+    /// into access logs and any proxy in front of them; the dashboard is a static
+    /// export with no server-side logging at all, and it POSTs the token in a
+    /// body from there.
+    ///
+    /// Falls back to the API link when unset, so a deployment without a dashboard
+    /// keeps working unchanged. Both endpoints redeem through the same
+    /// transactional path, so links already in inboxes stay valid either way.
+    ///
+    /// The trailing slash on `/verify-email/` matters: the dashboard is exported
+    /// with `trailingSlash: true`, and the unslashed form costs a redirect that
+    /// some mail clients will not follow.
     fn verification_link(&self, token: &str) -> String {
-        format!(
-            "{}/api/v1/auth/verify-email?token={}",
-            self.public_api_url, token
-        )
+        match &self.public_app_url {
+            Some(app) => format!("{app}/verify-email/?token={token}"),
+            None => format!(
+                "{}/api/v1/auth/verify-email?token={}",
+                self.public_api_url, token
+            ),
+        }
     }
 
     pub async fn send_verification(&self, to: &str, token: &str) -> Result<(), EmailError> {
