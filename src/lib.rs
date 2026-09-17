@@ -56,5 +56,13 @@ pub async fn health_check() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+        // The commit this binary was built from — see `build.rs`.
+        //
+        // `version` cannot stand in for it: it has been 0.1.0 since the repo
+        // began and does not move when code does. With images published on tags
+        // rather than on every push, the deployed binary lags `main` by design,
+        // and this is the only way to see by how much without guessing from
+        // workflow history.
+        "build": env!("EVNX_BUILD_SHA"),
     }))
 }

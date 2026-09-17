@@ -27,6 +27,18 @@ RUN cargo build --release && rm -rf src
 
 # Build real source
 COPY . .
+
+# Stamped HERE, below the dependency-cache layer above, deliberately. Set before
+# that `cargo build --release`, the SHA would change the stub-build layer on
+# every commit and force a full dependency rebuild into every image — trading a
+# short build for a long one to carry seven characters.
+#
+# Empty default so a plain `docker build` still works; `build.rs` then falls
+# through to "unknown" rather than inventing a value. It cannot fall back to git
+# here in any case: `.dockerignore` excludes `.git/`.
+ARG GIT_SHA=""
+ENV EVNX_BUILD_SHA=$GIT_SHA
+
 ENV SQLX_OFFLINE=true
 RUN touch src/main.rs && cargo build --release
 

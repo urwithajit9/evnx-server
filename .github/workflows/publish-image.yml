@@ -55,6 +55,11 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.server
+          # Stamps the binary with the commit, so /health can report what is
+          # actually deployed. Inside the builder this is the only way to know:
+          # .dockerignore excludes .git/, so build.rs has no repository to read.
+          build-args: |
+            GIT_SHA=${{ github.sha }}
           target: production
           push: true
           tags: ${{ steps.meta.outputs.tags }}
