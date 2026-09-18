@@ -48,6 +48,19 @@ pub struct RegisterRequest {
     #[validate(length(equal = 44, message = "x25519_public_key must be 44 base64 chars"))]
     pub x25519_public_key: String,
 
+    /// ML-KEM-768 public key — 1184 bytes, exactly 1580 base64 characters.
+    ///
+    /// Required at registration since F1. It is derived from the same Ed25519
+    /// seed the client already holds, so a client that can produce
+    /// `x25519_public_key` can always produce this too — there is no client for
+    /// which this is a burden, and making it optional would create accounts that
+    /// silently cannot be shared with.
+    #[validate(length(
+        equal = 1580,
+        message = "mlkem_public_key must be 1580 base64 chars (1184 bytes)"
+    ))]
+    pub mlkem_public_key: String,
+
     // Encrypted private key: nonce (24 bytes) + ciphertext (~32) + tag (16) + base64 overhead
     #[validate(length(min = 60, max = 300, message = "encrypted_private_key invalid length"))]
     pub encrypted_private_key: String,
@@ -102,6 +115,7 @@ pub async fn register(
             argon2_salt: req.argon2_salt,
             ed25519_public_key: req.ed25519_public_key,
             x25519_public_key: req.x25519_public_key,
+            mlkem_public_key: req.mlkem_public_key,
             encrypted_private_key: req.encrypted_private_key,
         },
     )
@@ -1115,5 +1129,11 @@ pub async fn me(
         "encrypted_private_key": user.encrypted_private_key,
         "argon2_salt":           user.argon2_salt,
         "totp_enabled":          user.totp_enabled,
+        // Clients read this to decide whether to run the F1 backfill. `false`
+        // means the account cannot be shared with until the client derives the
+        // key and PUTs it to /auth/public-keys. The key itself is not returned:
+        // it is public, but nothing here needs it and a 1580-character field on
+        // every /me call is pure weight.
+        "has_mlkem_key":         user.mlkem_public_key.is_some(),
     })))
 }

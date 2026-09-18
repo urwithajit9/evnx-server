@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO vault_members\n            (vault_id, user_id, role, encrypted_vault_key, eph_pub_key,\n             mlkem_ciphertext, granted_by)\n        VALUES ($1, $2, $3, $4, $5, $6, $7)\n        ON CONFLICT (vault_id, user_id) DO UPDATE\n            SET role = EXCLUDED.role,\n                encrypted_vault_key = EXCLUDED.encrypted_vault_key,\n                eph_pub_key = EXCLUDED.eph_pub_key,\n                mlkem_ciphertext = EXCLUDED.mlkem_ciphertext,\n                granted_by = EXCLUDED.granted_by,\n                granted_at = NOW()\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5a5bcc04a8849629949af6ec1c2ef656c6982e1351d91825da969482cda5f640"
+}

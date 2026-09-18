@@ -4,7 +4,7 @@ use crate::state::AppState;
 use axum::http::{HeaderName, Method};
 use axum::{
     middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -120,6 +120,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/sessions", get(sessions::list_sessions))
         .route("/sessions/others", delete(sessions::revoke_other_sessions))
         .route("/sessions/:session_id", delete(sessions::revoke_session))
+        // F1 backfill: upload the ML-KEM public key for an account that predates
+        // it. Behind a session rather than `require_auth` on purpose — an API
+        // token that could rewrite the account's public key would turn a leaked
+        // deploy credential into a way to intercept every future share.
+        .route("/public-keys", put(users::backfill_public_keys))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_user_session,

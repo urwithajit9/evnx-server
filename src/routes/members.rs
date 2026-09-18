@@ -17,9 +17,15 @@ use uuid::Uuid;
 pub struct AddMemberRequest {
     pub user_email: String,
     pub role: String,
-    /// ECDH-wrapped vault key, prepared client-side for the recipient's X25519 pubkey
+    /// Vault key wrapped client-side for the recipient — hybrid X25519 + ML-KEM.
     pub encrypted_vault_key: String,
+    /// The sender's ephemeral X25519 public key. 44 base64 characters.
     pub eph_pub_key: String,
+    /// The ML-KEM-768 ciphertext. 1452 base64 characters.
+    ///
+    /// Required, not optional. A share is the one path where the post-quantum
+    /// half matters, so this is exactly where its absence must be an error.
+    pub mlkem_ciphertext: String,
 }
 
 pub async fn add_member(
@@ -54,15 +60,39 @@ pub async fn add_member(
         .await?
         .ok_or(AppError::NotFound)?;
 
+    // ⚠️ Refuse to share with an account that has no ML-KEM public key.
+    //
+    // Such an account registered before F1 and has not signed in since with a
+    // client that derives the key. The only alternative would be an X25519-only
+    // wrap — and a vault key wrapped that way stays wrapped that way for as long
+    // as the row exists. An adversary recording it today does not care that a
+    // later version fixed the algorithm, so there is no "share now, upgrade
+    // later". The share is refused instead.
+    //
+    // 409 rather than 400: nothing about the *request* is wrong. The server's
+    // state is not yet ready, and the fix is on the recipient's side.
+    if target.mlkem_public_key.is_none() {
+        return Err(AppError::Conflict(format!(
+            "{} has no post-quantum public key on file and cannot be shared with yet. \
+             They need to sign in once with evnx 0.5 or later, or at app.evnx.dev, \
+             which uploads it automatically. Sharing without it would wrap the vault \
+             key under X25519 alone.",
+            target.email
+        )));
+    }
+
     members::add_member(
         &state.db,
         vault_id,
         target.id,
         &req.role,
-        &req.encrypted_vault_key,
-        // Always present here: sharing wraps by ECDH for the recipient's X25519
-        // key, which by definition produces an ephemeral.
-        Some(&req.eph_pub_key),
+        // Always `Hybrid` here: a share wraps by ECDH *and* ML-KEM, together.
+        // `MemberKeyWrap` has no variant that carries only one of them.
+        &members::MemberKeyWrap::Hybrid {
+            encrypted_vault_key: req.encrypted_vault_key.clone(),
+            eph_pub_key: req.eph_pub_key.clone(),
+            mlkem_ciphertext: req.mlkem_ciphertext.clone(),
+        },
         requester_id,
     )
     .await?;

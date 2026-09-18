@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT encrypted_vault_key, eph_pub_key\n        FROM vault_members\n        WHERE vault_id = $1 AND user_id = $2\n        ",
+  "query": "\n        SELECT encrypted_vault_key, eph_pub_key, mlkem_ciphertext\n        FROM vault_members\n        WHERE vault_id = $1 AND user_id = $2\n        ",
   "describe": {
     "columns": [
       {
@@ -12,6 +12,11 @@
         "ordinal": 1,
         "name": "eph_pub_key",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "mlkem_ciphertext",
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -22,8 +27,9 @@
     },
     "nullable": [
       false,
+      true,
       true
     ]
   },
-  "hash": "e6b72b7c1e8f7de53e5e225c6444228107b48e912320088794fcc175b5b94f38"
+  "hash": "3d27cbcbafa3e1e0f55deee4e1f2a8b218b9ef21b452ea36e5d9d2603f7c4ae0"
 }

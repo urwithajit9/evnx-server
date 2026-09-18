@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE users\n        SET mlkem_public_key = $2\n        WHERE id = $1 AND mlkem_public_key IS NULL\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "710d728b43fbe2f0d4995e1ec90e5020f07447c5d02547b7010f277520823fa0"
+}

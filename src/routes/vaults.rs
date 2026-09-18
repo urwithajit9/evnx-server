@@ -45,6 +45,16 @@ pub struct CreateVaultRequest {
     /// The column is nullable for the same reason.
     #[serde(default)]
     pub eph_pub_key: Option<String>,
+
+    /// ML-KEM-768 ciphertext, present **only** alongside `eph_pub_key`.
+    ///
+    /// Same reasoning: the creator's own copy uses no key agreement of either
+    /// kind, so there is nothing to encapsulate. A CHECK constraint on
+    /// `vault_members` refuses a row carrying one of the two without the other,
+    /// so a client that sent only an ephemeral would get a database error rather
+    /// than a silently downgraded wrap.
+    #[serde(default)]
+    pub mlkem_ciphertext: Option<String>,
 }
 
 // Regex for vault names: lowercase alphanumeric + hyphens.
@@ -102,16 +112,30 @@ pub async fn create_vault(
     // The owner's own copy of the vault key, wrapped client-side under their
     // master key. The server never sees it unwrapped, and stores no ephemeral
     // because that path uses no ECDH — see CreateVaultRequest::eph_pub_key.
-    members::add_member(
-        &mut *tx,
-        vault_id,
-        user_id,
-        "owner",
-        &req.encrypted_vault_key,
-        req.eph_pub_key.as_deref(),
-        user_id,
-    )
-    .await?;
+    //
+    // A client that sends one key-agreement field without the other is sending
+    // half a wrap; `MemberKeyWrap` has no shape for that, so it is refused here
+    // rather than stored.
+    let wrap = match (&req.eph_pub_key, &req.mlkem_ciphertext) {
+        (None, None) => members::MemberKeyWrap::OwnMasterKey {
+            encrypted_vault_key: req.encrypted_vault_key.clone(),
+        },
+        (Some(eph), Some(ct)) => members::MemberKeyWrap::Hybrid {
+            encrypted_vault_key: req.encrypted_vault_key.clone(),
+            eph_pub_key: eph.clone(),
+            mlkem_ciphertext: ct.clone(),
+        },
+        _ => {
+            return Err(AppError::Validation(
+                "eph_pub_key and mlkem_ciphertext must be sent together or not at \
+                 all. One without the other is a vault key wrapped by ECDH with no \
+                 post-quantum half, which a quantum computer breaks."
+                    .into(),
+            ))
+        }
+    };
+
+    members::add_member(&mut *tx, vault_id, user_id, "owner", &wrap, user_id).await?;
 
     tx.commit().await.map_err(AppError::Database)?;
 
@@ -201,6 +225,10 @@ pub async fn get_my_key(
 
     Ok(Json(serde_json::json!({
         "encrypted_vault_key": key_row.encrypted_vault_key,
+        // Both null together for the creator's own copy — unwrap it with the
+        // master key. Both present for a share — unwrap it with the hybrid path.
+        // The pair is what tells a client which of the two it is holding.
         "eph_pub_key": key_row.eph_pub_key,
+        "mlkem_ciphertext": key_row.mlkem_ciphertext,
     })))
 }

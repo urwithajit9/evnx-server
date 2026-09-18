@@ -56,6 +56,7 @@ fn register_payload(email: &str) -> serde_json::Value {
         "argon2_salt": "B".repeat(44),
         "ed25519_public_key": "C".repeat(44),
         "x25519_public_key": "D".repeat(44),      // required since migration 002
+        "mlkem_public_key": "F".repeat(1580),     // required since migration 004
         "encrypted_private_key": "E".repeat(96),  // base64, 60..=300
     })
 }
@@ -118,6 +119,41 @@ async fn register_without_x25519_key_returns_422() {
         StatusCode::CREATED,
         "registration without x25519_public_key must be rejected"
     );
+}
+
+#[tokio::test]
+async fn register_without_mlkem_key_returns_422() {
+    // Guards migration 004. An account with no ML-KEM public key cannot be shared
+    // with at all — `add_member` refuses rather than falling back to an
+    // X25519-only wrap — so a registration that omits it would silently create an
+    // account that looks fine and cannot participate in a team.
+    let server = test_app().await;
+    let mut payload = register_payload(&unique_email("nomlkem"));
+    payload.as_object_mut().unwrap().remove("mlkem_public_key");
+    let resp = server.post("/api/v1/auth/register").json(&payload).await;
+    assert_ne!(
+        resp.status_code(),
+        StatusCode::CREATED,
+        "registration without mlkem_public_key must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn register_with_wrong_length_mlkem_key_returns_422() {
+    // 1580 characters exactly — 1184 bytes base64. A shorter value is either a
+    // different parameter set (ML-KEM-512 is 800 bytes) or a truncated key, and
+    // both must be caught at the edge rather than at the first share.
+    let server = test_app().await;
+    for len in [1579usize, 1581, 44] {
+        let mut payload = register_payload(&unique_email("badmlkem"));
+        payload["mlkem_public_key"] = serde_json::json!("F".repeat(len));
+        let resp = server.post("/api/v1/auth/register").json(&payload).await;
+        assert_ne!(
+            resp.status_code(),
+            StatusCode::CREATED,
+            "a {len}-character mlkem_public_key must be rejected"
+        );
+    }
 }
 
 // ─── B1 regression: protected auth routes ──────────────────────────────────────
@@ -317,7 +353,12 @@ async fn create_vault(server: &TestServer, jwt: &str) -> Uuid {
             "name": name,
             "environment": "development",
             "encrypted_vault_key": "Zm9v",
-            "eph_pub_key": "YmFy",
+            // The creator's own copy carries NEITHER an ephemeral nor an ML-KEM
+            // ciphertext: it is wrapped under an HKDF subkey of the master key,
+            // which involves no key agreement of either kind. This helper used to
+            // send `eph_pub_key: "YmFy"` — base64 for "bar" — which is how 140
+            // rows in the development database ended up claiming to be ECDH
+            // wraps. Migration 004's CHECK constraint refuses that shape now.
         }))
         .await;
     resp.assert_status(StatusCode::CREATED);
@@ -715,6 +756,7 @@ async fn register_srp_account(server: &TestServer) -> SrpAccount {
             "argon2_salt": salt_to_base64(&argon2_salt),
             "ed25519_public_key": "C".repeat(44),
             "x25519_public_key": "D".repeat(44),
+            "mlkem_public_key": "F".repeat(1580),
             "encrypted_private_key": "E".repeat(96),
         }))
         .await;
@@ -1137,8 +1179,10 @@ async fn a_failed_member_insert_rolls_the_vault_back() {
         vault_id,
         Uuid::new_v4(),
         "owner",
-        "Zm9v",
-        None,
+        // The creator's own copy: no ephemeral, no ML-KEM ciphertext.
+        &members::MemberKeyWrap::OwnMasterKey {
+            encrypted_vault_key: "Zm9v".into(),
+        },
         owner_id,
     )
     .await;
@@ -1161,10 +1205,48 @@ async fn a_failed_member_insert_rolls_the_vault_back() {
     let resp = bearer(server.post("/api/v1/vaults"), &_jwt)
         .json(&serde_json::json!({
             "name": name, "environment": "development",
-            "encrypted_vault_key": "Zm9v", "eph_pub_key": "YmFy",
+            "encrypted_vault_key": "Zm9v",
         }))
         .await;
     resp.assert_status(StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn a_failed_member_insert_rolls_the_vault_back_through_the_handler() {
+    // The test above drives the db layer directly, which is why the source-level
+    // check below exists at all — there was no way to force a mid-handler failure
+    // from outside, because the key columns were unconstrained TEXT.
+    //
+    // Migration 004 changed that. `eph_pub_key` without `mlkem_ciphertext`
+    // violates `vault_members_wrap_is_whole`, and that violation happens on the
+    // member insert — AFTER the vault insert, inside the same handler. So this is
+    // now a genuine black-box test of the transaction: the request fails, and the
+    // vault must not survive holding its unique name.
+    let server = test_app().await;
+    let (_id, jwt) = verified_user(&server).await;
+    let name = format!("v{}", Uuid::new_v4().simple());
+
+    let resp = bearer(server.post("/api/v1/vaults"), &jwt)
+        .json(&serde_json::json!({
+            "name": name,
+            "environment": "development",
+            "encrypted_vault_key": "Zm9v",
+            "eph_pub_key": "YmFy",
+        }))
+        .await;
+    assert_ne!(resp.status_code(), StatusCode::CREATED);
+
+    // The name must be free — if the vault row survived, this would be a 409 and
+    // the owner would have a vault they cannot see (list_vaults inner-joins
+    // vault_members, which is the row that failed).
+    let retry = bearer(server.post("/api/v1/vaults"), &jwt)
+        .json(&serde_json::json!({
+            "name": name,
+            "environment": "development",
+            "encrypted_vault_key": "Zm9v",
+        }))
+        .await;
+    retry.assert_status(StatusCode::CREATED);
 }
 
 #[tokio::test]
@@ -1173,8 +1255,14 @@ async fn create_vault_handler_uses_a_transaction() {
     // in a transaction, but it drives them directly — it would still pass if the
     // handler went back to two separate pool connections. Forcing a mid-handler
     // failure is not possible from the outside (role and user_id are fixed by the
-    // handler, and the key columns are unconstrained TEXT), so this pins the
+    // handler, and the key columns were unconstrained TEXT), so this pins the
     // handler to the transaction at the source level instead.
+    //
+    // ⚠️ Migration 004 made a black-box version possible — see
+    // `a_failed_member_insert_rolls_the_vault_back_through_the_handler`. This one
+    // is kept because it fails for a different reason: it catches the handler
+    // being rewritten to two pool connections even in a future where no CHECK
+    // constraint happens to be violable.
     let src = std::fs::read_to_string("src/routes/vaults.rs").unwrap();
     let body = src
         .split("pub async fn create_vault")
@@ -1599,4 +1687,230 @@ async fn resend_verification_is_case_insensitive_about_the_address() {
         .json(&serde_json::json!({ "email": email.to_uppercase() }))
         .await
         .assert_status(StatusCode::ACCEPTED);
+}
+
+// ─── F1: hybrid X25519 + ML-KEM-768 wrapping ──────────────────────────────────
+//
+// The server never performs the wrap — it stores what the client computed. What
+// it can enforce, and what these cover, is that a *half* wrap is unrepresentable
+// and that an account without a post-quantum key cannot be shared with.
+
+#[tokio::test]
+async fn my_key_returns_both_wrap_fields() {
+    let server = test_app().await;
+    let (_id, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+
+    let resp = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/my-key")),
+        &jwt,
+    )
+    .await;
+    resp.assert_status_ok();
+    let body = resp.json::<serde_json::Value>();
+
+    // The creator's own copy: both null together. That pair is what tells a
+    // client to unwrap with the master key rather than the hybrid path.
+    assert!(body["eph_pub_key"].is_null());
+    assert!(body["mlkem_ciphertext"].is_null());
+    assert_eq!(body["encrypted_vault_key"], "Zm9v");
+}
+
+#[tokio::test]
+async fn creating_a_vault_with_half_a_wrap_is_refused() {
+    // ⚠️ The downgrade this whole feature exists to prevent: an ephemeral X25519
+    // key with no ML-KEM ciphertext beside it is a wrap that Shor opens. The
+    // CHECK constraint from migration 004 makes it unstorable, so a client bug
+    // — or a deliberate strip — surfaces as an error rather than a weak key.
+    let server = test_app().await;
+    let (_id, jwt) = verified_user(&server).await;
+    let name = format!("v{}", Uuid::new_v4().simple());
+
+    let resp = bearer(server.post("/api/v1/vaults"), &jwt)
+        .json(&serde_json::json!({
+            "name": name,
+            "environment": "development",
+            "encrypted_vault_key": "Zm9v",
+            "eph_pub_key": "YmFy",
+            // mlkem_ciphertext deliberately absent
+        }))
+        .await;
+
+    assert_ne!(
+        resp.status_code(),
+        StatusCode::CREATED,
+        "a vault key wrapped by ECDH with no ML-KEM ciphertext must not be stored"
+    );
+}
+
+#[tokio::test]
+async fn public_key_lookup_includes_the_mlkem_key() {
+    let server = test_app().await;
+    let (_id, jwt) = verified_user(&server).await;
+
+    let email = unique_email("pklookup");
+    server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&email))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    let resp = bearer(
+        server.get(&format!("/api/v1/users/{email}/public-key")),
+        &jwt,
+    )
+    .await;
+    resp.assert_status_ok();
+    let body = resp.json::<serde_json::Value>();
+
+    assert_eq!(body["mlkem_public_key"].as_str().unwrap().len(), 1580);
+    assert_eq!(body["x25519_public_key"].as_str().unwrap().len(), 44);
+}
+
+#[tokio::test]
+async fn backfilling_a_public_key_is_idempotent_then_refuses_a_different_one() {
+    // The endpoint exists because the server cannot derive the ML-KEM key — only
+    // a client holding the master password can. Clients call it on every login,
+    // so the same value arriving repeatedly must be fine.
+    let server = test_app().await;
+
+    // A row with no ML-KEM key, as a pre-F1 account would be.
+    let user_id = register_user(&server).await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    sqlx::query("UPDATE users SET mlkem_public_key = NULL WHERE id = $1")
+        .bind(user_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let jwt = jwt_service()
+        .await
+        .issue(user_id, Uuid::new_v4(), true)
+        .unwrap();
+    let key = "G".repeat(1580);
+
+    let first = bearer(server.put("/api/v1/auth/public-keys"), &jwt)
+        .json(&serde_json::json!({ "mlkem_public_key": key }))
+        .await;
+    first.assert_status_ok();
+    assert_eq!(first.json::<serde_json::Value>()["status"], "stored");
+
+    // Same key again — what every subsequent login sends.
+    let second = bearer(server.put("/api/v1/auth/public-keys"), &jwt)
+        .json(&serde_json::json!({ "mlkem_public_key": key }))
+        .await;
+    second.assert_status_ok();
+    assert_eq!(second.json::<serde_json::Value>()["status"], "unchanged");
+
+    // ⚠️ A DIFFERENT key must be refused. An open update would be a
+    // key-substitution primitive: anyone holding a session could point the
+    // account at their own key, and every vault shared with it afterwards would
+    // be wrapped to them.
+    let hijack = bearer(server.put("/api/v1/auth/public-keys"), &jwt)
+        .json(&serde_json::json!({ "mlkem_public_key": "H".repeat(1580) }))
+        .await;
+    assert_eq!(
+        hijack.status_code(),
+        StatusCode::CONFLICT,
+        "overwriting an existing ML-KEM public key must be refused"
+    );
+}
+
+#[tokio::test]
+async fn sharing_with_an_account_that_has_no_mlkem_key_is_refused() {
+    // ⚠️ The alternative would be an X25519-only wrap, and a vault key wrapped
+    // that way stays wrapped that way for as long as the row exists. An adversary
+    // recording it does not care that a later version fixed the algorithm, so
+    // there is no "share now, upgrade later".
+    let server = test_app().await;
+    let (_owner, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+
+    let email = unique_email("nopq");
+    server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&email))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    sqlx::query("UPDATE users SET mlkem_public_key = NULL WHERE email = $1")
+        .bind(&email)
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+        &jwt,
+    )
+    .json(&serde_json::json!({
+        "user_email": email,
+        "role": "developer",
+        "encrypted_vault_key": "Zm9v",
+        "eph_pub_key": "YmFy",
+        "mlkem_ciphertext": "Y".repeat(1452),
+    }))
+    .await;
+
+    assert_eq!(
+        resp.status_code(),
+        StatusCode::CONFLICT,
+        "sharing with an account that has no post-quantum key must be refused"
+    );
+}
+
+#[tokio::test]
+async fn sharing_stores_both_halves_and_returns_them() {
+    let server = test_app().await;
+    let (_owner, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+
+    let email = unique_email("share");
+    let recipient = server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&email))
+        .await;
+    recipient.assert_status(StatusCode::CREATED);
+    let recipient_id = Uuid::parse_str(
+        recipient.json::<serde_json::Value>()["user_id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let ct = "Y".repeat(1452);
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+        &jwt,
+    )
+    .json(&serde_json::json!({
+        "user_email": email,
+        "role": "developer",
+        "encrypted_vault_key": "c2hhcmVk",
+        "eph_pub_key": "YmFy",
+        "mlkem_ciphertext": ct,
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    // The recipient reads back exactly what was stored — all three fields, since
+    // all three are needed to unwrap.
+    let their_jwt = jwt_service()
+        .await
+        .issue(recipient_id, Uuid::new_v4(), true)
+        .unwrap();
+    let resp = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/my-key")),
+        &their_jwt,
+    )
+    .await;
+    resp.assert_status_ok();
+    let body = resp.json::<serde_json::Value>();
+
+    assert_eq!(body["encrypted_vault_key"], "c2hhcmVk");
+    assert_eq!(body["eph_pub_key"], "YmFy");
+    assert_eq!(body["mlkem_ciphertext"], ct);
 }
