@@ -3224,3 +3224,413 @@ async fn audit_metadata_carries_no_key_material() {
         );
     }
 }
+
+// ─── P4: SRP brute-force lockout ──────────────────────────────────────────────
+
+/// Open an SRP session and return `(session_id, server_public)`.
+async fn srp_begin(server: &TestServer, account: &SrpAccount) -> (String, Vec<u8>) {
+    let ephemeral = generate_client_ephemeral().unwrap();
+    let init = server
+        .post("/api/v1/auth/srp/init")
+        .json(&serde_json::json!({
+            "email": account.email,
+            "client_public": hex::encode(&ephemeral.public_a),
+        }))
+        .await;
+    init.assert_status_ok();
+    let init = init.json::<serde_json::Value>();
+    (
+        init["session_id"].as_str().unwrap().to_string(),
+        hex::decode(init["server_public"].as_str().unwrap()).unwrap(),
+    )
+}
+
+/// ⚠️ The gap this closes: a failed proof does NOT delete the SRP session — by
+/// design, so a mistyped password does not send the user back through
+/// `/srp/init`, which is itself capped at 5 per 15 minutes.
+///
+/// Without a counter that leaves one `/srp/init` buying unlimited guesses for
+/// the session's 300-second life, with no rate limit on `/srp/verify` at all.
+#[tokio::test]
+async fn a_failed_srp_proof_leaves_the_session_usable_but_counts_toward_a_lockout() {
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+    let (session_id, _sp) = srp_begin(&server, &account).await;
+
+    let wrong = serde_json::json!({
+        "session_id": session_id,
+        "client_proof": hex::encode([0u8; 32]),
+    });
+
+    // The session survives a wrong proof — each attempt is 401, not 404.
+    for attempt in 1..=3 {
+        let resp = server.post("/api/v1/auth/srp/verify").json(&wrong).await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt} should be 401, not a dead session"
+        );
+    }
+
+    // And a correct password still works, because the counter is below the limit
+    // and a success clears it.
+    srp_login(&server, &account).await;
+}
+
+/// Five failures lock the account for the window, and the lock applies even with
+/// the *correct* password — otherwise it would not bound anything.
+#[tokio::test]
+async fn enough_failed_srp_proofs_lock_the_account() {
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+
+    // `srp_init` is capped at 5 per 15 minutes per email, so reuse ONE session
+    // for the guesses — which is precisely the attack being bounded.
+    let (session_id, _sp) = srp_begin(&server, &account).await;
+    let wrong = serde_json::json!({
+        "session_id": session_id,
+        "client_proof": hex::encode([0u8; 32]),
+    });
+
+    let mut locked_at = None;
+    for attempt in 1..=8 {
+        let resp = server.post("/api/v1/auth/srp/verify").json(&wrong).await;
+        if resp.status_code() == StatusCode::LOCKED {
+            locked_at = Some(attempt);
+            break;
+        }
+        assert_eq!(resp.status_code(), StatusCode::UNAUTHORIZED);
+    }
+
+    let locked_at =
+        locked_at.expect("the account should lock — brute force is unbounded without it");
+    assert!(
+        (5..=6).contains(&locked_at),
+        "expected a lockout around the 5-failure mark, got {locked_at}"
+    );
+
+    // ⚠️ The lock must hold against the RIGHT password too. A lockout that a
+    // correct guess walks through bounds nothing — the attacker's last guess is
+    // by definition correct.
+    let ephemeral = generate_client_ephemeral().unwrap();
+    let init = server
+        .post("/api/v1/auth/srp/init")
+        .json(&serde_json::json!({
+            "email": account.email,
+            "client_public": hex::encode(&ephemeral.public_a),
+        }))
+        .await;
+    init.assert_status_ok();
+    let init = init.json::<serde_json::Value>();
+    let server_public = hex::decode(init["server_public"].as_str().unwrap()).unwrap();
+    let srp_password = derive_srp_password(TEST_PASSWORD, &account.srp_salt).unwrap();
+    let proof = compute_client_proof(
+        &account.email,
+        srp_password,
+        &account.srp_salt,
+        &server_public,
+        &ephemeral,
+    )
+    .unwrap();
+
+    let resp = server
+        .post("/api/v1/auth/srp/verify")
+        .json(&serde_json::json!({
+            "session_id": init["session_id"].as_str().unwrap(),
+            "client_proof": hex::encode(&proof.client_proof),
+        }))
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        StatusCode::LOCKED,
+        "a lockout that the correct password walks through bounds nothing"
+    );
+}
+
+/// A success clears the counter, so someone who mistypes twice and then gets it
+/// right does not carry failures toward a lockout they never earned.
+#[tokio::test]
+async fn a_successful_srp_login_clears_the_failure_counter() {
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+
+    let (session_id, _sp) = srp_begin(&server, &account).await;
+    let wrong = serde_json::json!({
+        "session_id": session_id,
+        "client_proof": hex::encode([0u8; 32]),
+    });
+    for _ in 0..3 {
+        server
+            .post("/api/v1/auth/srp/verify")
+            .json(&wrong)
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    srp_login(&server, &account).await;
+
+    // Three more failures would lock the account if the counter had survived.
+    let (session_id, _sp) = srp_begin(&server, &account).await;
+    let wrong = serde_json::json!({
+        "session_id": session_id,
+        "client_proof": hex::encode([0u8; 32]),
+    });
+    for attempt in 1..=3 {
+        let resp = server.post("/api/v1/auth/srp/verify").json(&wrong).await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt} after a success should not be locked — the counter did not reset"
+        );
+    }
+}
+
+// ─── P4: append-only enforcement and the audit view ───────────────────────────
+
+/// ⚠️ An audit log the application merely declines to modify is not an audit
+/// log. Before migration 006 nothing stopped an UPDATE or a DELETE — the "append
+/// only" in the schema comment was aspiration, not enforcement.
+#[tokio::test]
+async fn audit_events_cannot_be_edited_or_deleted() {
+    let server = test_app().await;
+    let (_owner, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    let (dev_id, _dj) = member_at(&server, &jwt, vault_id, "developer").await;
+    let _ = dev_id;
+
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM audit_events WHERE vault_id = $1 LIMIT 1")
+        .bind(vault_id)
+        .fetch_one(&db)
+        .await
+        .expect("the grant should have been audited");
+
+    for (what, sql) in [
+        (
+            "rewrite the event type",
+            "UPDATE audit_events SET event_type = 'nothing_happened' WHERE id = $1",
+        ),
+        (
+            "blank the metadata",
+            "UPDATE audit_events SET metadata = '{}'::jsonb WHERE id = $1",
+        ),
+        (
+            "backdate it",
+            "UPDATE audit_events SET created_at = NOW() - INTERVAL '1 year' WHERE id = $1",
+        ),
+        (
+            "delete it outright",
+            "DELETE FROM audit_events WHERE id = $1",
+        ),
+    ] {
+        let r = sqlx::query(sql).bind(id).execute(&db).await;
+        assert!(r.is_err(), "the database allowed someone to {what}");
+    }
+}
+
+/// ⚠️ The one permitted mutation. Both FKs are ON DELETE SET NULL, so deleting a
+/// user makes Postgres itself update this table — a blanket refusal would make
+/// user deletion impossible rather than making the log safer.
+#[tokio::test]
+async fn deleting_a_user_nulls_their_audit_reference_without_erasing_the_event() {
+    let server = test_app().await;
+    let (owner_id, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    push_versions(&server, &jwt, vault_id, 1).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE user_id = $1")
+        .bind(owner_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert!(before > 0, "the push should have been audited");
+
+    // Remove the rows that reference the user by FK-cascade-unfriendly paths
+    // first, then the user. This is what a real account deletion would do.
+    sqlx::query("DELETE FROM vault_versions WHERE pushed_by = $1")
+        .bind(owner_id)
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM vaults WHERE owner_id = $1")
+        .bind(owner_id)
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(owner_id)
+        .execute(&db)
+        .await
+        .expect("deleting a user must still work — the trigger exempts the FK null");
+
+    let orphaned: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_events WHERE user_id IS NULL AND event_type = 'push'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert!(
+        orphaned > 0,
+        "the event must survive with a null actor, not vanish"
+    );
+}
+
+#[tokio::test]
+async fn a_member_can_read_the_vault_audit_trail() {
+    let server = test_app().await;
+    let (_owner, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    let (dev_id, _dj) = member_at(&server, &jwt, vault_id, "developer").await;
+    push_versions(&server, &jwt, vault_id, 1).await;
+
+    bearer(
+        server.patch(&format!("/api/v1/vaults/{vault_id}/members/{dev_id}")),
+        &jwt,
+    )
+    .json(&serde_json::json!({ "role": "viewer" }))
+    .await
+    .assert_status(StatusCode::NO_CONTENT);
+
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let resp = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/audit")),
+        &jwt,
+    )
+    .await;
+    resp.assert_status_ok();
+    let body = resp.json::<serde_json::Value>();
+    let events = body["events"].as_array().unwrap();
+
+    let types: Vec<&str> = events
+        .iter()
+        .map(|e| e["event_type"].as_str().unwrap())
+        .collect();
+    assert!(types.contains(&"push"), "got {types:?}");
+    assert!(types.contains(&"member_grant"), "got {types:?}");
+    assert!(types.contains(&"member_role_change"), "got {types:?}");
+
+    // The actor is resolved by join, so it is a live email rather than one copied
+    // in at write time and since gone stale.
+    assert!(
+        events.iter().any(|e| e["actor_email"].is_string()),
+        "events should name their actor"
+    );
+
+    // Newest first.
+    let ts: Vec<&str> = events
+        .iter()
+        .map(|e| e["created_at"].as_str().unwrap())
+        .collect();
+    let mut sorted = ts.clone();
+    sorted.sort_by(|a, b| b.cmp(a));
+    assert_eq!(ts, sorted, "the trail should read newest first");
+}
+
+/// ⚠️ `ip_hash` and `user_agent_hash` correlate a person's activity across
+/// events without naming them. That is worth having in the database and is not
+/// worth handing to every colleague who shares a vault.
+#[tokio::test]
+async fn the_audit_view_withholds_device_identifiers() {
+    let server = test_app().await;
+    let (_owner, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    push_versions(&server, &jwt, vault_id, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let raw = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/audit")),
+        &jwt,
+    )
+    .await
+    .text();
+
+    for forbidden in ["ip_hash", "user_agent_hash"] {
+        assert!(
+            !raw.contains(forbidden),
+            "the audit view leaked `{forbidden}`"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_non_member_cannot_read_the_audit_trail() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (_out, outsider_jwt) = verified_user(&server).await;
+
+    let resp = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/audit")),
+        &outsider_jwt,
+    )
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
+}
+
+/// ⚠️ A login alert on the token-refresh path would email every fifteen minutes.
+///
+/// `issue_token_pair` is shared by `srp_verify`, `totp_verify_login` and
+/// `refresh`, so hooking the helper — the obvious place — would have done
+/// exactly that. This pins the call sites at the source level, the same way
+/// `create_vault_handler_uses_a_transaction` does, because asserting on a
+/// fire-and-forget email from an integration test needs subscriber capture for
+/// less benefit than it costs.
+#[test]
+fn login_alerts_fire_on_login_and_never_on_refresh() {
+    let src = std::fs::read_to_string("src/routes/auth.rs").unwrap();
+
+    let body_of = |name: &str| -> String {
+        let start = src
+            .find(&format!("pub async fn {name}("))
+            .unwrap_or_else(|| panic!("handler {name} not found"));
+        let rest = &src[start..];
+        // Up to the next top-level `}` at column 0.
+        let end = rest.find("\n}\n").unwrap_or(rest.len());
+        rest[..end].to_string()
+    };
+
+    assert!(
+        body_of("srp_verify").contains("notify_new_login"),
+        "a password login should tell the account holder"
+    );
+    assert!(
+        body_of("totp_verify_login").contains("notify_new_login"),
+        "a 2FA login completes at the second factor, and should notify there"
+    );
+    assert!(
+        !body_of("refresh").contains("notify_new_login"),
+        "a refresh is the SAME session continuing — alerting here would email \
+         every fifteen minutes"
+    );
+}
+
+/// Refresh keeps working after the helper grew a third return value.
+#[tokio::test]
+async fn refreshing_a_session_still_works_and_rotates_the_token() {
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+    let login = srp_login(&server, &account).await;
+    let refresh_token = login["refresh_token"].as_str().unwrap().to_string();
+
+    let resp = server
+        .post("/api/v1/auth/refresh")
+        .json(&serde_json::json!({ "refresh_token": refresh_token }))
+        .await;
+    resp.assert_status_ok();
+    let body = resp.json::<serde_json::Value>();
+
+    assert!(body["access_token"].is_string());
+    let rotated = body["refresh_token"].as_str().unwrap();
+    assert_ne!(
+        rotated, refresh_token,
+        "the refresh token must rotate, or a stolen one lives forever"
+    );
+}

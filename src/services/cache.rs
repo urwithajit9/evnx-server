@@ -11,9 +11,20 @@ use serde::{de::DeserializeOwned, Serialize};
 ///
 /// Key naming convention:
 ///   srp:{session_id}            → SRP server state (5-min TTL)
-///   rate:auth:{ip_hash}         → auth attempt counter (15-min window)
-///   rate:register:{ip_hash}     → registration counter (24h window)
+///   rate:srp_init:{email_hash}  → SRP init counter (5 per 15 min)
+///   rate:resend_verify:{email_hash} → verification resend counter (3 per hour)
+///
+/// ⚠️ Rate limiting is keyed by **email hash, not by IP**, and the two are not
+/// interchangeable: an email key throttles attacks against one account, an IP
+/// key throttles one attacker across many. Only the first exists. Client
+/// addresses are not plumbed through to handlers at all — every audit event
+/// passes `ip_hash: None` — and doing so means deciding how far to trust
+/// `X-Forwarded-For` from Caddy, which is a separate change.
+///
+/// An earlier revision of this comment listed `rate:auth:{ip_hash}` and
+/// `rate:register:{ip_hash}`. Neither key has ever existed.
 ///   totp_lockout:{user_id}      → failed TOTP counter (15-min TTL)
+///   srp_lockout:{user_id}       → failed SRP proof counter (15-min TTL)
 ///   jwt_blocklist:{session_id}  → revoked JWT sessions
 #[derive(Clone)]
 pub struct CacheService(pub ConnectionManager);

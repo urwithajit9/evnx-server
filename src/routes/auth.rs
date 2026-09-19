@@ -179,6 +179,17 @@ pub struct SrpInitResponse {
     pub server_public: String, // B: hex-encoded server ephemeral public key
 }
 
+/// Failed SRP proofs before the account is locked out.
+///
+/// Five rather than TOTP's three: a TOTP code is read off a screen and retyped,
+/// where a master password is typed from memory and may be long. Three is
+/// unforgiving for the credential people get wrong most often.
+const SRP_MAX_FAILURES: u64 = 5;
+
+/// How long an SRP lockout lasts, and the window failures are counted over.
+/// Matches `totp_lockout` so the two behave the same way.
+const SRP_LOCKOUT_SECONDS: u64 = 900;
+
 /// SRP Step 1 — exchange ephemeral public keys.
 ///
 /// SECURITY CRITICAL: This endpoint must respond identically (same shape, similar timing)
@@ -326,12 +337,41 @@ pub async fn srp_verify(
     // Verify client proof M1
     let client_proof_bytes = hex::decode(&req.client_proof).map_err(|_| AppError::Unauthorized)?;
 
-    server_verifier
-        .verify_client(&client_proof_bytes)
-        .map_err(|_| {
-            tracing::warn!(user_id = ?srp_state.user_id, "SRP verification failed");
-            AppError::Unauthorized
-        })?;
+    // ─── Brute-force lockout ─────────────────────────────────────────────────
+    //
+    // ⚠️ The session below is deleted only on SUCCESS, and that is deliberate —
+    // a mistyped password must not send the user back through `/srp/init`, which
+    // is itself capped at 5 per 15 minutes, or three typos would lock them out
+    // for a quarter of an hour.
+    //
+    // But leaving it at that means one `/srp/init` buys unlimited guesses for the
+    // session's 300-second life, and `srp_verify` has no rate limit of its own.
+    // Each guess costs the attacker an Argon2id derivation, which is a real cost
+    // and not a prohibitive one against a weak password.
+    //
+    // So the bound is a failure counter, exactly as `totp_verify_login` does it.
+    // Keyed by user rather than by session, or an attacker would simply fetch a
+    // fresh session — and `srp_init`'s own limit is per *email*, which is the
+    // same subject, so the two compose.
+    let lockout_key = srp_state.user_id.map(|id| format!("srp_lockout:{id}"));
+
+    if let Some(key) = &lockout_key {
+        let failures: u64 = state.cache.get_json::<u64>(key).await?.unwrap_or(0);
+        if failures >= SRP_MAX_FAILURES {
+            return Err(AppError::AccountLocked);
+        }
+    }
+
+    if let Err(e) = server_verifier.verify_client(&client_proof_bytes) {
+        let _ = e;
+        // Count the failure before answering, so a client that gives up mid-flight
+        // has still been counted.
+        if let Some(key) = &lockout_key {
+            state.cache.incr_with_ttl(key, SRP_LOCKOUT_SECONDS).await?;
+        }
+        tracing::warn!(user_id = ?srp_state.user_id, "SRP verification failed");
+        return Err(AppError::Unauthorized);
+    }
 
     // Get server proof M2 (hex-encoded for JSON)
     let server_proof_bytes = server_verifier.proof();
@@ -340,8 +380,16 @@ pub async fn srp_verify(
     // Optional: extract shared key for encryption if needed
     // let shared_key = server_verifier.key(); // Use HKDF to derive keys from this
 
-    // Delete session (single-use)
+    // Delete session (single-use on success — see the lockout note above for why
+    // a failure deliberately leaves it alive).
     state.cache.del(&session_key).await?;
+
+    // A correct password clears the counter, so a user who mistypes twice and
+    // then succeeds starts clean rather than carrying failures toward a lockout
+    // they never earned.
+    if let Some(key) = &lockout_key {
+        state.cache.del(key).await?;
+    }
 
     // Must have real user at this point
     let user_id = srp_state.user_id.ok_or(AppError::Unauthorized)?;
@@ -385,8 +433,17 @@ pub async fn srp_verify(
     }
 
     // Issue JWT access + refresh token pair
-    let (access_token, refresh_token) =
+    let (access_token, refresh_token, session_id) =
         issue_token_pair(&state, user_id, user.email_verified).await?;
+
+    // ⚠️ Fire-and-forget, and deliberately NOT inside `issue_token_pair` — that
+    // helper is shared with the token-refresh path, which runs every fifteen
+    // minutes and would email accordingly.
+    //
+    // A mail outage must not fail a login, and awaiting delivery would let
+    // response timing say something about the account. Same discipline as the
+    // verification email on register.
+    notify_new_login(&state, &user.email, session_id);
 
     Ok(Json(SrpVerifyResponse {
         server_proof: server_proof_hex,
@@ -644,12 +701,34 @@ fn fake_salt() -> String {
 
 /// Issue a JWT + refresh token pair for a successfully authenticated user.
 /// Returns (access_token_jwt, raw_refresh_token).
+/// Tell the account holder that someone just signed in.
+///
+/// ⚠️ Spawned, never awaited. A mail outage must not fail a login, and awaiting
+/// delivery would make the response time depend on the mail provider — which is
+/// the same reason registration sends its verification email this way.
+///
+/// Errors are logged without the recipient's address: a failure to notify is
+/// worth knowing about, and repeating the address into the log is not.
+fn notify_new_login(state: &AppState, email: &str, session_id: Uuid) {
+    let mail = state.email.clone();
+    let to = email.to_string();
+    let when = chrono::Utc::now();
+    tokio::spawn(async move {
+        if let Err(e) = mail
+            .send_login_alert(&to, &session_id.to_string(), when)
+            .await
+        {
+            tracing::warn!(%session_id, "could not send the login alert: {e}");
+        }
+    });
+}
+
 /// The raw refresh token is returned ONCE — store BLAKE3 hash in DB.
 async fn issue_token_pair(
     state: &AppState,
     user_id: Uuid,
     email_verified: bool,
-) -> Result<(String, String), AppError> {
+) -> Result<(String, String, Uuid), AppError> {
     let session_id = Uuid::new_v4();
 
     // Issue JWT access token
@@ -674,7 +753,7 @@ async fn issue_token_pair(
     )
     .await?;
 
-    Ok((access_token, raw_refresh))
+    Ok((access_token, raw_refresh, session_id))
 }
 
 #[derive(Deserialize)]
@@ -713,8 +792,11 @@ pub async fn refresh(
         return Err(AppError::Unauthorized);
     }
 
-    // 4. Issue new pair
-    let (access_token, new_refresh) =
+    // 4. Issue new pair.
+    //
+    // No login alert here: a refresh is the SAME session continuing, not a new
+    // sign-in, and it happens every fifteen minutes.
+    let (access_token, new_refresh, _session_id) =
         issue_token_pair(&state, token.user_id, user.email_verified).await?;
 
     Ok(Json(RefreshResponse {
@@ -968,8 +1050,12 @@ pub async fn totp_verify_login(
             state.cache.del(&lockout_key).await?;
 
             // Issue real tokens
-            let (access_token, refresh_token) =
+            let (access_token, refresh_token, session_id) =
                 issue_token_pair(&state, user_id, user.email_verified).await?;
+
+            // The second factor is where a 2FA login actually completes, so the
+            // alert belongs here rather than after the password step.
+            notify_new_login(&state, &user.email, session_id);
 
             let backup_codes_remaining = db_totp::remaining(&state.db, user_id).await?;
             Ok(Json(serde_json::json!({
