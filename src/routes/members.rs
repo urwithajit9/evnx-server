@@ -100,6 +100,62 @@ pub async fn add_member(
     Ok(axum::http::StatusCode::CREATED)
 }
 
+/// Everyone who can reach this vault.
+///
+/// ─── Who may see this ────────────────────────────────────────────────────────
+///
+/// **Any member, including a `viewer`.** Being able to see who else holds a key
+/// to a vault you hold a key to is not a privilege — it is the minimum needed to
+/// notice that someone has access they should not. Restricting it to admins
+/// would mean the people most likely to spot a wrong grant are the ones who
+/// cannot look.
+///
+/// A non-member gets **404**, not 403, matching every other vault route: a
+/// distinct "this vault exists but is not yours" would let anyone probe for vault
+/// ids.
+///
+/// ─── What it deliberately does not return ────────────────────────────────────
+///
+/// ⚠️ No wrapped keys. Each member's `encrypted_vault_key`, `eph_pub_key` and
+/// `mlkem_ciphertext` are wrapped to that member and useless to anyone else, but
+/// a listing endpoint is precisely where such a field gets copied into a response
+/// without anyone noticing. `GET /vaults/:id/my-key` returns your own, and
+/// nothing returns anybody else's.
+pub async fn list_members(
+    State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<Claims>,
+    Path(vault_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let requester_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
+
+    // Membership is the authorisation. Any role suffices, so this is a presence
+    // check rather than a rank check — the only route in Phase 3 where that is
+    // the whole rule.
+    vaults::find_member_role(&state.db, vault_id, requester_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    let members = members::list_members(&state.db, vault_id).await?;
+
+    Ok(Json(serde_json::json!({
+        "members": members
+            .into_iter()
+            .map(|m| serde_json::json!({
+                "user_id":        m.user_id,
+                "email":          m.email,
+                "role":           m.role,
+                "granted_at":     m.granted_at,
+                "granted_by":     m.granted_by,
+                // False for an account predating F1 that has not signed in since.
+                // Such a member cannot be re-wrapped to, so a client should say so
+                // before a re-key rather than after it fails.
+                "has_mlkem_key":  m.has_mlkem_key,
+                "is_you":         m.user_id == requester_id,
+            }))
+            .collect::<Vec<_>>(),
+    })))
+}
+
 pub async fn remove_member(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<Claims>,

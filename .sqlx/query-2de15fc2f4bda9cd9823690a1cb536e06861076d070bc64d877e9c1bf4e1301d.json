@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            u.id AS \"user_id!\",\n            u.email AS \"email!\",\n            m.role AS \"role!\",\n            m.granted_at AS \"granted_at!\",\n            m.granted_by,\n            (u.mlkem_public_key IS NOT NULL) AS \"has_mlkem_key!\"\n        FROM vault_members m\n        JOIN users u ON u.id = m.user_id\n        WHERE m.vault_id = $1\n        ORDER BY (m.role = 'owner') DESC, m.granted_at ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "email!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "role!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "granted_at!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "granted_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "has_mlkem_key!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      null
+    ]
+  },
+  "hash": "2de15fc2f4bda9cd9823690a1cb536e06861076d070bc64d877e9c1bf4e1301d"
+}

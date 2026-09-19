@@ -1914,3 +1914,245 @@ async fn sharing_stores_both_halves_and_returns_them() {
     assert_eq!(body["eph_pub_key"], "YmFy");
     assert_eq!(body["mlkem_ciphertext"], ct);
 }
+
+// ─── Phase 3 step 1: who can reach this vault ─────────────────────────────────
+
+#[tokio::test]
+async fn member_list_shows_the_owner_and_everyone_shared_with() {
+    let server = test_app().await;
+    let (owner_id, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+
+    // Owner alone, before any sharing.
+    let resp = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/members")),
+        &jwt,
+    )
+    .await;
+    resp.assert_status_ok();
+    let body = resp.json::<serde_json::Value>();
+    let members = body["members"].as_array().unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0]["role"], "owner");
+    assert_eq!(members[0]["user_id"], owner_id.to_string());
+    assert_eq!(members[0]["is_you"], true);
+    assert_eq!(members[0]["has_mlkem_key"], true);
+
+    // Share, then the list grows.
+    let email = unique_email("listed");
+    server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&email))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+        &jwt,
+    )
+    .json(&serde_json::json!({
+        "user_email": email,
+        "role": "developer",
+        "encrypted_vault_key": "c2hhcmVk",
+        "eph_pub_key": "YmFy",
+        "mlkem_ciphertext": "Y".repeat(1452),
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    let resp = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/members")),
+        &jwt,
+    )
+    .await;
+    let body = resp.json::<serde_json::Value>();
+    let members = body["members"].as_array().unwrap();
+    assert_eq!(members.len(), 2);
+
+    // The owner sorts first regardless of when anyone was added — a list whose
+    // first row moves around as people join reads as unstable.
+    assert_eq!(members[0]["role"], "owner");
+    assert_eq!(members[1]["role"], "developer");
+    assert_eq!(members[1]["email"], email);
+    assert_eq!(members[1]["is_you"], false);
+}
+
+/// ⚠️ The listing must never carry another member's wrapped key.
+///
+/// Each one is wrapped to that member and useless to anyone else, so this is not
+/// a break — but a listing endpoint is exactly where such a field gets copied
+/// into a response by accident, and the test is cheaper than the review.
+#[tokio::test]
+async fn member_list_leaks_no_key_material() {
+    let server = test_app().await;
+    let (_owner, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+
+    let email = unique_email("nokeys");
+    server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&email))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    let ct = "Y".repeat(1452);
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+        &jwt,
+    )
+    .json(&serde_json::json!({
+        "user_email": email,
+        "role": "viewer",
+        "encrypted_vault_key": "c2VjcmV0d3JhcA==",
+        "eph_pub_key": "YmFy",
+        "mlkem_ciphertext": ct,
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    let raw = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/members")),
+        &jwt,
+    )
+    .await
+    .text();
+
+    for forbidden in [
+        "encrypted_vault_key",
+        "eph_pub_key",
+        "mlkem_ciphertext",
+        "c2VjcmV0d3JhcA==", // the wrapped key's actual value
+        "mlkem_public_key",
+        &ct,
+    ] {
+        assert!(
+            !raw.contains(forbidden),
+            "member listing leaked `{forbidden}`"
+        );
+    }
+}
+
+/// A non-member gets 404, not 403 — a distinct "exists but not yours" would let
+/// anyone probe for vault ids.
+#[tokio::test]
+async fn member_list_is_404_for_a_non_member() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+
+    let (_outsider, outsider_jwt) = verified_user(&server).await;
+    let resp = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/members")),
+        &outsider_jwt,
+    )
+    .await;
+
+    assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
+}
+
+/// A `viewer` may list members. Seeing who else holds a key to a vault you hold
+/// a key to is the minimum needed to notice a wrong grant — restricting it to
+/// admins would blind the people most likely to spot one.
+#[tokio::test]
+async fn a_viewer_may_list_members() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+
+    let email = unique_email("viewer");
+    let reg = server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&email))
+        .await;
+    reg.assert_status(StatusCode::CREATED);
+    let viewer_id =
+        Uuid::parse_str(reg.json::<serde_json::Value>()["user_id"].as_str().unwrap()).unwrap();
+
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({
+        "user_email": email,
+        "role": "viewer",
+        "encrypted_vault_key": "Zm9v",
+        "eph_pub_key": "YmFy",
+        "mlkem_ciphertext": "Y".repeat(1452),
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    let viewer_jwt = jwt_service()
+        .await
+        .issue(viewer_id, Uuid::new_v4(), true)
+        .unwrap();
+
+    let resp = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/members")),
+        &viewer_jwt,
+    )
+    .await;
+    resp.assert_status_ok();
+    assert_eq!(
+        resp.json::<serde_json::Value>()["members"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+/// `has_mlkem_key` is false for an account predating F1, so a client can say why
+/// a re-share or re-key will refuse them rather than failing at the point of use.
+#[tokio::test]
+async fn member_list_flags_a_member_with_no_post_quantum_key() {
+    let server = test_app().await;
+    let (_owner, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+
+    let email = unique_email("prepq");
+    server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&email))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+        &jwt,
+    )
+    .json(&serde_json::json!({
+        "user_email": email,
+        "role": "developer",
+        "encrypted_vault_key": "Zm9v",
+        "eph_pub_key": "YmFy",
+        "mlkem_ciphertext": "Y".repeat(1452),
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    // Simulate the pre-F1 account: the share already happened, the key is gone.
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    sqlx::query("UPDATE users SET mlkem_public_key = NULL WHERE email = $1")
+        .bind(&email)
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let body = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/members")),
+        &jwt,
+    )
+    .await
+    .json::<serde_json::Value>();
+
+    let them = body["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["email"] == email.as_str())
+        .expect("the member should still be listed");
+
+    assert_eq!(them["has_mlkem_key"], false);
+}

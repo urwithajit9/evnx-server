@@ -150,3 +150,52 @@ pub async fn remove_member(
     .await?;
     Ok(r.rows_affected() > 0)
 }
+
+/// One row of a vault's member list.
+///
+/// ⚠️ Deliberately carries **no key material**. `encrypted_vault_key`,
+/// `eph_pub_key` and `mlkem_ciphertext` are each wrapped to one specific member
+/// and are useless to anyone else — but "useless to an attacker" is not a reason
+/// to hand them out, and a listing endpoint is exactly where that kind of field
+/// gets copied into a response by accident.
+pub struct MemberRow {
+    pub user_id: Uuid,
+    pub email: String,
+    pub role: String,
+    pub granted_at: chrono::DateTime<chrono::Utc>,
+    /// Who granted this access. `None` only if that account has since been
+    /// deleted — the column is a nullable FK.
+    pub granted_by: Option<Uuid>,
+    /// Whether this member has a post-quantum public key on file.
+    ///
+    /// `false` means an account that predates F1 and has not signed in since.
+    /// Surfaced here so a client can explain *why* a re-key or a re-share will
+    /// refuse them, rather than failing at the point of action with no warning.
+    pub has_mlkem_key: bool,
+}
+
+/// Everyone who can reach a vault, oldest grant first.
+///
+/// The owner sorts first regardless, because a member list whose first row moves
+/// around as people are added reads as unstable.
+pub async fn list_members(pool: &PgPool, vault_id: Uuid) -> Result<Vec<MemberRow>, sqlx::Error> {
+    sqlx::query_as!(
+        MemberRow,
+        r#"
+        SELECT
+            u.id AS "user_id!",
+            u.email AS "email!",
+            m.role AS "role!",
+            m.granted_at AS "granted_at!",
+            m.granted_by,
+            (u.mlkem_public_key IS NOT NULL) AS "has_mlkem_key!"
+        FROM vault_members m
+        JOIN users u ON u.id = m.user_id
+        WHERE m.vault_id = $1
+        ORDER BY (m.role = 'owner') DESC, m.granted_at ASC
+        "#,
+        vault_id,
+    )
+    .fetch_all(pool)
+    .await
+}

@@ -56,7 +56,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/", get(vaults::list_vaults).post(vaults::create_vault))
         .route("/:vault_id", delete(vaults::delete_vault))
         .route("/:vault_id/my-key", get(vaults::get_my_key))
-        .route("/:vault_id/members", post(members::add_member))
+        .route(
+            "/:vault_id/members",
+            get(members::list_members).post(members::add_member),
+        )
         .route(
             "/:vault_id/members/:user_id",
             delete(members::remove_member),
