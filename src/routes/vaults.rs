@@ -229,3 +229,51 @@ pub async fn get_my_key(
         "mlkem_ciphertext": key_row.mlkem_ciphertext,
     })))
 }
+
+// ─── Audit trail ──────────────────────────────────────────────────────────────
+
+/// What has happened to this vault.
+///
+/// ─── Who may read it ─────────────────────────────────────────────────────────
+///
+/// **Any member.** The same reasoning as the member list: noticing that someone
+/// pulled a secret they should not have, or granted access you did not expect,
+/// requires being able to look. Restricting the trail to admins would leave the
+/// people best placed to spot something unable to.
+///
+/// ─── What it does not return ─────────────────────────────────────────────────
+///
+/// ⚠️ No `ip_hash`, no `user_agent_hash`. They are stable digests, so they
+/// correlate a person's activity across events without naming them — useful to
+/// an operator investigating, and a tracking primitive handed to every colleague
+/// who shares a vault. They stay in the database.
+///
+/// No key material either; `services::audit` never writes any, and there is a
+/// test asserting so.
+pub async fn vault_audit(
+    State(state): State<AppState>,
+    access: VaultAccess<AtLeastViewer>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // Capped rather than paginated. An audit view is read by a human scanning for
+    // something surprising, and 200 events is more than anyone scans; proper
+    // paging can arrive when someone actually needs to walk further back.
+    const LIMIT: i64 = 200;
+
+    let events = crate::services::audit::list_for_vault(&state.db, access.vault_id, LIMIT).await?;
+
+    Ok(Json(serde_json::json!({
+        "events": events
+            .into_iter()
+            .map(|e| serde_json::json!({
+                "id":           e.id,
+                "event_type":   e.event_type,
+                "user_id":      e.user_id,
+                // `null` when the account has been deleted since.
+                "actor_email":  e.actor_email,
+                "metadata":     e.metadata,
+                "created_at":   e.created_at,
+            }))
+            .collect::<Vec<_>>(),
+        "limit": LIMIT,
+    })))
+}

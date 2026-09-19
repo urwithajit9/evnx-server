@@ -82,3 +82,54 @@ pub fn record_membership_event(
         }
     });
 }
+
+/// One event, as the vault audit view returns it.
+pub struct AuditRow {
+    pub id: Uuid,
+    pub event_type: String,
+    pub user_id: Option<Uuid>,
+    pub actor_email: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A vault's audit trail, newest first.
+///
+/// ⚠️ Returns `ip_hash` and `user_agent_hash` to **nobody**. They are BLAKE3
+/// digests, so they identify a device across events without naming it — which is
+/// exactly what makes them worth having and exactly why they should not be
+/// handed to every vault member. Correlating them is an operator's job, against
+/// the database, not a feature of the member-facing view.
+///
+/// `actor_email` is resolved by join rather than stored on the event: an email
+/// copied into `metadata` at write time would go stale, and stale is worse than
+/// absent in an audit log. `None` means the account has since been deleted — the
+/// FK is ON DELETE SET NULL, and migration 006's trigger permits exactly that
+/// one mutation.
+pub async fn list_for_vault(
+    pool: &PgPool,
+    vault_id: Uuid,
+    limit: i64,
+) -> Result<Vec<AuditRow>, sqlx::Error> {
+    sqlx::query_as!(
+        AuditRow,
+        r#"
+        SELECT
+            a.id          AS "id!",
+            a.event_type  AS "event_type!",
+            a.user_id,
+            u.email       AS "actor_email?",
+            a.metadata,
+            a.created_at  AS "created_at!"
+        FROM audit_events a
+        LEFT JOIN users u ON u.id = a.user_id
+        WHERE a.vault_id = $1
+        ORDER BY a.created_at DESC
+        LIMIT $2
+        "#,
+        vault_id,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}
