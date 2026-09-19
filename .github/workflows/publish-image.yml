@@ -14,6 +14,21 @@ name: Publish image
 on:
   workflow_dispatch:
   push:
+    # ⚠️ `branches: [main]` added 2026-09-20, and the reason is a bug that bit
+    # twice. Publishing fired only on a tag or a manual run, so a merge to main
+    # changed nothing in ghcr — and `docker compose pull` on the server happily
+    # re-fetched the identical digest and reported success. Compose then said
+    # "Running" rather than "Started", because from its point of view nothing
+    # had changed. The deploy looked done and was not.
+    #
+    # It happened around d4872e1 and again during the F1 rollout. Both times the
+    # `build` field on /health is what eventually revealed it, and both times it
+    # cost more to diagnose than this line costs to maintain.
+    #
+    # Tags still publish — `type=ref,event=tag` below covers those — and the
+    # `latest` tag is still gated on the default branch, so a tag build does not
+    # move `latest` unless it is also on main.
+    branches: [main]
     tags: ["v*"]
 
 env:
@@ -80,3 +95,6 @@ jobs:
           echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "Deploy with the runbook in docs/DEPLOYMENT.md." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Verify the deploy took by checking /health reports \`${GITHUB_SHA::7}\` —" >> "$GITHUB_STEP_SUMMARY"
+          echo "a pull that fetches an unchanged digest looks identical to one that does not." >> "$GITHUB_STEP_SUMMARY"
