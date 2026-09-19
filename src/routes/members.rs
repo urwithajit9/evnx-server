@@ -107,6 +107,17 @@ pub async fn add_member(
     )
     .await?;
 
+    crate::services::audit::record_membership_event(
+        &state.db,
+        vault_id,
+        requester_id,
+        "member_grant",
+        serde_json::json!({
+            "member_user_id": target.id,
+            "role": granted.as_str(),
+        }),
+    );
+
     Ok(axum::http::StatusCode::CREATED)
 }
 
@@ -235,6 +246,18 @@ pub async fn set_member_role(
         return Err(AppError::NotFound);
     }
 
+    crate::services::audit::record_membership_event(
+        &state.db,
+        vault_id,
+        access.user_id,
+        "member_role_change",
+        serde_json::json!({
+            "member_user_id": member_user_id,
+            "from": current_role.as_str(),
+            "to": new_role.as_str(),
+        }),
+    );
+
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -287,6 +310,23 @@ pub async fn remove_member(
     if !removed {
         return Err(AppError::NotFound);
     }
+
+    crate::services::audit::record_membership_event(
+        &state.db,
+        vault_id,
+        requester_id,
+        "member_revoke",
+        serde_json::json!({
+            "member_user_id": member_user_id,
+            "role": target_role.as_str(),
+            "voluntary": leaving_voluntarily,
+            // ⚠️ Recorded because it is the difference between a revocation that
+            // took effect and one that only looks like it did. A bare removal
+            // leaves the vault key unchanged, so the member keeps the ability to
+            // read everything they had — see routes::rekey.
+            "rekeyed": false,
+        }),
+    );
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

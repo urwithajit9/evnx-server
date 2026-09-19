@@ -130,13 +130,61 @@ pub struct RekeyedVersion {
     pub blob_size_bytes: i32,
 }
 
+/// One member's copy of the **new** vault key.
+///
+/// ⚠️ **Two shapes, and the distinction is the same one `MemberKeyWrap` draws.**
+///
+/// * Both key-agreement fields present — a hybrid X25519 + ML-KEM wrap, which is
+///   what you produce for somebody else from their public keys.
+/// * Both absent — wrapped under the caller's own master key, which is how a
+///   vault creator's own copy has always been sealed. It needs no key agreement
+///   at all, so requiring one here would silently re-seal the owner's own vault
+///   under ECDH — exactly what `CreateVaultRequest::eph_pub_key` was made
+///   optional to prevent.
+///
+/// **Only the caller may use the master-key shape**, because only they hold
+/// their own master key. Supplying it for anyone else would write a blob nobody
+/// can open and lock that member out.
 #[derive(Deserialize)]
 pub struct RekeyedMember {
     pub user_id: Uuid,
     /// The vault key wrapped afresh for this member under the **new** key.
     pub encrypted_vault_key: String,
-    pub eph_pub_key: String,
-    pub mlkem_ciphertext: String,
+    #[serde(default)]
+    pub eph_pub_key: Option<String>,
+    #[serde(default)]
+    pub mlkem_ciphertext: Option<String>,
+}
+
+impl RekeyedMember {
+    /// Which wrap shape this is, refusing the half-shape and the misuse above.
+    fn to_wrap(&self, caller_id: Uuid) -> Result<members::MemberKeyWrap, AppError> {
+        match (&self.eph_pub_key, &self.mlkem_ciphertext) {
+            (Some(eph), Some(ct)) => Ok(members::MemberKeyWrap::Hybrid {
+                encrypted_vault_key: self.encrypted_vault_key.clone(),
+                eph_pub_key: eph.clone(),
+                mlkem_ciphertext: ct.clone(),
+            }),
+            (None, None) => {
+                if self.user_id != caller_id {
+                    return Err(AppError::Validation(format!(
+                        "member {} was given a master-key wrap, but only the caller can \
+                         produce one of those — they hold nobody's master key but their \
+                         own. This would lock that member out.",
+                        self.user_id
+                    )));
+                }
+                Ok(members::MemberKeyWrap::OwnMasterKey {
+                    encrypted_vault_key: self.encrypted_vault_key.clone(),
+                })
+            }
+            _ => Err(AppError::Validation(format!(
+                "member {} has one key-agreement field without the other. A wrap with \
+                 an ephemeral but no ML-KEM ciphertext is one a quantum computer opens.",
+                self.user_id
+            ))),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -250,6 +298,14 @@ pub async fn rekey(
         )));
     }
 
+    // Shapes are resolved before the transaction opens, so a malformed wrap is a
+    // 422 that changed nothing rather than a rollback partway through.
+    let wraps: std::collections::HashMap<Uuid, members::MemberKeyWrap> = req
+        .members
+        .iter()
+        .map(|m| m.to_wrap(access.user_id).map(|w| (m.user_id, w)))
+        .collect::<Result<_, _>>()?;
+
     // ── Commit ───────────────────────────────────────────────────────────────
     let mut tx = state.db.begin().await.map_err(AppError::Database)?;
 
@@ -272,12 +328,10 @@ pub async fn rekey(
     }
 
     for m in &req.members {
-        let wrap = members::MemberKeyWrap::Hybrid {
-            encrypted_vault_key: m.encrypted_vault_key.clone(),
-            eph_pub_key: m.eph_pub_key.clone(),
-            mlkem_ciphertext: m.mlkem_ciphertext.clone(),
-        };
-        if !members::set_wrap(&mut *tx, vault_id, m.user_id, &wrap).await? {
+        let wrap = wraps
+            .get(&m.user_id)
+            .expect("every member was validated above");
+        if !members::set_wrap(&mut *tx, vault_id, m.user_id, wrap).await? {
             return Err(AppError::Conflict(format!(
                 "member {} vanished mid-re-key",
                 m.user_id
@@ -290,6 +344,18 @@ pub async fn rekey(
     }
 
     tx.commit().await.map_err(AppError::Database)?;
+
+    crate::services::audit::record_membership_event(
+        &state.db,
+        vault_id,
+        access.user_id,
+        "vault_rekey",
+        serde_json::json!({
+            "versions_rekeyed":  req.versions.len(),
+            "members_rewrapped": req.members.len(),
+            "removed_user_id":   req.remove_user_id,
+        }),
+    );
 
     Ok(Json(serde_json::json!({
         "versions_rekeyed": req.versions.len(),

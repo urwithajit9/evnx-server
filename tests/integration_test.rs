@@ -2675,12 +2675,22 @@ async fn stage(
     )
 }
 
+/// A hybrid wrap — what you produce for somebody else from their public keys.
 fn wrap_for(user_id: Uuid) -> serde_json::Value {
     serde_json::json!({
         "user_id": user_id,
         "encrypted_vault_key": "bmV3d3JhcA==",
         "eph_pub_key": "bmV3",
         "mlkem_ciphertext": "Z".repeat(1452),
+    })
+}
+
+/// A master-key wrap — no key agreement, the shape a vault creator's own copy
+/// has always used.
+fn own_wrap_for(user_id: Uuid) -> serde_json::Value {
+    serde_json::json!({
+        "user_id": user_id,
+        "encrypted_vault_key": "bXlvd25rZXk=",
     })
 }
 
@@ -2968,4 +2978,249 @@ async fn staging_verifies_the_blob_hash() {
     }))
     .await;
     assert_eq!(resp.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// ⚠️ A re-key must be able to keep the owner's copy master-key-wrapped.
+///
+/// Requiring a hybrid wrap for everyone would silently re-seal the vault
+/// creator's own copy under ECDH — the exact thing `CreateVaultRequest`'s
+/// optional `eph_pub_key` exists to prevent. 284 owner rows in the development
+/// database use this shape.
+#[tokio::test]
+async fn a_rekey_preserves_the_owners_master_key_wrap() {
+    let server = test_app().await;
+    let (owner_id, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    push_versions(&server, &owner_jwt, vault_id, 1).await;
+
+    let (blob_key, blob_hash, size) = stage(&server, &owner_jwt, vault_id, 1).await;
+
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({
+        "versions": [{"version_num": 1, "blob_key": blob_key,
+                      "blob_hash": blob_hash, "blob_size_bytes": size}],
+        "members": [own_wrap_for(owner_id)],
+    }))
+    .await
+    .assert_status_ok();
+
+    let mine = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/my-key")),
+        &owner_jwt,
+    )
+    .await
+    .json::<serde_json::Value>();
+
+    assert_eq!(mine["encrypted_vault_key"], "bXlvd25rZXk=");
+    assert!(
+        mine["eph_pub_key"].is_null() && mine["mlkem_ciphertext"].is_null(),
+        "the owner's copy must stay master-key-wrapped, with no key agreement"
+    );
+}
+
+/// ⚠️ Only the caller may use the master-key shape — nobody holds anyone else's
+/// master key, so this would write a blob that member can never open.
+#[tokio::test]
+async fn a_rekey_cannot_give_someone_else_a_master_key_wrap() {
+    let server = test_app().await;
+    let (owner_id, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (dev_id, _dj) = member_at(&server, &owner_jwt, vault_id, "developer").await;
+    push_versions(&server, &owner_jwt, vault_id, 1).await;
+
+    let (blob_key, blob_hash, size) = stage(&server, &owner_jwt, vault_id, 1).await;
+
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({
+        "versions": [{"version_num": 1, "blob_key": blob_key,
+                      "blob_hash": blob_hash, "blob_size_bytes": size}],
+        "members": [own_wrap_for(owner_id), own_wrap_for(dev_id)],
+    }))
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// Half a wrap is refused before the transaction opens.
+#[tokio::test]
+async fn a_rekey_refuses_half_a_wrap() {
+    let server = test_app().await;
+    let (owner_id, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    push_versions(&server, &owner_jwt, vault_id, 1).await;
+
+    let (blob_key, blob_hash, size) = stage(&server, &owner_jwt, vault_id, 1).await;
+
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({
+        "versions": [{"version_num": 1, "blob_key": blob_key,
+                      "blob_hash": blob_hash, "blob_size_bytes": size}],
+        "members": [{
+            "user_id": owner_id,
+            "encrypted_vault_key": "Zm9v",
+            "eph_pub_key": "bmV3",
+        }],
+    }))
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // And nothing moved.
+    let mine = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/my-key")),
+        &owner_jwt,
+    )
+    .await
+    .json::<serde_json::Value>();
+    assert_eq!(mine["encrypted_vault_key"], "Zm9v");
+}
+
+// ─── Phase 3 step 8: audit trail for membership changes ───────────────────────
+
+async fn audit_events(vault_id: Uuid) -> Vec<(String, serde_json::Value)> {
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    // Audit writes are spawned, so give them a moment to land.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    sqlx::query_as::<_, (String, Option<serde_json::Value>)>(
+        "SELECT event_type, metadata FROM audit_events WHERE vault_id = $1 ORDER BY created_at ASC",
+    )
+    .bind(vault_id)
+    .fetch_all(&db)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|(t, m)| (t, m.unwrap_or(serde_json::Value::Null)))
+    .collect()
+}
+
+#[tokio::test]
+async fn membership_changes_are_audited() {
+    let server = test_app().await;
+    let (owner_id, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (dev_id, _dj) = member_at(&server, &owner_jwt, vault_id, "developer").await;
+
+    bearer(
+        server.patch(&format!("/api/v1/vaults/{vault_id}/members/{dev_id}")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({ "role": "viewer" }))
+    .await
+    .assert_status(StatusCode::NO_CONTENT);
+
+    bearer(
+        server.delete(&format!("/api/v1/vaults/{vault_id}/members/{dev_id}")),
+        &owner_jwt,
+    )
+    .await
+    .assert_status(StatusCode::NO_CONTENT);
+
+    let events = audit_events(vault_id).await;
+    let types: Vec<&str> = events.iter().map(|(t, _)| t.as_str()).collect();
+    assert!(types.contains(&"member_grant"), "got {types:?}");
+    assert!(types.contains(&"member_role_change"), "got {types:?}");
+    assert!(types.contains(&"member_revoke"), "got {types:?}");
+
+    let (_, change) = events
+        .iter()
+        .find(|(t, _)| t == "member_role_change")
+        .unwrap();
+    assert_eq!(change["from"], "developer");
+    assert_eq!(change["to"], "viewer");
+
+    // ⚠️ A bare removal records rekeyed:false — the difference between a
+    // revocation that took effect and one that only looks like it did.
+    let (_, revoke) = events.iter().find(|(t, _)| t == "member_revoke").unwrap();
+    assert_eq!(revoke["rekeyed"], false);
+    assert_eq!(revoke["member_user_id"], dev_id.to_string());
+
+    let _ = owner_id;
+}
+
+#[tokio::test]
+async fn a_rekey_is_audited() {
+    let server = test_app().await;
+    let (owner_id, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (leaver_id, _lj) = member_at(&server, &owner_jwt, vault_id, "developer").await;
+    push_versions(&server, &owner_jwt, vault_id, 2).await;
+
+    let mut versions = Vec::new();
+    for v in 1..=2 {
+        let (blob_key, blob_hash, size) = stage(&server, &owner_jwt, vault_id, v).await;
+        versions.push(serde_json::json!({
+            "version_num": v, "blob_key": blob_key,
+            "blob_hash": blob_hash, "blob_size_bytes": size,
+        }));
+    }
+
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({
+        "versions": versions,
+        "members": [own_wrap_for(owner_id)],
+        "remove_user_id": leaver_id,
+    }))
+    .await
+    .assert_status_ok();
+
+    let events = audit_events(vault_id).await;
+    let (_, rekey) = events
+        .iter()
+        .find(|(t, _)| t == "vault_rekey")
+        .expect("a re-key must be audited");
+
+    assert_eq!(rekey["versions_rekeyed"], 2);
+    assert_eq!(rekey["members_rewrapped"], 1);
+    assert_eq!(rekey["removed_user_id"], leaver_id.to_string());
+}
+
+/// ⚠️ Audit metadata is read by humans and append-only. Key material must never
+/// reach it, however useless that material is to anyone but its owner.
+#[tokio::test]
+async fn audit_metadata_carries_no_key_material() {
+    let server = test_app().await;
+    let (owner_id, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (dev_id, _dj) = member_at(&server, &owner_jwt, vault_id, "developer").await;
+    push_versions(&server, &owner_jwt, vault_id, 1).await;
+
+    let (blob_key, blob_hash, size) = stage(&server, &owner_jwt, vault_id, 1).await;
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({
+        "versions": [{"version_num": 1, "blob_key": blob_key,
+                      "blob_hash": blob_hash, "blob_size_bytes": size}],
+        "members": [own_wrap_for(owner_id), wrap_for(dev_id)],
+    }))
+    .await
+    .assert_status_ok();
+
+    let dump = serde_json::to_string(&audit_events(vault_id).await).unwrap();
+    for forbidden in [
+        "encrypted_vault_key",
+        "eph_pub_key",
+        "mlkem_ciphertext",
+        "bmV3d3JhcA==", // the hybrid wrap's value
+        "bXlvd25rZXk=", // the master-key wrap's value
+        &"Z".repeat(1452),
+    ] {
+        assert!(
+            !dump.contains(forbidden),
+            "audit metadata leaked `{}`",
+            &forbidden[..forbidden.len().min(30)]
+        );
+    }
 }
