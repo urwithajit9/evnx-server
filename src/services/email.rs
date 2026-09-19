@@ -105,18 +105,65 @@ impl EmailService {
             .await
     }
 
-    /// `ip` must already be a BLAKE3 hash — never a raw address.
-    pub async fn send_login_alert(&self, to: &str, ip_hash: &str) -> Result<(), EmailError> {
+    /// Tell someone their account was just signed into.
+    ///
+    /// ─── Why this does not say where the login came from ─────────────────────
+    ///
+    /// ⚠️ The obvious content — a city, an IP — does not exist to send. evnx
+    /// hashes client IPs deliberately (`audit_events.ip_hash`), and an earlier
+    /// version of this function rendered that hash directly: `IP hash: a3f9c2…`.
+    /// A BLAKE3 digest tells a person nothing and offers no action, so it was
+    /// alarming and useless at once.
+    ///
+    /// What can honestly be offered instead is a **session id**, which the
+    /// recipient can match against Settings → Sessions and revoke. That turns
+    /// "something happened" into "here is the thing, here is the button".
+    ///
+    /// ─── Why it is sent at login and not at refresh ──────────────────────────
+    ///
+    /// `issue_token_pair` is shared with the token-refresh path, which runs every
+    /// fifteen minutes. Hooking the helper would have emailed accordingly. The
+    /// two real login handlers call this instead.
+    pub async fn send_login_alert(
+        &self,
+        to: &str,
+        session_id: &str,
+        when: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), EmailError> {
+        // First segment of the UUID: enough to match against the session list,
+        // short enough to read in a notification.
+        let short = session_id.split('-').next().unwrap_or(session_id);
+        let sessions_link = self
+            .public_app_url
+            .as_deref()
+            .map(|base| format!("{}/settings/", base.trim_end_matches('/')));
+
+        let action = match &sessions_link {
+            Some(link) => format!(
+                r#"<p style="margin-top:20px"><a href="{link}" style="color:#E8652A">Review your sessions</a> — revoking one signs that device out immediately.</p>"#
+            ),
+            // No dashboard configured: name the CLI instead of linking nowhere.
+            None => r#"<p style="margin-top:20px">Run <code>evnx auth sessions list</code> to review, and <code>evnx auth sessions revoke-others</code> if this was not you.</p>"#.to_string(),
+        };
+
         let html = format!(
             r#"
-            <div style="font-family:monospace;max-width:560px;margin:40px auto;padding:32px;background:#0f0f1a;color:#e6e6e6;border-radius:12px;border:1px solid #f59e0b">
-              <h2 style="color:#f59e0b">New Login Detected</h2>
-              <p>IP hash: <code>{ip_hash}</code></p>
-              <p>If this wasn't you, revoke all sessions from your account settings.</p>
+            <div style="font-family:ui-monospace,monospace;max-width:560px;margin:40px auto;padding:32px;background:#0d1117;color:#E6EDF3;border-radius:12px;border:1px solid #30363d">
+              <h2 style="color:#E8652A;margin-top:0">New sign-in to evnx</h2>
+              <p>Your account was signed into on <strong>{when}</strong>.</p>
+              <p style="color:#8B949E">Session <code>{short}</code></p>
+              {action}
+              <p style="margin-top:24px;color:#8B949E;font-size:12px">
+                If this was you, nothing to do. evnx cannot see where a sign-in came
+                from — client addresses are hashed before they are stored — so this
+                notice carries the session rather than a location.
+              </p>
             </div>
-        "#
+        "#,
+            when = when.format("%d %b %Y at %H:%M UTC"),
         );
-        self.send(to, "New login to your evnx account", &html, None)
+
+        self.send(to, "New sign-in to your evnx account", &html, None)
             .await
     }
 
