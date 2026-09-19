@@ -164,6 +164,80 @@ pub async fn list_members(
     })))
 }
 
+/// Body of `PATCH /vaults/:id/members/:user_id`.
+#[derive(Deserialize)]
+pub struct SetRoleRequest {
+    pub role: String,
+}
+
+/// Change a member's role.
+///
+/// ─── The rule, in one line ───────────────────────────────────────────────────
+///
+/// **You must outrank both what they are and what you are making them.**
+///
+/// Outranking the *current* role stops an admin demoting a peer or an owner.
+/// Outranking the *new* role stops an admin promoting someone to admin — the
+/// same one-way door `add_member` refuses, reached by a different route. Missing
+/// either check would leave the other pointless, since a grant and a promotion
+/// produce the same end state.
+///
+/// A consequence worth noting: **you cannot change your own role**, because
+/// nobody outranks themselves. That rules out self-demotion too, which is a
+/// small loss and keeps the rule to one sentence.
+pub async fn set_member_role(
+    State(state): State<AppState>,
+    // Admin or above to reach this at all; the finer rules are below.
+    access: VaultAccess<AtLeastAdmin>,
+    Path((_, member_user_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<SetRoleRequest>,
+) -> Result<axum::http::StatusCode, AppError> {
+    let vault_id = access.vault_id;
+
+    let new_role = Role::parse(&req.role)
+        .filter(|r| Role::ASSIGNABLE.contains(r))
+        .ok_or_else(|| {
+            AppError::Validation(format!(
+                "role must be one of: {}",
+                Role::ASSIGNABLE
+                    .iter()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+
+    let current_stored = vaults::find_member_role(&state.db, vault_id, member_user_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let current_role = Role::parse(&current_stored).ok_or_else(|| {
+        AppError::Internal(format!("unrecognised vault role: {current_stored:?}"))
+    })?;
+
+    // ⚠️ The owner's role is fixed. Demoting them would leave the vault with no
+    // owner — nobody who can delete it or promote a replacement — and there is no
+    // transfer-ownership endpoint yet. Same reasoning as `remove_member`.
+    if current_role == Role::Owner {
+        return Err(AppError::Conflict(
+            "the vault owner's role cannot be changed. Transfer ownership first — \
+             which is not built yet."
+                .into(),
+        ));
+    }
+
+    if !access.outranks(current_role) || !access.outranks(new_role) {
+        return Err(AppError::Forbidden);
+    }
+
+    // A no-op is success rather than an error: a client reconciling desired state
+    // should not have to check first.
+    if !members::set_role(&state.db, vault_id, member_user_id, new_role.as_str()).await? {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
 pub async fn remove_member(
     State(state): State<AppState>,
     // Any member, because leaving is always allowed. Removing *somebody else*

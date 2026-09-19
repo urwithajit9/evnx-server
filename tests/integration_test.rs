@@ -2452,3 +2452,520 @@ async fn an_unknown_role_cannot_be_stored() {
         assert!(r.is_err(), "the database accepted role {bad:?}");
     }
 }
+
+// ─── Phase 3 step 3: changing a role ──────────────────────────────────────────
+
+#[tokio::test]
+async fn an_owner_may_change_a_members_role() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (viewer_id, viewer_jwt) = member_at(&server, &owner_jwt, vault_id, "viewer").await;
+
+    // As a viewer, pushing is refused.
+    //
+    // `blob_hash` is computed rather than filler here, unlike the pure-403 tests
+    // above: those never reach the body, but this push has to actually succeed
+    // after the promotion, and the server verifies the hash against the
+    // ciphertext it was given.
+    let push = serde_json::json!({
+        "nonce": "AAAAAAAAAAAAAAAA",
+        "ciphertext": "Zm9v",
+        "blob_hash": blake3::hash(b"foo").to_hex().to_string(),
+        "key_names": ["A"],
+        "key_count": 1,
+        "base_version": 0,
+    });
+    assert_eq!(
+        bearer(
+            server.post(&format!("/api/v1/vaults/{vault_id}/versions")),
+            &viewer_jwt
+        )
+        .json(&push)
+        .await
+        .status_code(),
+        StatusCode::FORBIDDEN
+    );
+
+    // Promote to developer.
+    bearer(
+        server.patch(&format!("/api/v1/vaults/{vault_id}/members/{viewer_id}")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({ "role": "developer" }))
+    .await
+    .assert_status(StatusCode::NO_CONTENT);
+
+    // The same push now succeeds — the change took effect, not merely returned 204.
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/versions")),
+        &viewer_jwt,
+    )
+    .json(&push)
+    .await
+    .assert_status(StatusCode::CREATED);
+}
+
+/// ⚠️ You must outrank both what they are and what you are making them.
+/// Outranking only the current role would let an admin promote someone to admin,
+/// which is the one-way door `add_member` already refuses.
+#[tokio::test]
+async fn an_admin_cannot_promote_anyone_to_admin() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (_aid, admin_jwt) = member_at(&server, &owner_jwt, vault_id, "admin").await;
+    let (dev_id, _dj) = member_at(&server, &owner_jwt, vault_id, "developer").await;
+
+    let resp = bearer(
+        server.patch(&format!("/api/v1/vaults/{vault_id}/members/{dev_id}")),
+        &admin_jwt,
+    )
+    .json(&serde_json::json!({ "role": "admin" }))
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+
+    // Demoting a developer to viewer is fine — the admin outranks both.
+    bearer(
+        server.patch(&format!("/api/v1/vaults/{vault_id}/members/{dev_id}")),
+        &admin_jwt,
+    )
+    .json(&serde_json::json!({ "role": "viewer" }))
+    .await
+    .assert_status(StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn an_admin_cannot_change_another_admins_role() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (_a1, admin1_jwt) = member_at(&server, &owner_jwt, vault_id, "admin").await;
+    let (admin2_id, _a2) = member_at(&server, &owner_jwt, vault_id, "admin").await;
+
+    let resp = bearer(
+        server.patch(&format!("/api/v1/vaults/{vault_id}/members/{admin2_id}")),
+        &admin1_jwt,
+    )
+    .json(&serde_json::json!({ "role": "viewer" }))
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+}
+
+/// Demoting the owner would leave the vault with nobody who can delete it or
+/// promote a replacement.
+#[tokio::test]
+async fn the_owners_role_cannot_be_changed() {
+    let server = test_app().await;
+    let (owner_id, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+
+    let resp = bearer(
+        server.patch(&format!("/api/v1/vaults/{vault_id}/members/{owner_id}")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({ "role": "admin" }))
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn a_role_change_rejects_owner_and_unknown_roles() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (dev_id, _dj) = member_at(&server, &owner_jwt, vault_id, "developer").await;
+
+    for bad in ["owner", "admni", "Admin", "", "god"] {
+        let resp = bearer(
+            server.patch(&format!("/api/v1/vaults/{vault_id}/members/{dev_id}")),
+            &owner_jwt,
+        )
+        .json(&serde_json::json!({ "role": bad }))
+        .await;
+        assert_ne!(
+            resp.status_code(),
+            StatusCode::NO_CONTENT,
+            "role {bad:?} should be refused"
+        );
+    }
+}
+
+/// A developer cannot change anyone's role — the route is admin-gated.
+#[tokio::test]
+async fn a_developer_cannot_change_roles() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (_did, dev_jwt) = member_at(&server, &owner_jwt, vault_id, "developer").await;
+    let (viewer_id, _vj) = member_at(&server, &owner_jwt, vault_id, "viewer").await;
+
+    let resp = bearer(
+        server.patch(&format!("/api/v1/vaults/{vault_id}/members/{viewer_id}")),
+        &dev_jwt,
+    )
+    .json(&serde_json::json!({ "role": "developer" }))
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+}
+
+// ─── Phase 3 step 5: re-keying ────────────────────────────────────────────────
+
+/// Push `n` versions and return their numbers.
+async fn push_versions(server: &TestServer, jwt: &str, vault_id: Uuid, n: i32) -> Vec<i32> {
+    let mut nums = Vec::new();
+    for i in 1..=n {
+        // Encode real bytes rather than hand-writing base64: appending a digit
+        // to a literal produces a string whose length is not a multiple of four,
+        // which is not valid base64 and fails before reaching the server.
+        let raw = format!("ciphertext-v{i}").into_bytes();
+        let ct = {
+            use base64ct::Encoding;
+            base64ct::Base64::encode_string(&raw)
+        };
+        let resp = bearer(
+            server.post(&format!("/api/v1/vaults/{vault_id}/versions")),
+            jwt,
+        )
+        .json(&serde_json::json!({
+            "nonce": "AAAAAAAAAAAAAAAA",
+            "ciphertext": ct,
+            "blob_hash": blake3::hash(&raw).to_hex().to_string(),
+            "key_names": ["A"],
+            "key_count": 1,
+            "base_version": i - 1,
+        }))
+        .await;
+        resp.assert_status(StatusCode::CREATED);
+        nums.push(i);
+    }
+    nums
+}
+
+/// Stage one re-encrypted blob and return the `blob_key` the swap must quote.
+async fn stage(
+    server: &TestServer,
+    jwt: &str,
+    vault_id: Uuid,
+    version_num: i32,
+) -> (String, String, i32) {
+    let raw = format!("rekeyed-v{version_num}").into_bytes();
+    let ct = {
+        use base64ct::Encoding;
+        base64ct::Base64::encode_string(&raw)
+    };
+    let hash = blake3::hash(&raw).to_hex().to_string();
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey/blobs")),
+        jwt,
+    )
+    .json(&serde_json::json!({
+        "version_num": version_num,
+        "nonce": "AAAAAAAAAAAAAAAA",
+        "ciphertext": ct,
+        "blob_hash": hash,
+    }))
+    .await;
+    resp.assert_status_ok();
+    let body = resp.json::<serde_json::Value>();
+    (
+        body["blob_key"].as_str().unwrap().to_string(),
+        hash,
+        body["blob_size_bytes"].as_i64().unwrap() as i32,
+    )
+}
+
+fn wrap_for(user_id: Uuid) -> serde_json::Value {
+    serde_json::json!({
+        "user_id": user_id,
+        "encrypted_vault_key": "bmV3d3JhcA==",
+        "eph_pub_key": "bmV3",
+        "mlkem_ciphertext": "Z".repeat(1452),
+    })
+}
+
+#[tokio::test]
+async fn a_rekey_repoints_every_version_and_rewraps_every_member() {
+    let server = test_app().await;
+    let (owner_id, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (dev_id, _dj) = member_at(&server, &owner_jwt, vault_id, "developer").await;
+    push_versions(&server, &owner_jwt, vault_id, 3).await;
+
+    let mut versions = Vec::new();
+    for v in 1..=3 {
+        let (blob_key, blob_hash, size) = stage(&server, &owner_jwt, vault_id, v).await;
+        versions.push(serde_json::json!({
+            "version_num": v, "blob_key": blob_key,
+            "blob_hash": blob_hash, "blob_size_bytes": size,
+        }));
+    }
+
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({
+        "versions": versions,
+        "members": [wrap_for(owner_id), wrap_for(dev_id)],
+    }))
+    .await;
+    resp.assert_status_ok();
+    let body = resp.json::<serde_json::Value>();
+    assert_eq!(body["versions_rekeyed"], 3);
+    assert_eq!(body["members_rewrapped"], 2);
+
+    // The owner's stored key really did change.
+    let mine = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/my-key")),
+        &owner_jwt,
+    )
+    .await
+    .json::<serde_json::Value>();
+    assert_eq!(mine["encrypted_vault_key"], "bmV3d3JhcA==");
+    assert_eq!(mine["eph_pub_key"], "bmV3");
+}
+
+/// ⚠️ The invariant this endpoint exists to hold. A vault whose versions are
+/// split across two keys cannot be opened by anyone — the old key fails on the
+/// new blobs and the new key fails on the old ones.
+#[tokio::test]
+async fn a_rekey_missing_a_version_is_rejected_whole() {
+    let server = test_app().await;
+    let (owner_id, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    push_versions(&server, &owner_jwt, vault_id, 3).await;
+
+    // Only two of the three.
+    let mut versions = Vec::new();
+    for v in 1..=2 {
+        let (blob_key, blob_hash, size) = stage(&server, &owner_jwt, vault_id, v).await;
+        versions.push(serde_json::json!({
+            "version_num": v, "blob_key": blob_key,
+            "blob_hash": blob_hash, "blob_size_bytes": size,
+        }));
+    }
+
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({ "versions": versions, "members": [wrap_for(owner_id)] }))
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::CONFLICT);
+
+    // And NOTHING moved — not even the two that were supplied.
+    let mine = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/my-key")),
+        &owner_jwt,
+    )
+    .await
+    .json::<serde_json::Value>();
+    assert_eq!(
+        mine["encrypted_vault_key"], "Zm9v",
+        "a rejected re-key must leave the vault exactly as it was"
+    );
+}
+
+/// A member left on the old key loses access to the whole vault.
+#[tokio::test]
+async fn a_rekey_missing_a_member_is_rejected_whole() {
+    let server = test_app().await;
+    let (owner_id, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (_dev_id, _dj) = member_at(&server, &owner_jwt, vault_id, "developer").await;
+    push_versions(&server, &owner_jwt, vault_id, 1).await;
+
+    let (blob_key, blob_hash, size) = stage(&server, &owner_jwt, vault_id, 1).await;
+
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({
+        "versions": [{"version_num": 1, "blob_key": blob_key,
+                      "blob_hash": blob_hash, "blob_size_bytes": size}],
+        "members": [wrap_for(owner_id)],   // developer omitted
+    }))
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::CONFLICT);
+}
+
+/// Revocation and rotation in one transaction: no window where the member is
+/// gone but the key has not moved, or the key has moved but they are still in.
+#[tokio::test]
+async fn a_rekey_can_revoke_a_member_atomically() {
+    let server = test_app().await;
+    let (owner_id, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (leaver_id, leaver_jwt) = member_at(&server, &owner_jwt, vault_id, "developer").await;
+    push_versions(&server, &owner_jwt, vault_id, 2).await;
+
+    let mut versions = Vec::new();
+    for v in 1..=2 {
+        let (blob_key, blob_hash, size) = stage(&server, &owner_jwt, vault_id, v).await;
+        versions.push(serde_json::json!({
+            "version_num": v, "blob_key": blob_key,
+            "blob_hash": blob_hash, "blob_size_bytes": size,
+        }));
+    }
+
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({
+        "versions": versions,
+        "members": [wrap_for(owner_id)],
+        "remove_user_id": leaver_id,
+    }))
+    .await
+    .assert_status_ok();
+
+    // They are out, and the vault reads as gone to them.
+    assert_eq!(
+        bearer(
+            server.get(&format!("/api/v1/vaults/{vault_id}/my-key")),
+            &leaver_jwt
+        )
+        .await
+        .status_code(),
+        StatusCode::NOT_FOUND
+    );
+
+    let members = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/members")),
+        &owner_jwt,
+    )
+    .await
+    .json::<serde_json::Value>();
+    assert_eq!(members["members"].as_array().unwrap().len(), 1);
+}
+
+/// ⚠️ Wrapping the new key for the person being removed would undo the whole
+/// operation, silently.
+#[tokio::test]
+async fn a_rekey_cannot_hand_the_new_key_to_the_member_it_removes() {
+    let server = test_app().await;
+    let (owner_id, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (leaver_id, _lj) = member_at(&server, &owner_jwt, vault_id, "developer").await;
+    push_versions(&server, &owner_jwt, vault_id, 1).await;
+
+    let (blob_key, blob_hash, size) = stage(&server, &owner_jwt, vault_id, 1).await;
+
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({
+        "versions": [{"version_num": 1, "blob_key": blob_key,
+                      "blob_hash": blob_hash, "blob_size_bytes": size}],
+        "members": [wrap_for(owner_id), wrap_for(leaver_id)],
+        "remove_user_id": leaver_id,
+    }))
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn a_developer_cannot_rekey_and_an_admin_can() {
+    let server = test_app().await;
+    let (owner_id, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (_did, dev_jwt) = member_at(&server, &owner_jwt, vault_id, "developer").await;
+    let (admin_id, admin_jwt) = member_at(&server, &owner_jwt, vault_id, "admin").await;
+    push_versions(&server, &owner_jwt, vault_id, 1).await;
+
+    assert_eq!(
+        bearer(
+            server.post(&format!("/api/v1/vaults/{vault_id}/rekey/blobs")),
+            &dev_jwt
+        )
+        .json(&serde_json::json!({
+            "version_num": 1, "nonce": "AAAAAAAAAAAAAAAA",
+            "ciphertext": "Zm9v", "blob_hash": blake3::hash(b"foo").to_hex().to_string(),
+        }))
+        .await
+        .status_code(),
+        StatusCode::FORBIDDEN
+    );
+
+    // An admin may — decided 2026-09-19, so a team whose owner is away can still
+    // revoke someone.
+    let (blob_key, blob_hash, size) = stage(&server, &admin_jwt, vault_id, 1).await;
+    let dev_id = Uuid::parse_str(
+        bearer(
+            server.get(&format!("/api/v1/vaults/{vault_id}/members")),
+            &owner_jwt,
+        )
+        .await
+        .json::<serde_json::Value>()["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "developer")
+            .unwrap()["user_id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &admin_jwt,
+    )
+    .json(&serde_json::json!({
+        "versions": [{"version_num": 1, "blob_key": blob_key,
+                      "blob_hash": blob_hash, "blob_size_bytes": size}],
+        "members": [wrap_for(owner_id), wrap_for(admin_id), wrap_for(dev_id)],
+    }))
+    .await
+    .assert_status_ok();
+}
+
+/// Staging a blob for a version that does not exist would leave an object
+/// nothing can ever reference.
+#[tokio::test]
+async fn staging_a_blob_for_an_unknown_version_is_refused() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    push_versions(&server, &owner_jwt, vault_id, 1).await;
+
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey/blobs")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({
+        "version_num": 99,
+        "nonce": "AAAAAAAAAAAAAAAA",
+        "ciphertext": "Zm9v",
+        "blob_hash": blake3::hash(b"foo").to_hex().to_string(),
+    }))
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
+}
+
+/// Staging must verify the hash, so a corrupt upload fails immediately rather
+/// than at the swap after everything else has been uploaded.
+#[tokio::test]
+async fn staging_verifies_the_blob_hash() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    push_versions(&server, &owner_jwt, vault_id, 1).await;
+
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey/blobs")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({
+        "version_num": 1,
+        "nonce": "AAAAAAAAAAAAAAAA",
+        "ciphertext": "Zm9v",
+        "blob_hash": "a".repeat(64),
+    }))
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+}

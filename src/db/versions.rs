@@ -102,3 +102,51 @@ pub async fn list(pool: &PgPool, vault_id: Uuid) -> Result<Vec<VersionRow>, sqlx
     .fetch_all(pool)
     .await
 }
+
+/// Point a version at a new blob, as part of a re-key.
+///
+/// Executor-generic so every version in a vault can move inside one transaction
+/// with the member re-wraps. A re-key that committed version by version would
+/// leave a vault whose history is split across two keys, which no client can
+/// open — see `routes::versions::rekey`.
+///
+/// `version_num`, `key_names` and `key_count` are untouched: re-keying changes
+/// how the bytes are encrypted, never what they say.
+pub async fn repoint_blob<'e, E>(
+    executor: E,
+    vault_id: Uuid,
+    version_num: i32,
+    blob_key: &str,
+    blob_hash: &str,
+    blob_size_bytes: i32,
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let r = sqlx::query!(
+        r#"
+        UPDATE vault_versions
+           SET blob_key = $3, blob_hash = $4, blob_size_bytes = $5
+         WHERE vault_id = $1 AND version_num = $2
+        "#,
+        vault_id,
+        version_num,
+        blob_key,
+        blob_hash,
+        blob_size_bytes,
+    )
+    .execute(executor)
+    .await?;
+    Ok(r.rows_affected() == 1)
+}
+
+/// Every version number a vault currently has, ascending.
+pub async fn all_version_nums(pool: &PgPool, vault_id: Uuid) -> Result<Vec<i32>, sqlx::Error> {
+    let rows = sqlx::query!(
+        "SELECT version_num FROM vault_versions WHERE vault_id = $1 ORDER BY version_num ASC",
+        vault_id,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.version_num).collect())
+}

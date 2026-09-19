@@ -199,3 +199,86 @@ pub async fn list_members(pool: &PgPool, vault_id: Uuid) -> Result<Vec<MemberRow
     .fetch_all(pool)
     .await
 }
+
+/// Change an existing member's role. Returns false if they are not a member.
+///
+/// Deliberately narrow: it touches `role` and nothing else. A member's wrapped
+/// key is unrelated to their rank — demoting someone does not re-wrap anything,
+/// and must not, or a role change would silently invalidate their access.
+pub async fn set_role(
+    pool: &PgPool,
+    vault_id: Uuid,
+    user_id: Uuid,
+    role: &str,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query!(
+        "UPDATE vault_members SET role = $3 WHERE vault_id = $1 AND user_id = $2",
+        vault_id,
+        user_id,
+        role,
+    )
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Every member's id and role, for validating a re-key covers them all.
+pub async fn member_ids(pool: &PgPool, vault_id: Uuid) -> Result<Vec<Uuid>, sqlx::Error> {
+    let rows = sqlx::query!(
+        "SELECT user_id FROM vault_members WHERE vault_id = $1",
+        vault_id,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.user_id).collect())
+}
+
+/// Replace a member's wrapped key without touching their role.
+///
+/// Executor-generic so a re-key can re-wrap every member inside the same
+/// transaction that repoints the blobs.
+pub async fn set_wrap<'e, E>(
+    executor: E,
+    vault_id: Uuid,
+    user_id: Uuid,
+    wrap: &MemberKeyWrap,
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let (encrypted_vault_key, eph_pub_key, mlkem_ciphertext) = wrap.columns();
+    let r = sqlx::query!(
+        r#"
+        UPDATE vault_members
+           SET encrypted_vault_key = $3, eph_pub_key = $4, mlkem_ciphertext = $5
+         WHERE vault_id = $1 AND user_id = $2
+        "#,
+        vault_id,
+        user_id,
+        encrypted_vault_key,
+        eph_pub_key,
+        mlkem_ciphertext,
+    )
+    .execute(executor)
+    .await?;
+    Ok(r.rows_affected() == 1)
+}
+
+/// Remove a member inside a caller-supplied transaction.
+pub async fn remove_member_tx<'e, E>(
+    executor: E,
+    vault_id: Uuid,
+    user_id: Uuid,
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let r = sqlx::query!(
+        "DELETE FROM vault_members WHERE vault_id = $1 AND user_id = $2",
+        vault_id,
+        user_id,
+    )
+    .execute(executor)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}

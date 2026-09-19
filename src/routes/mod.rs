@@ -4,13 +4,14 @@ use crate::state::AppState;
 use axum::http::{HeaderName, Method};
 use axum::{
     middleware,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 pub mod auth;
 pub mod members;
+pub mod rekey;
 pub mod sessions;
 pub mod tokens;
 pub mod users;
@@ -38,10 +39,15 @@ pub fn create_router(state: AppState) -> Router {
 
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(allowed_origins))
+        // ⚠️ PATCH must be listed. A method missing here fails the browser's
+        // preflight, and the symptom is a CORS error in the console rather than
+        // anything resembling "this verb is not allowed" — so it reads as a
+        // deployment problem. Added with the role-change endpoint in Phase 3.
         .allow_methods([
             Method::GET,
             Method::POST,
             Method::PUT,
+            Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
         ])
@@ -62,7 +68,7 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route(
             "/:vault_id/members/:user_id",
-            delete(members::remove_member),
+            patch(members::set_member_role).delete(members::remove_member),
         )
         .route(
             "/:vault_id/versions",
@@ -73,6 +79,10 @@ pub fn create_router(state: AppState) -> Router {
             get(versions::get_latest_version),
         )
         .route("/:vault_id/versions/:n/blob", get(versions::download_blob))
+        // Re-keying. Blobs are staged one at a time, then one atomic swap —
+        // see routes::rekey for why it cannot be a single request.
+        .route("/:vault_id/rekey/blobs", post(rekey::stage_blob))
+        .route("/:vault_id/rekey", post(rekey::rekey))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_verified,

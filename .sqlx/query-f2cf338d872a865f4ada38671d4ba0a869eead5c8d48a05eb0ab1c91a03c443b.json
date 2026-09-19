@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE vault_versions\n           SET blob_key = $3, blob_hash = $4, blob_size_bytes = $5\n         WHERE vault_id = $1 AND version_num = $2\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Text",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f2cf338d872a865f4ada38671d4ba0a869eead5c8d48a05eb0ab1c91a03c443b"
+}

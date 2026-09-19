@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE vault_members\n           SET encrypted_vault_key = $3, eph_pub_key = $4, mlkem_ciphertext = $5\n         WHERE vault_id = $1 AND user_id = $2\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0c4a9b704600171619081c7a897409592df48cbf7cf48ea37a3308944ba1419a"
+}

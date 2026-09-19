@@ -222,7 +222,9 @@ pub async fn download_blob(
         .unwrap())
 }
 
-fn base64_decode(s: &str) -> Result<Vec<u8>, base64ct::Error> {
+/// Shared with `routes::rekey`, which stages blobs in the same wire format a
+/// push uses. Two decoders would be two chances to disagree about padding.
+pub(crate) fn base64_decode(s: &str) -> Result<Vec<u8>, base64ct::Error> {
     use base64ct::{Base64, Encoding};
     Base64::decode_vec(s)
 }

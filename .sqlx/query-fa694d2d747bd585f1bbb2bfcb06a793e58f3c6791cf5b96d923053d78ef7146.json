@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT version_num FROM vault_versions WHERE vault_id = $1 ORDER BY version_num ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "version_num",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fa694d2d747bd585f1bbb2bfcb06a793e58f3c6791cf5b96d923053d78ef7146"
+}
