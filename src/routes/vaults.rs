@@ -1,9 +1,6 @@
 // src/routes/vaults.rs
 
-use axum::{
-    extract::{Path, State},
-    Json,
-};
+use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
@@ -11,6 +8,7 @@ use validator::Validate;
 use crate::{
     db::{members, vaults},
     errors::AppError,
+    middleware::vault_role::{AtLeastViewer, OwnerOnly, VaultAccess},
     services::jwt::Claims,
     state::AppState,
 };
@@ -188,19 +186,14 @@ pub async fn list_vaults(
 
 pub async fn delete_vault(
     State(state): State<AppState>,
-    axum::Extension(claims): axum::Extension<Claims>,
-    Path(vault_id): Path<Uuid>,
+    // Owner only. An admin can share, revoke and re-key, but destroying the vault
+    // — and everyone else's access with it — stays with the one account that
+    // created it.
+    access: VaultAccess<OwnerOnly>,
 ) -> Result<axum::http::StatusCode, AppError> {
-    let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
-
-    // Only owners can delete
-    let role = vaults::find_member_role(&state.db, vault_id, user_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-
-    if role != "owner" {
-        return Err(AppError::Forbidden);
-    }
+    let VaultAccess {
+        vault_id, user_id, ..
+    } = access;
 
     let deleted = vaults::soft_delete(&state.db, vault_id, user_id).await?;
     if !deleted {
@@ -214,10 +207,14 @@ pub async fn delete_vault(
 
 pub async fn get_my_key(
     State(state): State<AppState>,
-    axum::Extension(claims): axum::Extension<Claims>,
-    Path(vault_id): Path<Uuid>,
+    // Any member. Previously this had no explicit check and relied on the query
+    // returning nothing for a non-member — correct, but authorisation by
+    // side-effect. Now it is stated.
+    access: VaultAccess<AtLeastViewer>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
+    let VaultAccess {
+        vault_id, user_id, ..
+    } = access;
 
     let key_row = members::get_wrapped_key(&state.db, vault_id, user_id)
         .await?

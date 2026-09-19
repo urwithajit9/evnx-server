@@ -2156,3 +2156,299 @@ async fn member_list_flags_a_member_with_no_post_quantum_key() {
 
     assert_eq!(them["has_mlkem_key"], false);
 }
+
+// ─── Phase 3 step 2: the role ladder ──────────────────────────────────────────
+
+/// Share a vault with a fresh account at `role`, returning their id and a JWT.
+async fn member_at(
+    server: &TestServer,
+    owner_jwt: &str,
+    vault_id: Uuid,
+    role: &str,
+) -> (Uuid, String) {
+    let email = unique_email(role);
+    let reg = server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&email))
+        .await;
+    reg.assert_status(StatusCode::CREATED);
+    let id = Uuid::parse_str(reg.json::<serde_json::Value>()["user_id"].as_str().unwrap()).unwrap();
+
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+        owner_jwt,
+    )
+    .json(&serde_json::json!({
+        "user_email": email,
+        "role": role,
+        "encrypted_vault_key": "Zm9v",
+        "eph_pub_key": "YmFy",
+        "mlkem_ciphertext": "Y".repeat(1452),
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    let jwt = jwt_service().await.issue(id, Uuid::new_v4(), true).unwrap();
+    (id, jwt)
+}
+
+#[tokio::test]
+async fn a_viewer_may_read_but_not_push() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (_vid, viewer_jwt) = member_at(&server, &owner_jwt, vault_id, "viewer").await;
+
+    // Reads: allowed.
+    bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/versions")),
+        &viewer_jwt,
+    )
+    .await
+    .assert_status_ok();
+
+    // Push: refused with 403 — they are a member, so the vault's existence is
+    // not a secret from them; only the action is refused.
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/versions")),
+        &viewer_jwt,
+    )
+    .json(&serde_json::json!({
+        "nonce": "AAAAAAAAAAAAAAAA",
+        "ciphertext": "Zm9v",
+        "blob_hash": "a".repeat(64),
+        "key_names": ["A"],
+        "key_count": 1,
+        "base_version": 0,
+    }))
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_developer_may_push_but_not_share_or_delete() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (_did, dev_jwt) = member_at(&server, &owner_jwt, vault_id, "developer").await;
+
+    let outsider = unique_email("outsider");
+    server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&outsider))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    // Sharing hands out a key — not a developer-level act.
+    let share = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+        &dev_jwt,
+    )
+    .json(&serde_json::json!({
+        "user_email": outsider,
+        "role": "viewer",
+        "encrypted_vault_key": "Zm9v",
+        "eph_pub_key": "YmFy",
+        "mlkem_ciphertext": "Y".repeat(1452),
+    }))
+    .await;
+    assert_eq!(share.status_code(), StatusCode::FORBIDDEN);
+
+    // Deleting the vault is owner-only.
+    let del = bearer(
+        server.delete(&format!("/api/v1/vaults/{vault_id}")),
+        &dev_jwt,
+    )
+    .await;
+    assert_eq!(del.status_code(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn an_admin_may_share_but_not_delete_the_vault() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (_aid, admin_jwt) = member_at(&server, &owner_jwt, vault_id, "admin").await;
+
+    let target = unique_email("shared-by-admin");
+    server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&target))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+        &admin_jwt,
+    )
+    .json(&serde_json::json!({
+        "user_email": target,
+        "role": "developer",
+        "encrypted_vault_key": "Zm9v",
+        "eph_pub_key": "YmFy",
+        "mlkem_ciphertext": "Y".repeat(1452),
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    let del = bearer(
+        server.delete(&format!("/api/v1/vaults/{vault_id}")),
+        &admin_jwt,
+    )
+    .await;
+    assert_eq!(del.status_code(), StatusCode::FORBIDDEN);
+}
+
+/// ⚠️ You may only grant a role you outrank.
+///
+/// An admin granting `admin` would create a peer neither could remove, leaving
+/// only the owner able to clean up.
+#[tokio::test]
+async fn an_admin_cannot_grant_admin() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (_aid, admin_jwt) = member_at(&server, &owner_jwt, vault_id, "admin").await;
+
+    let target = unique_email("would-be-admin");
+    server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&target))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+        &admin_jwt,
+    )
+    .json(&serde_json::json!({
+        "user_email": target,
+        "role": "admin",
+        "encrypted_vault_key": "Zm9v",
+        "eph_pub_key": "YmFy",
+        "mlkem_ciphertext": "Y".repeat(1452),
+    }))
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+
+    // The owner, who does outrank admin, may.
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({
+        "user_email": target,
+        "role": "admin",
+        "encrypted_vault_key": "Zm9v",
+        "eph_pub_key": "YmFy",
+        "mlkem_ciphertext": "Y".repeat(1452),
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+}
+
+/// ⚠️ Removal requires **outranking**, which gets "admins cannot remove other
+/// admins" for free — `Admin > Admin` is false. Two admins cannot evict each
+/// other in a race; only the owner settles it.
+#[tokio::test]
+async fn an_admin_cannot_remove_another_admin_but_the_owner_can() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+
+    let (_a1, admin1_jwt) = member_at(&server, &owner_jwt, vault_id, "admin").await;
+    let (admin2_id, _a2jwt) = member_at(&server, &owner_jwt, vault_id, "admin").await;
+
+    let peer = bearer(
+        server.delete(&format!("/api/v1/vaults/{vault_id}/members/{admin2_id}")),
+        &admin1_jwt,
+    )
+    .await;
+    assert_eq!(peer.status_code(), StatusCode::FORBIDDEN);
+
+    bearer(
+        server.delete(&format!("/api/v1/vaults/{vault_id}/members/{admin2_id}")),
+        &owner_jwt,
+    )
+    .await
+    .assert_status(StatusCode::NO_CONTENT);
+}
+
+/// Leaving is always allowed, whatever your rank.
+#[tokio::test]
+async fn any_member_may_remove_themselves() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (viewer_id, viewer_jwt) = member_at(&server, &owner_jwt, vault_id, "viewer").await;
+
+    bearer(
+        server.delete(&format!("/api/v1/vaults/{vault_id}/members/{viewer_id}")),
+        &viewer_jwt,
+    )
+    .await
+    .assert_status(StatusCode::NO_CONTENT);
+}
+
+/// ⚠️ An ownerless vault has nobody who can delete it or promote a replacement,
+/// and there is no transfer-ownership endpoint. Refusing is recoverable.
+#[tokio::test]
+async fn the_owner_cannot_be_removed_even_by_themselves() {
+    let server = test_app().await;
+    let (owner_id, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+
+    let resp = bearer(
+        server.delete(&format!("/api/v1/vaults/{vault_id}/members/{owner_id}")),
+        &owner_jwt,
+    )
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::CONFLICT);
+}
+
+/// A non-member gets 404 everywhere, never 403 — a distinct "exists but not
+/// yours" would let anyone probe for vault ids.
+#[tokio::test]
+async fn a_non_member_gets_404_not_403_across_vault_routes() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (_out, outsider_jwt) = verified_user(&server).await;
+
+    for path in [
+        format!("/api/v1/vaults/{vault_id}/members"),
+        format!("/api/v1/vaults/{vault_id}/versions"),
+        format!("/api/v1/vaults/{vault_id}/versions/latest"),
+        format!("/api/v1/vaults/{vault_id}/my-key"),
+    ] {
+        let resp = bearer(server.get(&path), &outsider_jwt).await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::NOT_FOUND,
+            "{path} leaked the vault's existence to a non-member"
+        );
+    }
+}
+
+/// Migration 005: an unknown role is unstorable. A typo would otherwise read as
+/// "this user has no permission" rather than "this row is corrupt".
+#[tokio::test]
+async fn an_unknown_role_cannot_be_stored() {
+    let server = test_app().await;
+    let (owner_id, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+
+    for bad in ["admni", "Admin", "god", ""] {
+        let r =
+            sqlx::query("UPDATE vault_members SET role = $1 WHERE vault_id = $2 AND user_id = $3")
+                .bind(bad)
+                .bind(vault_id)
+                .bind(owner_id)
+                .execute(&db)
+                .await;
+        assert!(r.is_err(), "the database accepted role {bad:?}");
+    }
+}

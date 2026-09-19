@@ -3,7 +3,7 @@
 use crate::{
     db::{members, users as db_users, vaults},
     errors::AppError,
-    services::jwt::Claims,
+    middleware::vault_role::{AtLeastAdmin, AtLeastViewer, Role, VaultAccess},
     state::AppState,
 };
 use axum::{
@@ -30,28 +30,38 @@ pub struct AddMemberRequest {
 
 pub async fn add_member(
     State(state): State<AppState>,
-    axum::Extension(claims): axum::Extension<Claims>,
-    Path(vault_id): Path<Uuid>,
+    // Admin or above — sharing hands out a key, so it is not a developer-level act.
+    access: VaultAccess<AtLeastAdmin>,
     Json(req): Json<AddMemberRequest>,
 ) -> Result<axum::http::StatusCode, AppError> {
-    let requester_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
+    let VaultAccess {
+        vault_id,
+        user_id: requester_id,
+        ..
+    } = access;
 
-    // Check requester has admin or owner role on this vault
-    let role = vaults::find_member_role(&state.db, vault_id, requester_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let granted = Role::parse(&req.role)
+        .filter(|r| Role::ASSIGNABLE.contains(r))
+        .ok_or_else(|| {
+            AppError::Validation(format!(
+                "role must be one of: {}",
+                Role::ASSIGNABLE
+                    .iter()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
 
-    if !["owner", "admin"].contains(&role.as_str()) {
+    // ⚠️ You may only grant a role you outrank.
+    //
+    // An admin granting `admin` would create a peer neither of them can remove —
+    // see `remove_member`, where removal requires outranking the target — leaving
+    // only the owner able to clean up. Nothing is *breached* by allowing it, but
+    // it is a one-way door for everyone except the owner, and roles that are
+    // easier to create than to undo accumulate.
+    if !access.outranks(granted) {
         return Err(AppError::Forbidden);
-    }
-
-    // Validate the role being assigned
-    let valid_roles = ["admin", "developer", "viewer"];
-    if !valid_roles.contains(&req.role.as_str()) {
-        return Err(AppError::Validation(format!(
-            "role must be one of: {}",
-            valid_roles.join(", ")
-        )));
     }
 
     // Prevent assigning "owner" — only vault creation sets owner
@@ -85,7 +95,7 @@ pub async fn add_member(
         &state.db,
         vault_id,
         target.id,
-        &req.role,
+        granted.as_str(),
         // Always `Hybrid` here: a share wraps by ECDH *and* ML-KEM, together.
         // `MemberKeyWrap` has no variant that carries only one of them.
         &members::MemberKeyWrap::Hybrid {
@@ -123,17 +133,15 @@ pub async fn add_member(
 /// nothing returns anybody else's.
 pub async fn list_members(
     State(state): State<AppState>,
-    axum::Extension(claims): axum::Extension<Claims>,
-    Path(vault_id): Path<Uuid>,
+    // Any member — membership is the whole rule here. See the doc comment above
+    // for why a viewer is included rather than excluded.
+    access: VaultAccess<AtLeastViewer>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let requester_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
-
-    // Membership is the authorisation. Any role suffices, so this is a presence
-    // check rather than a rank check — the only route in Phase 3 where that is
-    // the whole rule.
-    vaults::find_member_role(&state.db, vault_id, requester_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let VaultAccess {
+        vault_id,
+        user_id: requester_id,
+        ..
+    } = access;
 
     let members = members::list_members(&state.db, vault_id).await?;
 
@@ -158,28 +166,47 @@ pub async fn list_members(
 
 pub async fn remove_member(
     State(state): State<AppState>,
-    axum::Extension(claims): axum::Extension<Claims>,
-    Path((vault_id, member_user_id)): Path<(Uuid, Uuid)>,
+    // Any member, because leaving is always allowed. Removing *somebody else*
+    // needs more, and that is checked below against the target's own rank.
+    access: VaultAccess<AtLeastViewer>,
+    Path((_, member_user_id)): Path<(Uuid, Uuid)>,
 ) -> Result<axum::http::StatusCode, AppError> {
-    let requester_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
+    let VaultAccess {
+        vault_id,
+        user_id: requester_id,
+        ..
+    } = access;
 
-    // Only owner can remove members; users can remove themselves
-    let role = vaults::find_member_role(&state.db, vault_id, requester_id)
+    let target_stored = vaults::find_member_role(&state.db, vault_id, member_user_id)
         .await?
         .ok_or(AppError::NotFound)?;
+    let target_role = Role::parse(&target_stored)
+        .ok_or_else(|| AppError::Internal(format!("unrecognised vault role: {target_stored:?}")))?;
 
-    let can_remove = role == "owner" || requester_id == member_user_id;
-    if !can_remove {
-        return Err(AppError::Forbidden);
+    // ⚠️ The owner cannot be removed, by anyone, including themselves.
+    //
+    // A vault with no owner has nobody who can delete it or promote a
+    // replacement, and there is no transfer-ownership endpoint yet. Refusing is
+    // recoverable; an ownerless vault is not.
+    if target_role == Role::Owner {
+        return Err(AppError::Conflict(
+            "the vault owner cannot be removed. Transfer ownership first —              which is not built yet."
+                .into(),
+        ));
     }
 
-    // Prevent removing the owner
-    let target_role = vaults::find_member_role(&state.db, vault_id, member_user_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-
-    if target_role == "owner" {
-        return Err(AppError::Conflict("Cannot remove vault owner".into()));
+    // ⚠️ Removing someone else requires OUTRANKING them, not merely being an
+    // admin.
+    //
+    // Expressed as a rank comparison rather than a role list, this gets "admins
+    // cannot remove other admins" for free: `Admin > Admin` is false. Two admins
+    // therefore cannot evict each other in a race, and only the owner resolves a
+    // disagreement between them.
+    //
+    // Leaving on your own account is always allowed, whatever your rank.
+    let leaving_voluntarily = requester_id == member_user_id;
+    if !leaving_voluntarily && !access.outranks(target_role) {
+        return Err(AppError::Forbidden);
     }
 
     let removed = members::remove_member(&state.db, vault_id, member_user_id).await?;

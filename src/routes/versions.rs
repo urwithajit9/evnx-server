@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    db::{vaults, versions},
+    db::versions,
     errors::AppError,
-    services::jwt::Claims,
+    middleware::vault_role::{AtLeastDeveloper, AtLeastViewer, VaultAccess},
     state::AppState,
 };
 
@@ -42,20 +42,14 @@ pub struct PushVersionResponse {
 
 pub async fn push_version(
     State(state): State<AppState>,
-    axum::Extension(claims): axum::Extension<Claims>,
-    Path(vault_id): Path<Uuid>,
+    // Developer or above. A viewer is refused before the body is read — the
+    // requirement is in the signature, not in the body, so it cannot be skipped.
+    access: VaultAccess<AtLeastDeveloper>,
     Json(req): Json<PushVersionRequest>,
 ) -> Result<(axum::http::StatusCode, Json<PushVersionResponse>), AppError> {
-    let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
-
-    // 1. Check push permission (owner, admin, developer)
-    let role = vaults::find_member_role(&state.db, vault_id, user_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-
-    if !["owner", "admin", "developer"].contains(&role.as_str()) {
-        return Err(AppError::Forbidden);
-    }
+    let VaultAccess {
+        vault_id, user_id, ..
+    } = access;
 
     // 2. Optimistic locking: check base_version matches current latest
     let current_version = versions::get_latest_version_num(&state.db, vault_id).await?;
@@ -147,15 +141,10 @@ pub async fn push_version(
 
 pub async fn get_latest_version(
     State(state): State<AppState>,
-    axum::Extension(claims): axum::Extension<Claims>,
-    Path(vault_id): Path<Uuid>,
+    // Any member. Version metadata carries no secret values — only key *names*.
+    access: VaultAccess<AtLeastViewer>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
-
-    // Any vault member can get version metadata
-    vaults::find_member_role(&state.db, vault_id, user_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let vault_id = access.vault_id;
 
     let version = versions::get_latest(&state.db, vault_id)
         .await?
@@ -176,15 +165,15 @@ pub async fn get_latest_version(
 
 pub async fn download_blob(
     State(state): State<AppState>,
-    axum::Extension(claims): axum::Extension<Claims>,
-    Path((vault_id, version_num)): Path<(Uuid, i32)>,
+    // Any member may pull. The blob is ciphertext either way — the server could
+    // not hand over plaintext if it wanted to — so this gate is about metadata
+    // and audit trail, not confidentiality.
+    access: VaultAccess<AtLeastViewer>,
+    Path((_, version_num)): Path<(Uuid, i32)>,
 ) -> Result<Response, AppError> {
-    let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
-
-    // Any vault member can pull
-    vaults::find_member_role(&state.db, vault_id, user_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let VaultAccess {
+        vault_id, user_id, ..
+    } = access;
 
     let version = versions::get_by_num(&state.db, vault_id, version_num)
         .await?
@@ -240,14 +229,10 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, base64ct::Error> {
 
 pub async fn list_versions(
     State(state): State<AppState>,
-    axum::Extension(claims): axum::Extension<Claims>,
-    Path(vault_id): Path<Uuid>,
+    // Any member. History is key *names* and hashes, never values.
+    access: VaultAccess<AtLeastViewer>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
-
-    vaults::find_member_role(&state.db, vault_id, user_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let vault_id = access.vault_id;
 
     let versions = versions::list(&state.db, vault_id).await?;
 
