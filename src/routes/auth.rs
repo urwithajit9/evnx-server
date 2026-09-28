@@ -1223,3 +1223,202 @@ pub async fn me(
         "has_mlkem_key":         user.mlkem_public_key.is_some(),
     })))
 }
+
+// ─── Deleting an account ──────────────────────────────────────────────────────
+
+/// Body of `DELETE /api/v1/auth/account`.
+#[derive(Deserialize)]
+pub struct DeleteAccountRequest {
+    /// The account's own email address, typed by the person deleting it.
+    ///
+    /// ⚠️ **This is a guard against mistakes, not against attackers.** Anyone who
+    /// can reach this endpoint already knows their own email, so it stops a
+    /// misclick and a mis-scripted call — nothing more. `totp_code` below is the
+    /// security control, and the session guard is what keeps API tokens out.
+    ///
+    /// It is enforced here rather than only in the UI because a client that
+    /// forgets to ask is exactly the client that deletes an account by accident.
+    pub confirm_email: String,
+    /// Required when TOTP is enabled, as it is for disabling TOTP.
+    #[serde(default)]
+    pub totp_code: Option<String>,
+}
+
+/// Delete the caller's account and everything only they can reach.
+///
+/// ─── What goes, and what survives ────────────────────────────────────────────
+///
+/// | | |
+/// |---|---|
+/// | `users` row — email, SRP verifier, salts, keys | **deleted**, so the identity is gone |
+/// | sessions, API tokens, TOTP secret and recovery codes | cascade |
+/// | vaults where this account is the **only** member | deleted, blobs included |
+/// | `audit_events.user_id` | **nulled** — the events stay, disassociated (migration 006) |
+/// | `vault_versions.pushed_by`, `vault_members.granted_by` | **nulled** (migration 007) |
+///
+/// The last row is the point of migration 007: before it, either column made an
+/// active account undeletable.
+///
+/// ─── Why a shared vault blocks the whole thing ───────────────────────────────
+///
+/// `vaults.owner_id` is `ON DELETE CASCADE`, so deleting an owner deletes their
+/// vaults — and with them the `vault_members` rows of everyone else. **Your
+/// erasure must not erase someone else's data.**
+///
+/// The server cannot resolve this on its own: promoting a new owner would mean
+/// wrapping the vault key for them, and the server has never seen that key. Nor
+/// can it leave the vault owner-less, because nobody could then administer,
+/// share or re-key it.
+///
+/// So this refuses, names the vaults, and leaves the choice to the person: remove
+/// the other members, or delete the vault. Erasure stays achievable without
+/// anyone's help — it is just not always one step. Ownership transfer would make
+/// it one, and is not built.
+///
+/// # Errors
+/// * `400` — `confirm_email` does not match the account.
+/// * `401` — no session, or a wrong/absent TOTP code while TOTP is enabled.
+/// * `403` — an API token tried this; the route sits behind `require_user_session`.
+/// * `409` — the account owns vaults other people are members of, which are named.
+pub async fn delete_account(
+    State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<Claims>,
+    Json(req): Json<DeleteAccountRequest>,
+) -> Result<axum::http::StatusCode, AppError> {
+    let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
+    let user = users::find_by_id(&state.db, user_id)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+
+    // ── Did they mean it ────────────────────────────────────────────────────
+    if req.confirm_email.trim().to_lowercase() != user.email.to_lowercase() {
+        return Err(AppError::Validation(
+            "confirm_email must be this account's own email address. Nothing has been deleted."
+                .into(),
+        ));
+    }
+
+    // ── Is it them ──────────────────────────────────────────────────────────
+    //
+    // Same bar as disabling TOTP: a session alone is not enough for an
+    // irreversible account-level act, because a borrowed session is exactly the
+    // case a second factor exists for.
+    if user.totp_enabled {
+        let code = req.totp_code.as_deref().unwrap_or_default();
+        let secret = user
+            .totp_secret_enc
+            .clone()
+            .ok_or_else(|| AppError::Internal("TOTP enabled but no secret".into()))?;
+        let authorised = verify_totp_code(&secret, code).is_ok()
+            || db_totp::redeem(&state.db, user_id, &hash_token(code)).await?;
+        if !authorised {
+            return Err(AppError::Unauthorized);
+        }
+    }
+
+    // ── Vaults that are not only theirs ─────────────────────────────────────
+    let blocking = sqlx::query!(
+        r#"
+        SELECT v.name, v.environment, COUNT(m.user_id) - 1 AS "others!"
+        FROM vaults v
+        JOIN vault_members m ON m.vault_id = v.id
+        WHERE v.owner_id = $1 AND v.deleted_at IS NULL
+        GROUP BY v.id, v.name, v.environment
+        HAVING COUNT(m.user_id) > 1
+        ORDER BY v.name, v.environment
+        "#,
+        user_id
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(AppError::Database)?;
+
+    if !blocking.is_empty() {
+        let named = blocking
+            .iter()
+            .map(|v| {
+                format!(
+                    "{}/{} ({} other member{})",
+                    v.name,
+                    v.environment,
+                    v.others,
+                    if v.others == 1 { "" } else { "s" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(AppError::Conflict(format!(
+            "this account owns {} vault{} that other people are members of: {}. \
+             Deleting the account would delete those vaults and everyone else's access \
+             with them, so nothing has been deleted. Remove the other members, or delete \
+             the vaults, then try again.",
+            blocking.len(),
+            if blocking.len() == 1 { "" } else { "s" },
+            named
+        )));
+    }
+
+    // ── The blobs of vaults that die with the account ───────────────────────
+    //
+    // Collected before the delete, because afterwards the rows naming them are
+    // gone and the objects would be unreachable forever. A cascading row delete
+    // cannot reach object storage.
+    let doomed_blobs = sqlx::query_scalar!(
+        r#"
+        SELECT ver.blob_key
+        FROM vault_versions ver
+        JOIN vaults v ON v.id = ver.vault_id
+        WHERE v.owner_id = $1
+        "#,
+        user_id
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(AppError::Database)?;
+
+    // Recorded before the row goes. The event survives the deletion with its
+    // `user_id` nulled, which is what migration 006's exemption exists for — the
+    // log keeps *that an account was deleted*, not *whose*.
+    // ⚠️ Awaited, not `tokio::spawn`ed as every other audit call is. The insert
+    // has a foreign key to `users`, so a spawned write racing the delete below
+    // would simply fail — the one event that must survive the deletion is the
+    // one recording it. A failure is still only logged: erasure is the person's
+    // right and must not be blocked on a log write, which is the same call the
+    // rest of this service makes.
+    if let Err(e) = crate::services::audit::record(
+        &state.db,
+        crate::services::audit::AuditEvent {
+            vault_id: None,
+            user_id: Some(user_id),
+            event_type: "account_deleted".into(),
+            ip_hash: None,
+            user_agent_hash: None,
+            metadata: Some(serde_json::json!({ "vaults_deleted": doomed_blobs.len() })),
+        },
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "could not record an account deletion");
+    }
+
+    sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+        .execute(&state.db)
+        .await
+        .map_err(AppError::Database)?;
+
+    // ⚠️ After the commit, and best-effort. The other order is worse: deleting
+    // blobs first and then failing the row delete would leave a live account
+    // whose vaults cannot be opened. An orphaned object is wasted bytes; an
+    // unopenable vault is lost data.
+    for key in &doomed_blobs {
+        if let Err(e) = state.storage.delete_blob(key).await {
+            tracing::warn!(
+                error = %e,
+                "account deleted, but a blob could not be removed from storage"
+            );
+        }
+    }
+
+    tracing::info!(blobs = doomed_blobs.len(), "account deleted");
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}

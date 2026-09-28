@@ -12,7 +12,16 @@ pub struct VersionRow {
     pub blob_hash: String,
     pub key_count: i32,
     pub key_names: Option<Vec<String>>,
-    pub pushed_by: Uuid,
+    /// Who pushed it, or `None` if that account has since been deleted.
+    ///
+    /// ⚠️ Optional since migration 007. `pushed_by` is `ON DELETE SET NULL`, so
+    /// deleting an account does not delete versions it pushed to **other
+    /// people's** vaults — the version survives and the pusher is forgotten. The
+    /// same trade `audit_events.user_id` has always made.
+    ///
+    /// `CreateVersion::pushed_by` stays required: at push time the pusher is
+    /// always known. Only reads can encounter the gap.
+    pub pushed_by: Option<Uuid>,
     pub pushed_at: chrono::DateTime<chrono::Utc>,
 }
 

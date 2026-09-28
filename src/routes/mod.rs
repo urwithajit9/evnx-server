@@ -123,6 +123,10 @@ pub fn create_router(state: AppState) -> Router {
             "/totp/backup-codes",
             post(auth::totp_regenerate_backup_codes),
         )
+        // ⚠️ Here rather than under `require_auth`, so an API token cannot delete
+        // the account that issued it. A leaked CI token is exactly the credential
+        // that must not be able to erase the account it belongs to.
+        .route("/account", delete(auth::delete_account))
         // CI/CD API tokens. Minting a token is a privilege-granting act, so it
         // requires a real login — a token must not be able to mint another.
         .route(

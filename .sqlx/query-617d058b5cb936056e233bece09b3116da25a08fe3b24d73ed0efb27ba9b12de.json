@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT ver.blob_key\n        FROM vault_versions ver\n        JOIN vaults v ON v.id = ver.vault_id\n        WHERE v.owner_id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "blob_key",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "617d058b5cb936056e233bece09b3116da25a08fe3b24d73ed0efb27ba9b12de"
+}

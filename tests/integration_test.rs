@@ -3634,3 +3634,111 @@ async fn refreshing_a_session_still_works_and_rotates_the_token() {
         "the refresh token must rotate, or a stolen one lives forever"
     );
 }
+
+// ─── A3 — account deletion ───────────────────────────────────────────────────
+//
+// ⚠️ Before migration 007 this was impossible for anyone who had used the
+// product: `vault_versions.pushed_by` and `vault_members.granted_by` were
+// declared without an `ON DELETE` clause, so they defaulted to NO ACTION and a
+// single push made an account undeletable. Right to erasure is not optional, so
+// that was a compliance problem hiding as a schema default.
+
+/// The email must be typed back. A guard against a misclick and a mis-scripted
+/// call — not against an attacker, who knows their own address.
+#[tokio::test]
+async fn deleting_an_account_requires_typing_its_email() {
+    let server = test_app().await;
+    let (_id, jwt) = verified_user(&server).await;
+
+    bearer(server.delete("/api/v1/auth/account"), &jwt)
+        .json(&serde_json::json!({ "confirm_email": "someone-else@example.com" }))
+        .await
+        .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Still there.
+    bearer(server.get("/api/v1/auth/me"), &jwt)
+        .await
+        .assert_status(StatusCode::OK);
+}
+
+/// ⚠️ The case migration 007 exists for. Pushing a version used to make the
+/// account permanently undeletable, with a bare foreign-key violation as the
+/// only explanation.
+#[tokio::test]
+async fn an_account_that_has_pushed_can_be_deleted() {
+    let server = test_app().await;
+    let (_id, jwt) = verified_user(&server).await;
+    let email = bearer(server.get("/api/v1/auth/me"), &jwt)
+        .await
+        .json::<serde_json::Value>()["email"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let vault_id = create_vault(&server, &jwt).await;
+    push_versions(&server, &jwt, vault_id, 2).await;
+
+    bearer(server.delete("/api/v1/auth/account"), &jwt)
+        .json(&serde_json::json!({ "confirm_email": email }))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    // The session's user is gone, so the guard can no longer resolve it.
+    bearer(server.get("/api/v1/auth/me"), &jwt)
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+}
+
+/// ⚠️ The decision this endpoint turns on. `vaults.owner_id` is ON DELETE
+/// CASCADE, so deleting an owner would delete their vaults and every other
+/// member's access with them. Your erasure must not erase someone else's data —
+/// so it refuses, and names what is in the way.
+#[tokio::test]
+async fn a_vault_with_other_members_blocks_deletion_and_is_named() {
+    let server = test_app().await;
+    let (_owner, jwt) = verified_user(&server).await;
+    let email = bearer(server.get("/api/v1/auth/me"), &jwt)
+        .await
+        .json::<serde_json::Value>()["email"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let vault_id = create_vault(&server, &jwt).await;
+    let _ = member_at(&server, &jwt, vault_id, "developer").await;
+
+    let resp = bearer(server.delete("/api/v1/auth/account"), &jwt)
+        .json(&serde_json::json!({ "confirm_email": email.clone() }))
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::CONFLICT);
+
+    // Naming them is the whole point — "you own a shared vault" with no way to
+    // find out which would leave the person stuck.
+    let body = resp.text();
+    assert!(
+        body.contains("other people are members of"),
+        "the refusal must explain itself:\n{body}"
+    );
+
+    // ⚠️ And nothing was deleted. A refusal that half-ran would be worse than one
+    // that never started.
+    bearer(server.get("/api/v1/auth/me"), &jwt)
+        .await
+        .assert_status(StatusCode::OK);
+    bearer(server.get("/api/v1/vaults"), &jwt)
+        .await
+        .assert_status(StatusCode::OK);
+}
+
+/// A CI token must not be able to delete the account it belongs to. 403 (wrong
+/// credential type) rather than 401, matching the rest of account management.
+#[tokio::test]
+async fn an_api_token_cannot_delete_the_account() {
+    let server = test_app().await;
+    let fake = format!("evnx_tok_{}", "b".repeat(64));
+
+    let resp = bearer(server.delete("/api/v1/auth/account"), &fake)
+        .json(&serde_json::json!({ "confirm_email": "whoever@example.com" }))
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+}
