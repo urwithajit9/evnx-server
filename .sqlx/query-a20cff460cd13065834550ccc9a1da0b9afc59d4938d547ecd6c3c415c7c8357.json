@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO master_key_rotations\n            (user_id, expires_at, prev_srp_salt, prev_srp_verifier,\n             prev_argon2_salt, prev_encrypted_private_key, prev_wraps)\n        VALUES ($1, NOW() + make_interval(hours => $2::int), $3, $4, $5, $6, $7)\n        ON CONFLICT DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a20cff460cd13065834550ccc9a1da0b9afc59d4938d547ecd6c3c415c7c8357"
+}

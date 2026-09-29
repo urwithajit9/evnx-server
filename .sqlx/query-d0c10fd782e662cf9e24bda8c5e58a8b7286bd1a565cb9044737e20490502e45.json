@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE master_key_rotations\n           SET consumed_at = NOW(), outcome = 'expired'\n         WHERE user_id = $1\n           AND consumed_at IS NULL\n           AND expires_at <= NOW()\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d0c10fd782e662cf9e24bda8c5e58a8b7286bd1a565cb9044737e20490502e45"
+}

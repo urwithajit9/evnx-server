@@ -100,6 +100,18 @@ impl CacheService {
         Ok(n > 0)
     }
 
+    /// Delete a key and report whether it was there.
+    ///
+    /// ⚠️ One round trip, deliberately. `exists` followed by `del` lets two
+    /// concurrent requests both observe the same single-use flag before either
+    /// spends it, which for a flag authorising an irreversible operation means
+    /// it authorises two.
+    pub async fn take_flag(&self, key: &str) -> Result<bool, CacheError> {
+        let mut conn = self.0.clone();
+        let removed: u64 = conn.del(key).await.map_err(CacheError::Valkey)?;
+        Ok(removed > 0)
+    }
+
     /// Set a key with no value (just existence matters — blocklist pattern).
     pub async fn set_flag(&self, key: &str, ttl_seconds: u64) -> Result<(), CacheError> {
         let mut conn = self.0.clone();

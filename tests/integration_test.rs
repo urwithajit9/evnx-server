@@ -3742,3 +3742,710 @@ async fn an_api_token_cannot_delete_the_account() {
         .await;
     assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
 }
+
+// ─── Master-key rotation — Chain 4.1a ─────────────────────────────────────────
+//
+// ⚠️ These drive the real SRP-6a exchange, twice over: once to prove the current
+// password before a rotation is allowed, and once against the *previous*
+// verifier to undo one. Nothing is stubbed, because the thing under test is an
+// authorisation decision and a stubbed proof would assert nothing.
+//
+// The operation being guarded is the only one in the system that can destroy
+// every vault an account owns, and the server cannot tell a correct rotation
+// from random bytes — so what these tests are really checking is that garbage
+// cannot be submitted by anyone who does not already know the password, and that
+// a half-applied rotation is impossible.
+
+/// A password and the SRP salt it was registered under.
+#[derive(Clone)]
+struct Credential {
+    password: Vec<u8>,
+    srp_salt: [u8; 32],
+}
+
+impl Credential {
+    fn new(password: &[u8]) -> Self {
+        Self {
+            password: password.to_vec(),
+            srp_salt: generate_salt(),
+        }
+    }
+}
+
+/// Mint a JWT claiming a verified email for a user that already exists.
+/// Test setup, as `verified_user` is: the server issues this only when the
+/// database agrees.
+async fn verified_jwt(user_id: Uuid) -> String {
+    jwt_service()
+        .await
+        .issue(user_id, Uuid::new_v4(), true)
+        .unwrap()
+}
+
+/// Attempt a login. `None` means the server refused it.
+async fn try_srp_login(
+    server: &TestServer,
+    email: &str,
+    cred: &Credential,
+) -> Option<serde_json::Value> {
+    let ephemeral = generate_client_ephemeral().unwrap();
+    let init = server
+        .post("/api/v1/auth/srp/init")
+        .json(&serde_json::json!({
+            "email": email,
+            "client_public": hex::encode(&ephemeral.public_a),
+        }))
+        .await;
+    init.assert_status_ok();
+    let init = init.json::<serde_json::Value>();
+    let server_public = hex::decode(init["server_public"].as_str().unwrap()).unwrap();
+
+    let srp_password = derive_srp_password(&cred.password, &cred.srp_salt).unwrap();
+    let proof = compute_client_proof(
+        email,
+        srp_password,
+        &cred.srp_salt,
+        &server_public,
+        &ephemeral,
+    )
+    .unwrap();
+
+    let verify = server
+        .post("/api/v1/auth/srp/verify")
+        .json(&serde_json::json!({
+            "session_id": init["session_id"].as_str().unwrap(),
+            "client_proof": hex::encode(&proof.client_proof),
+        }))
+        .await;
+
+    if verify.status_code() != StatusCode::OK {
+        return None;
+    }
+    Some(verify.json::<serde_json::Value>())
+}
+
+/// Prove a password at `/auth/reauth/*`. Returns the HTTP status of the verify.
+async fn reauth(server: &TestServer, email: &str, access: &str, cred: &Credential) -> StatusCode {
+    let ephemeral = generate_client_ephemeral().unwrap();
+    let init = bearer(server.post("/api/v1/auth/reauth/init"), access)
+        .json(&serde_json::json!({ "client_public": hex::encode(&ephemeral.public_a) }))
+        .await;
+    init.assert_status_ok();
+    let init = init.json::<serde_json::Value>();
+    let server_public = hex::decode(init["server_public"].as_str().unwrap()).unwrap();
+
+    let srp_password = derive_srp_password(&cred.password, &cred.srp_salt).unwrap();
+    let proof = compute_client_proof(
+        email,
+        srp_password,
+        &cred.srp_salt,
+        &server_public,
+        &ephemeral,
+    )
+    .unwrap();
+
+    bearer(server.post("/api/v1/auth/reauth/verify"), access)
+        .json(&serde_json::json!({
+            "session_id": init["session_id"].as_str().unwrap(),
+            "client_proof": hex::encode(&proof.client_proof),
+        }))
+        .await
+        .status_code()
+}
+
+/// Build the body of a rotation to `next`, re-wrapping exactly `vaults`.
+fn rotate_body(email: &str, next: &Credential, vaults: &[Uuid], reason: &str) -> serde_json::Value {
+    let srp_password = derive_srp_password(&next.password, &next.srp_salt).unwrap();
+    let verifier = compute_verifier(email, srp_password, next.srp_salt).unwrap();
+    serde_json::json!({
+        "srp_salt":              verifier.srp_salt_base64(),
+        "srp_verifier":          verifier.verifier_hex(),
+        "argon2_salt":           salt_to_base64(&generate_salt()),
+        "encrypted_private_key": "R".repeat(96),
+        "reason":                reason,
+        "vault_wraps": vaults.iter().map(|v| serde_json::json!({
+            "vault_id": v,
+            // Opaque to the server by construction — that is the whole point.
+            "encrypted_vault_key": format!("rewrapped-{}", v.simple()),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// A vault whose key is wrapped by the hybrid path — the shape a *share*
+/// produces. Rotation must leave these alone.
+async fn create_shared_style_vault(server: &TestServer, jwt: &str) -> Uuid {
+    let resp = bearer(server.post("/api/v1/vaults"), jwt)
+        .json(&serde_json::json!({
+            "name": format!("s{}", Uuid::new_v4().simple()),
+            "environment": "development",
+            "encrypted_vault_key": "aHlicmlkLXdyYXBwZWQ=",
+            "eph_pub_key": "ZXBoZW1lcmFs",
+            "mlkem_ciphertext": "a2VtLWNpcGhlcnRleHQ=",
+        }))
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+    Uuid::parse_str(
+        resp.json::<serde_json::Value>()["vault_id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+/// Register an account whose password is a value the test chose.
+async fn register_with(server: &TestServer, cred: &Credential) -> (String, Uuid) {
+    let email = unique_email("rot");
+    let srp_password = derive_srp_password(&cred.password, &cred.srp_salt).unwrap();
+    let verifier = compute_verifier(&email, srp_password, cred.srp_salt).unwrap();
+
+    let resp = server
+        .post("/api/v1/auth/register")
+        .json(&serde_json::json!({
+            "email": email,
+            "srp_verifier": verifier.verifier_hex(),
+            "srp_salt": verifier.srp_salt_base64(),
+            "argon2_salt": salt_to_base64(&generate_salt()),
+            "ed25519_public_key": "C".repeat(44),
+            "x25519_public_key": "D".repeat(44),
+            "mlkem_public_key": "F".repeat(1580),
+            "encrypted_private_key": "E".repeat(96),
+        }))
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+    let user_id = Uuid::parse_str(
+        resp.json::<serde_json::Value>()["user_id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    (email, user_id)
+}
+
+/// A session alone must not be enough.
+///
+/// This is the whole point of the feature's authorisation design. A stolen
+/// session cannot produce a valid rotation — that needs the old password — but
+/// it could submit garbage, and garbage is indistinguishable to a server that
+/// holds only ciphertext. The result would be an account nobody can open again.
+#[tokio::test]
+async fn rotation_without_a_password_proof_is_refused() {
+    let server = test_app().await;
+    let cred = Credential::new(b"first password for rotation");
+    let (email, user_id) = register_with(&server, &cred).await;
+    let access = verified_jwt(user_id).await;
+
+    let next = Credential::new(b"second password for rotation");
+    let resp = bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(&email, &next, &[], "routine"))
+        .await;
+
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+    assert!(
+        try_srp_login(&server, &email, &cred).await.is_some(),
+        "the original password must still work"
+    );
+}
+
+/// Proving the *wrong* password arms nothing.
+#[tokio::test]
+async fn a_wrong_password_does_not_arm_a_rotation() {
+    let server = test_app().await;
+    let cred = Credential::new(b"the real password");
+    let (email, user_id) = register_with(&server, &cred).await;
+    let access = verified_jwt(user_id).await;
+
+    // Same salt, different password — a genuine exchange that must not verify.
+    let wrong = Credential {
+        password: b"not the real password".to_vec(),
+        srp_salt: cred.srp_salt,
+    };
+    assert_eq!(
+        reauth(&server, &email, &access, &wrong).await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let next = Credential::new(b"attacker chosen");
+    let resp = bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(&email, &next, &[], "routine"))
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+}
+
+/// The happy path, end to end: the old password stops working and the new one starts.
+#[tokio::test]
+async fn a_proven_rotation_replaces_the_password() {
+    let server = test_app().await;
+    let cred = Credential::new(b"before the change");
+    let (email, user_id) = register_with(&server, &cred).await;
+    let access = verified_jwt(user_id).await;
+    let vault = create_vault(&server, &access).await;
+
+    assert_eq!(
+        reauth(&server, &email, &access, &cred).await,
+        StatusCode::OK
+    );
+
+    // Built once: a second call would generate a different salt, so the verifier
+    // sent and the one the test later logs in against would not match.
+    let next = Credential::new(b"after the change");
+    let body = rotate_body(&email, &next, &[vault], "routine");
+    let resp = bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&body)
+        .await;
+    resp.assert_status_ok();
+    let out = resp.json::<serde_json::Value>();
+    assert_eq!(out["status"], "rotated");
+    assert_eq!(out["vaults_rewrapped"], 1);
+    assert!(out["undo_available_until"].is_string());
+
+    assert!(
+        try_srp_login(&server, &email, &cred).await.is_none(),
+        "the old password must stop working"
+    );
+    assert!(
+        try_srp_login(&server, &email, &next).await.is_some(),
+        "the new password must work"
+    );
+}
+
+/// Every wrap, or none.
+///
+/// ⚠️ A vault left wrapped under a password nobody holds any more is simply
+/// gone — there is no recovery anywhere in the system. So a payload that omits
+/// one must change nothing at all, not partially succeed.
+#[tokio::test]
+async fn a_rotation_missing_a_wrap_changes_nothing() {
+    let server = test_app().await;
+    let cred = Credential::new(b"two vaults one wrap");
+    let (email, user_id) = register_with(&server, &cred).await;
+    let access = verified_jwt(user_id).await;
+
+    let kept = create_vault(&server, &access).await;
+    let forgotten = create_vault(&server, &access).await;
+
+    assert_eq!(
+        reauth(&server, &email, &access, &cred).await,
+        StatusCode::OK
+    );
+
+    let next = Credential::new(b"should not take effect");
+    let resp = bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(&email, &next, &[kept], "routine"))
+        .await;
+
+    assert_eq!(resp.status_code(), StatusCode::CONFLICT);
+    let msg = resp.text();
+    assert!(
+        msg.contains(&forgotten.to_string()),
+        "the refusal must name the vault it is missing: {msg}"
+    );
+
+    assert!(
+        try_srp_login(&server, &email, &cred).await.is_some(),
+        "the original password must still work"
+    );
+    assert!(
+        try_srp_login(&server, &email, &next).await.is_none(),
+        "the rejected password must not have taken effect"
+    );
+}
+
+/// A vault key shared *to* the account is wrapped to its keypair, which a
+/// rotation re-seals rather than replaces. Those rows must be untouched — and
+/// must not be demanded in the payload either.
+#[tokio::test]
+async fn a_rotation_leaves_hybrid_wrapped_keys_alone() {
+    let server = test_app().await;
+    let cred = Credential::new(b"own and shared");
+    let (email, user_id) = register_with(&server, &cred).await;
+    let access = verified_jwt(user_id).await;
+
+    let own = create_vault(&server, &access).await;
+    let shared = create_shared_style_vault(&server, &access).await;
+
+    let before = bearer(
+        server.get(&format!("/api/v1/vaults/{shared}/my-key")),
+        &access,
+    )
+    .await
+    .json::<serde_json::Value>();
+
+    assert_eq!(
+        reauth(&server, &email, &access, &cred).await,
+        StatusCode::OK
+    );
+
+    // Only the master-key-wrapped vault is listed, and that is accepted.
+    let next = Credential::new(b"rotated past a share");
+    let resp = bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(&email, &next, &[own], "routine"))
+        .await;
+    resp.assert_status_ok();
+    assert_eq!(resp.json::<serde_json::Value>()["vaults_rewrapped"], 1);
+
+    let after = bearer(
+        server.get(&format!("/api/v1/vaults/{shared}/my-key")),
+        &access,
+    )
+    .await
+    .json::<serde_json::Value>();
+    assert_eq!(
+        before, after,
+        "a hybrid wrap must survive a rotation intact"
+    );
+}
+
+/// Including a hybrid-wrapped vault is a client bug, and is refused rather than
+/// written — half a hybrid wrap is one a quantum computer opens.
+#[tokio::test]
+async fn a_rotation_may_not_claim_a_hybrid_wrapped_vault() {
+    let server = test_app().await;
+    let cred = Credential::new(b"claims too much");
+    let (email, user_id) = register_with(&server, &cred).await;
+    let access = verified_jwt(user_id).await;
+
+    let own = create_vault(&server, &access).await;
+    let shared = create_shared_style_vault(&server, &access).await;
+
+    assert_eq!(
+        reauth(&server, &email, &access, &cred).await,
+        StatusCode::OK
+    );
+
+    let next = Credential::new(b"rejected");
+    let resp = bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(&email, &next, &[own, shared], "routine"))
+        .await;
+
+    assert_eq!(resp.status_code(), StatusCode::CONFLICT);
+    assert!(resp.text().contains(&shared.to_string()));
+}
+
+/// A proof is spent by the rotation it authorised.
+#[tokio::test]
+async fn a_proof_authorises_exactly_one_rotation() {
+    let server = test_app().await;
+    let cred = Credential::new(b"one proof one rotation");
+    let (email, user_id) = register_with(&server, &cred).await;
+    let access = verified_jwt(user_id).await;
+
+    assert_eq!(
+        reauth(&server, &email, &access, &cred).await,
+        StatusCode::OK
+    );
+
+    let second = Credential::new(b"legitimate change");
+    bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(&email, &second, &[], "routine"))
+        .await
+        .assert_status_ok();
+
+    let third = Credential::new(b"unauthorised follow-up");
+    let resp = bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(&email, &third, &[], "routine"))
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+    assert!(try_srp_login(&server, &email, &second).await.is_some());
+}
+
+/// A retry after a dropped connection must not look like a failure.
+#[tokio::test]
+async fn repeating_the_same_rotation_reports_already_applied() {
+    let server = test_app().await;
+    let cred = Credential::new(b"retry me");
+    let (email, user_id) = register_with(&server, &cred).await;
+    let access = verified_jwt(user_id).await;
+
+    let next = Credential::new(b"retried password");
+    let body = rotate_body(&email, &next, &[], "routine");
+
+    assert_eq!(
+        reauth(&server, &email, &access, &cred).await,
+        StatusCode::OK
+    );
+    bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&body)
+        .await
+        .assert_status_ok();
+
+    // The same payload again, with a fresh proof — the client never learned the
+    // first one landed.
+    assert_eq!(
+        reauth(&server, &email, &access, &next).await,
+        StatusCode::OK
+    );
+    let resp = bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&body)
+        .await;
+    resp.assert_status_ok();
+    assert_eq!(
+        resp.json::<serde_json::Value>()["status"],
+        "already_applied"
+    );
+}
+
+/// Proving the current password at `/reauth` counts toward the same lockout
+/// `/srp/verify` uses.
+///
+/// ⚠️ The point of the test: a re-auth path with its own counter — or none —
+/// would hand anyone holding a session an unmetered password-guessing oracle,
+/// bypassing the bound login is under. D12 was this same mistake one layer up.
+#[tokio::test]
+async fn failed_reauth_counts_toward_the_login_lockout() {
+    let server = test_app().await;
+    let cred = Credential::new(b"lockout shared with login");
+    let (email, user_id) = register_with(&server, &cred).await;
+    let access = verified_jwt(user_id).await;
+
+    let wrong = Credential {
+        password: b"wrong every time".to_vec(),
+        srp_salt: cred.srp_salt,
+    };
+
+    let mut locked = false;
+    for _ in 0..6 {
+        if reauth(&server, &email, &access, &wrong).await == StatusCode::LOCKED {
+            locked = true;
+            break;
+        }
+    }
+    assert!(locked, "repeated wrong proofs must lock the account");
+
+    // And the lock is the login's lock, not a private one.
+    assert!(
+        try_srp_login(&server, &email, &cred).await.is_none(),
+        "the correct password must also be locked out, or the counters are separate"
+    );
+}
+
+/// Attempt to undo a rotation by proving `cred` — the password as it was
+/// *before* the change. Unauthenticated, because whoever needs this is by
+/// definition locked out.
+async fn undo(
+    server: &TestServer,
+    email: &str,
+    cred: &Credential,
+) -> (StatusCode, Option<serde_json::Value>) {
+    let ephemeral = generate_client_ephemeral().unwrap();
+    let init = server
+        .post("/api/v1/auth/master-key/undo/init")
+        .json(&serde_json::json!({
+            "email": email,
+            "client_public": hex::encode(&ephemeral.public_a),
+        }))
+        .await;
+    init.assert_status_ok();
+    let init = init.json::<serde_json::Value>();
+    let server_public = hex::decode(init["server_public"].as_str().unwrap()).unwrap();
+
+    let srp_password = derive_srp_password(&cred.password, &cred.srp_salt).unwrap();
+    let proof = compute_client_proof(
+        email,
+        srp_password,
+        &cred.srp_salt,
+        &server_public,
+        &ephemeral,
+    )
+    .unwrap();
+
+    let resp = server
+        .post("/api/v1/auth/master-key/undo/verify")
+        .json(&serde_json::json!({
+            "session_id": init["session_id"].as_str().unwrap(),
+            "client_proof": hex::encode(&proof.client_proof),
+        }))
+        .await;
+
+    let status = resp.status_code();
+    if status != StatusCode::OK {
+        return (status, None);
+    }
+    (status, Some(resp.json::<serde_json::Value>()))
+}
+
+/// The recovery path: prove the old password, get the account back.
+#[tokio::test]
+async fn a_rotation_can_be_undone_with_the_old_password() {
+    let server = test_app().await;
+    let original = Credential::new(b"the password i still know");
+    let (email, user_id) = register_with(&server, &original).await;
+    let access = verified_jwt(user_id).await;
+    let vault = create_vault(&server, &access).await;
+
+    assert_eq!(
+        reauth(&server, &email, &access, &original).await,
+        StatusCode::OK
+    );
+    let imposed = Credential::new(b"a password i did not choose");
+    bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(&email, &imposed, &[vault], "routine"))
+        .await
+        .assert_status_ok();
+
+    assert!(try_srp_login(&server, &email, &original).await.is_none());
+
+    let (status, body) = undo(&server, &email, &original).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body.unwrap();
+    assert_eq!(body["vaults_restored"], 1);
+    assert_eq!(body["vaults_not_in_snapshot"].as_array().unwrap().len(), 0);
+
+    assert!(
+        try_srp_login(&server, &email, &original).await.is_some(),
+        "the original password must work again"
+    );
+    assert!(
+        try_srp_login(&server, &email, &imposed).await.is_none(),
+        "the imposed password must stop working"
+    );
+}
+
+/// An undo is one-shot.
+#[tokio::test]
+async fn a_snapshot_can_only_be_restored_once() {
+    let server = test_app().await;
+    let original = Credential::new(b"restore me once");
+    let (email, user_id) = register_with(&server, &original).await;
+    let access = verified_jwt(user_id).await;
+
+    assert_eq!(
+        reauth(&server, &email, &access, &original).await,
+        StatusCode::OK
+    );
+    bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(
+            &email,
+            &Credential::new(b"tmp"),
+            &[],
+            "routine",
+        ))
+        .await
+        .assert_status_ok();
+
+    assert_eq!(undo(&server, &email, &original).await.0, StatusCode::OK);
+    // The snapshot is gone, so the second attempt answers like an address that
+    // never had one — a fabricated challenge that cannot verify.
+    assert_eq!(
+        undo(&server, &email, &original).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// ⚠️ The anti-chaining property, and the reason `store_snapshot` keeps the
+/// FIRST snapshot rather than the newest.
+///
+/// An attacker who has rotated the account knows the password they set, so
+/// nothing stops them rotating again. If the second rotation replaced the
+/// snapshot, the stored "previous" material would be the attacker's own garbage
+/// and the owner's real material would be gone — the undo would restore them
+/// into the same locked-out account.
+#[tokio::test]
+async fn chained_rotations_do_not_erase_the_owners_snapshot() {
+    let server = test_app().await;
+    let original = Credential::new(b"the only password the owner knows");
+    let (email, user_id) = register_with(&server, &original).await;
+    let access = verified_jwt(user_id).await;
+
+    assert_eq!(
+        reauth(&server, &email, &access, &original).await,
+        StatusCode::OK
+    );
+    let first = Credential::new(b"attacker step one");
+    bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(&email, &first, &[], "routine"))
+        .await
+        .assert_status_ok();
+
+    // The attacker knows `first`, so they can prove it and rotate again.
+    assert_eq!(
+        reauth(&server, &email, &access, &first).await,
+        StatusCode::OK
+    );
+    let second = Credential::new(b"attacker step two");
+    bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(&email, &second, &[], "routine"))
+        .await
+        .assert_status_ok();
+
+    // The owner still holds only the original password, and it still gets them home.
+    assert_eq!(undo(&server, &email, &original).await.0, StatusCode::OK);
+    assert!(try_srp_login(&server, &email, &original).await.is_some());
+    assert!(try_srp_login(&server, &email, &second).await.is_none());
+}
+
+/// `compromised` means what it says: no snapshot, so nobody holding the old
+/// password can put it back.
+#[tokio::test]
+async fn a_compromised_rotation_keeps_no_way_back() {
+    let server = test_app().await;
+    let leaked = Credential::new(b"this password is in someone elses hands");
+    let (email, user_id) = register_with(&server, &leaked).await;
+    let access = verified_jwt(user_id).await;
+
+    assert_eq!(
+        reauth(&server, &email, &access, &leaked).await,
+        StatusCode::OK
+    );
+    let resp = bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(
+            &email,
+            &Credential::new(b"safe now"),
+            &[],
+            "compromised",
+        ))
+        .await;
+    resp.assert_status_ok();
+    assert!(
+        resp.json::<serde_json::Value>()["undo_available_until"].is_null(),
+        "a compromised rotation must not offer an undo"
+    );
+
+    assert_eq!(
+        undo(&server, &email, &leaked).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// ⚠️ `/master-key/undo/init` is unauthenticated, so it must not say which
+/// addresses exist or which accounts have rotated recently.
+///
+/// `/auth/srp/init` goes to real trouble to fabricate a challenge for an unknown
+/// address; this endpoint has two ways to have nothing to offer — no account, and
+/// an account with no snapshot — and both must look like the third.
+#[tokio::test]
+async fn undo_init_says_nothing_about_who_exists() {
+    let server = test_app().await;
+
+    let cred = Credential::new(b"never rotated");
+    let (known_email, _) = register_with(&server, &cred).await;
+
+    let shapes: Vec<Vec<String>> = {
+        let mut out = Vec::new();
+        for email in [known_email.as_str(), "nobody-at-all@example.com"] {
+            let ephemeral = generate_client_ephemeral().unwrap();
+            let resp = server
+                .post("/api/v1/auth/master-key/undo/init")
+                .json(&serde_json::json!({
+                    "email": email,
+                    "client_public": hex::encode(&ephemeral.public_a),
+                }))
+                .await;
+            resp.assert_status_ok();
+            let body = resp.json::<serde_json::Value>();
+            let mut keys: Vec<String> = body
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| format!("{k}:{}", v.as_str().map(|s| s.len()).unwrap_or(0)))
+                .collect();
+            keys.sort();
+            out.push(keys);
+        }
+        out
+    };
+
+    assert_eq!(
+        shapes[0], shapes[1],
+        "a registered address with no snapshot and an unknown address must answer identically"
+    );
+}

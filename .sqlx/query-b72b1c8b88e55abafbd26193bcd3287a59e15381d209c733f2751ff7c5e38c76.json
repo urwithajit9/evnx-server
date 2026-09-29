@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE master_key_rotations\n           SET consumed_at = NOW(), outcome = $2\n         WHERE id = $1\n           AND consumed_at IS NULL\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b72b1c8b88e55abafbd26193bcd3287a59e15381d209c733f2751ff7c5e38c76"
+}

@@ -36,6 +36,14 @@ pub struct Config {
     /// release. See `services::quota`.
     pub quotas: crate::services::quota::Quotas,
 
+    /// How long a master-key rotation can be undone, in hours.
+    ///
+    /// ⚠️ A security window, so an unparseable value fails startup rather than
+    /// defaulting — the same reasoning as `quotas`. `0` disables the undo
+    /// entirely: no snapshot is stored and a locked-out account has no route
+    /// back. That is a deliberate choice a deployment may make, not a default.
+    pub master_key_undo_window_hours: i64,
+
     // Email (Resend)
     pub resend_api_key: String,
     pub email_from: String,
@@ -316,6 +324,17 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty()),
             max_request_size_kb: optional!("MAX_REQUEST_SIZE_KB", "64").parse().unwrap_or(64),
+            master_key_undo_window_hours: {
+                let raw = optional!("MASTER_KEY_UNDO_WINDOW_HOURS", "72");
+                match raw.trim().parse::<i64>() {
+                    Ok(h) if (0..=8760).contains(&h) => h,
+                    _ => {
+                        return Err(ConfigError::Invalid(format!(
+                            "MASTER_KEY_UNDO_WINDOW_HOURS: expected whole hours from 0 to 8760, got {raw:?}"
+                        )))
+                    }
+                }
+            },
             quotas,
         })
     }

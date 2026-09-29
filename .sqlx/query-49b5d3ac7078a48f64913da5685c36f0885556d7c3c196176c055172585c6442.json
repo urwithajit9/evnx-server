@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE users\n           SET srp_salt = $2, srp_verifier = $3, argon2_salt = $4,\n               encrypted_private_key = $5\n         WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "49b5d3ac7078a48f64913da5685c36f0885556d7c3c196176c055172585c6442"
+}

@@ -167,6 +167,91 @@ impl EmailService {
             .await
     }
 
+    /// The master password was changed.
+    ///
+    /// ⚠️ Sent unconditionally, and it is the only thing that reaches a person
+    /// whose account has just been taken. The rotation itself needs a proof of
+    /// the old password, so a session thief cannot do this — but someone who
+    /// phished the password can, and this mail plus the undo window is their
+    /// whole defence. It therefore leads with "was this you", not with a receipt.
+    pub async fn send_master_key_rotated(
+        &self,
+        to: &str,
+        when: chrono::DateTime<chrono::Utc>,
+        undo_until: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), EmailError> {
+        let undo = match undo_until {
+            Some(deadline) => format!(
+                r#"<p style="margin-top:20px;padding:14px;border:1px solid #30363d;border-radius:8px">
+                     <strong>If this was not you</strong>, you can put it back until
+                     <strong>{deadline}</strong> by running
+                     <code>evnx auth undo-password-change</code> and entering your
+                     <em>old</em> master password. After that the window closes and
+                     there is no way back.
+                   </p>"#,
+                deadline = deadline.format("%d %b %Y at %H:%M UTC"),
+            ),
+            None => r#"<p style="margin-top:20px;padding:14px;border:1px solid #30363d;border-radius:8px">
+                         <strong>This change cannot be undone.</strong> It was made
+                         without an undo window, so if it was not you, the account
+                         cannot be recovered — evnx never holds your password or
+                         anything derived from it.
+                       </p>"#.to_string(),
+        };
+
+        let html = format!(
+            r#"
+            <div style="font-family:ui-monospace,monospace;max-width:560px;margin:40px auto;padding:32px;background:#0d1117;color:#E6EDF3;border-radius:12px;border:1px solid #30363d">
+              <h2 style="color:#E8652A;margin-top:0">Your evnx master password was changed</h2>
+              <p>The change was made on <strong>{when}</strong>, and every other
+                 signed-in device has been signed out.</p>
+              {undo}
+              <p style="margin-top:24px;color:#8B949E;font-size:12px">
+                Any CI pipeline holding your master password as a secret will fail
+                until that secret is updated. API tokens themselves keep working —
+                they authenticate, they do not decrypt.
+              </p>
+            </div>
+        "#,
+            when = when.format("%d %b %Y at %H:%M UTC"),
+        );
+
+        self.send(to, "Your evnx master password was changed", &html, None)
+            .await
+    }
+
+    /// A master-password change was undone.
+    pub async fn send_master_key_restored(
+        &self,
+        to: &str,
+        when: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), EmailError> {
+        let html = format!(
+            r#"
+            <div style="font-family:ui-monospace,monospace;max-width:560px;margin:40px auto;padding:32px;background:#0d1117;color:#E6EDF3;border-radius:12px;border:1px solid #30363d">
+              <h2 style="color:#E8652A;margin-top:0">A password change on your evnx account was undone</h2>
+              <p>On <strong>{when}</strong> your previous master password was restored.
+                 Sign in with it as usual.</p>
+              <p style="color:#8B949E">Every session has been signed out, including any
+                 held by whoever made the change.</p>
+              <p style="margin-top:24px;color:#8B949E;font-size:12px">
+                If you did not do this, someone knows your previous master password.
+                Change it now, and choose <em>compromised</em> when asked why.
+              </p>
+            </div>
+        "#,
+            when = when.format("%d %b %Y at %H:%M UTC"),
+        );
+
+        self.send(
+            to,
+            "A password change on your evnx account was undone",
+            &html,
+            None,
+        )
+        .await
+    }
+
     /// `dev_link` is surfaced by the log transport so a local developer can click
     /// through. It is never logged by the Resend transport.
     async fn send(

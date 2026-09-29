@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT email, totp_enabled, srp_salt, srp_verifier, argon2_salt,\n               encrypted_private_key\n          FROM users\n         WHERE id = $1\n           FOR UPDATE\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "email",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "totp_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 2,
+        "name": "srp_salt",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "srp_verifier",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "argon2_salt",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "encrypted_private_key",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "16fb7010e0550405b4de728c430ce5a14e743b58313d27634f519a330cbcbd44"
+}

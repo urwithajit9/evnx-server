@@ -184,11 +184,11 @@ pub struct SrpInitResponse {
 /// Five rather than TOTP's three: a TOTP code is read off a screen and retyped,
 /// where a master password is typed from memory and may be long. Three is
 /// unforgiving for the credential people get wrong most often.
-const SRP_MAX_FAILURES: u64 = 5;
+pub(crate) const SRP_MAX_FAILURES: u64 = 5;
 
 /// How long an SRP lockout lasts, and the window failures are counted over.
 /// Matches `totp_lockout` so the two behave the same way.
-const SRP_LOCKOUT_SECONDS: u64 = 900;
+pub(crate) const SRP_LOCKOUT_SECONDS: u64 = 900;
 
 /// SRP Step 1 — exchange ephemeral public keys.
 ///
@@ -287,7 +287,7 @@ struct SrpSessionState {
 /// Both the rate limit and the lockout go through here so they cannot drift apart
 /// again, and so they describe the same subject the database does: `users` stores the
 /// trimmed, lowercased form.
-fn email_subject(email: &str) -> String {
+pub(crate) fn email_subject(email: &str) -> String {
     blake3::hash(email.trim().to_lowercase().as_bytes())
         .to_hex()
         .to_string()
@@ -710,12 +710,12 @@ fn generate_secure_token() -> String {
 }
 
 /// Hash a token for storage. We store hashes, not raw tokens.
-fn hash_token(token: &str) -> String {
+pub(crate) fn hash_token(token: &str) -> String {
     blake3::hash(token.as_bytes()).to_hex().to_string()
 }
 
 /// Generate a fake SRP verifier (same length as real) for unknown emails.
-fn fake_srp_verifier() -> String {
+pub(crate) fn fake_srp_verifier() -> String {
     use rand::RngCore;
     let mut bytes = vec![0u8; 256];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
@@ -723,7 +723,7 @@ fn fake_srp_verifier() -> String {
 }
 
 /// Generate a fake base64 salt for unknown emails.
-fn fake_salt() -> String {
+pub(crate) fn fake_salt() -> String {
     use base64ct::{Base64, Encoding};
     use rand::RngCore;
     let mut bytes = [0u8; 32];
@@ -1205,7 +1205,7 @@ pub async fn totp_regenerate_backup_codes(
 
 /// Validate a 6-digit TOTP code against a base32 secret.
 /// Accepts ±1 step (30s window) to handle clock drift.
-fn verify_totp_code(secret_base32: &str, code: &str) -> Result<(), AppError> {
+pub(crate) fn verify_totp_code(secret_base32: &str, code: &str) -> Result<(), AppError> {
     let secret_bytes = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, secret_base32)
         .ok_or_else(|| AppError::Internal("Invalid stored TOTP secret".into()))?;
 

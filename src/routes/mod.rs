@@ -10,6 +10,7 @@ use axum::{
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 pub mod auth;
+pub mod master_key;
 pub mod members;
 pub mod rekey;
 pub mod sessions;
@@ -107,7 +108,17 @@ pub fn create_router(state: AppState) -> Router {
         // Unauthenticated by necessity: the caller cannot log in until verified.
         // Safe because it always answers 202 and is rate-limited per address, so
         // it reveals nothing about which emails are registered.
-        .route("/resend-verification", post(auth::resend_verification));
+        .route("/resend-verification", post(auth::resend_verification))
+        // ── Undoing a master-password change ────────────────────────────────
+        //
+        // ⚠️ Unauthenticated **by necessity**, not by oversight. The person who
+        // needs this is the person a rotation has locked out, so a session is
+        // exactly what they do not have. The only credential it accepts is the
+        // one an attacker lacks: the *old* password, proven by SRP against the
+        // snapshot's verifier. It answers identically for an address with no
+        // snapshot and one that does not exist — see `routes::master_key`.
+        .route("/master-key/undo/init", post(master_key::undo_init))
+        .route("/master-key/undo/verify", post(master_key::undo_verify));
 
     // Account management — a real user session only. An `evnx_tok_` CI token that
     // could reach these would be able to enrol its own authenticator on the
@@ -127,6 +138,20 @@ pub fn create_router(state: AppState) -> Router {
         // the account that issued it. A leaked CI token is exactly the credential
         // that must not be able to erase the account it belongs to.
         .route("/account", delete(auth::delete_account))
+        // ── Changing the master password ────────────────────────────────────
+        //
+        // Behind `require_user_session` like the rest of account management, and
+        // then behind a *second* gate the others do not have: `/master-key`
+        // refuses unless `/reauth/verify` has proven the current password within
+        // the last five minutes.
+        //
+        // ⚠️ A recency check on the JWT's `iat` was considered and rejected —
+        // `/auth/refresh` restamps it, so it measures something the attacker
+        // controls. The reasoning is written out in full at the top of
+        // `routes::master_key`.
+        .route("/reauth/init", post(master_key::reauth_init))
+        .route("/reauth/verify", post(master_key::reauth_verify))
+        .route("/master-key", post(master_key::rotate_master_key))
         // CI/CD API tokens. Minting a token is a privilege-granting act, so it
         // requires a real login — a token must not be able to mint another.
         .route(

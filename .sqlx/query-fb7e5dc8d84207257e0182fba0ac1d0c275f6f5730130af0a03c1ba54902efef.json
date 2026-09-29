@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE refresh_tokens\n           SET revoked_at = NOW()\n         WHERE user_id = $1\n           AND revoked_at IS NULL\n           AND ($2::uuid IS NULL OR session_id <> $2)\n        RETURNING session_id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "session_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fb7e5dc8d84207257e0182fba0ac1d0c275f6f5730130af0a03c1ba54902efef"
+}
