@@ -63,15 +63,30 @@ where
     }))
 }
 
-/// Every vault key this account holds **wrapped under its own master key**, locked.
+/// Every **live** vault key this account holds **wrapped under its own master
+/// key**, locked.
 ///
-/// ⚠️ `eph_pub_key IS NULL` is the whole filter, and it is the difference between
+/// ⚠️ `eph_pub_key IS NULL` is one of two filters, and it is the difference between
 /// the two wrap modes. A row with `eph_pub_key` set is a vault key shared *to*
 /// this account, wrapped to its X25519 + ML-KEM keypair — and rotation does not
 /// change that keypair, it re-seals the seed it is derived from. Those rows are
 /// untouched by a rotation and must stay that way: writing a master-key wrap into
 /// one would produce half a hybrid wrap, which migration 004's
 /// `vault_members_wrap_is_whole` CHECK refuses anyway.
+///
+/// ⚠️ **`deleted_at IS NULL` is the second filter, and leaving it out made
+/// rotation impossible for anyone who had ever deleted a vault.** `soft_delete`
+/// clears nothing in `vault_members`, so the row survives with its wrap — while
+/// `vaults::list_for_user`, which is all a client can see, filters deleted vaults
+/// out. Without this join the swap demanded a wrap for a vault the caller could
+/// not list, name, or fetch a key for, and the refusal named a UUID that `evnx
+/// vault list` does not print. A dead end, reachable by anyone who has tidied up.
+///
+/// The consequence of skipping them is worth stating: a vault deleted before a
+/// rotation keeps its wrap under the **superseded** master key. Nothing can open
+/// it afterwards. There is no un-delete in the API, so this costs nothing today —
+/// but any future restore path must treat a vault deleted across a rotation as
+/// unrecoverable rather than quietly restoring a row that will not open.
 pub async fn own_wraps_for_update<'e, E>(
     executor: E,
     user_id: Uuid,
@@ -81,12 +96,14 @@ where
 {
     let rows = sqlx::query!(
         r#"
-        SELECT vault_id, encrypted_vault_key
-          FROM vault_members
-         WHERE user_id = $1
-           AND eph_pub_key IS NULL
-         ORDER BY vault_id
-           FOR UPDATE
+        SELECT m.vault_id, m.encrypted_vault_key
+          FROM vault_members m
+          JOIN vaults v ON v.id = m.vault_id
+         WHERE m.user_id = $1
+           AND m.eph_pub_key IS NULL
+           AND v.deleted_at IS NULL
+         ORDER BY m.vault_id
+           FOR UPDATE OF m
         "#,
         user_id
     )

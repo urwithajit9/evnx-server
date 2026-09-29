@@ -4449,3 +4449,41 @@ async fn undo_init_says_nothing_about_who_exists() {
         "a registered address with no snapshot and an unknown address must answer identically"
     );
 }
+
+/// ⚠️ A deleted vault must not be able to block a rotation forever.
+///
+/// `soft_delete` clears nothing in `vault_members`, so the row survives with its
+/// wrap — while `list_for_user`, which is all a client can see, filters deleted
+/// vaults out. Before the join in `own_wraps_for_update`, the swap demanded a
+/// wrap for a vault the caller could not list, name, or fetch a key for, and the
+/// refusal named a UUID `evnx vault list` does not print. Anyone who had ever
+/// tidied up was simply unable to change their master password.
+#[tokio::test]
+async fn a_deleted_vault_does_not_block_a_rotation() {
+    let server = test_app().await;
+    let cred = Credential::new(b"deleted a vault once");
+    let (email, user_id) = register_with(&server, &cred).await;
+    let access = verified_jwt(user_id).await;
+
+    let live = create_vault(&server, &access).await;
+    let gone = create_vault(&server, &access).await;
+    bearer(server.delete(&format!("/api/v1/vaults/{gone}")), &access)
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    assert_eq!(
+        reauth(&server, &email, &access, &cred).await,
+        StatusCode::OK
+    );
+
+    // Exactly the vaults the client can see — which is the only set it could
+    // possibly build.
+    let next = Credential::new(b"rotated past the deletion");
+    let resp = bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(&email, &next, &[live], "routine"))
+        .await;
+
+    resp.assert_status_ok();
+    assert_eq!(resp.json::<serde_json::Value>()["vaults_rewrapped"], 1);
+    assert!(try_srp_login(&server, &email, &next).await.is_some());
+}
