@@ -51,6 +51,9 @@ pub async fn push_version(
         vault_id, user_id, ..
     } = access;
 
+    // Before the blob is uploaded, so a refusal leaves no orphan in storage.
+    crate::services::quota::check_version_limit(&state.db, &state.config.quotas, vault_id).await?;
+
     // 2. Optimistic locking: check base_version matches current latest
     let current_version = versions::get_latest_version_num(&state.db, vault_id).await?;
     let current_num = current_version.unwrap_or(0);

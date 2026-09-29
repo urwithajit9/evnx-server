@@ -37,6 +37,8 @@ pub async fn create_token(
 ) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), AppError> {
     let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
 
+    crate::services::quota::check_token_limit(&state.db, &state.config.quotas, user_id).await?;
+
     let valid_scopes = ["read", "read_write"];
     if !valid_scopes.contains(&req.scope.as_str()) {
         return Err(AppError::Validation(

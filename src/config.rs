@@ -30,6 +30,12 @@ pub struct Config {
     /// This is what the CORS layer uses; `frontend_url` is kept as the raw value.
     pub frontend_origins: Vec<String>,
 
+    /// Per-plan limits, from `QUOTA_<PLAN>_<WHAT>` with documented defaults.
+    ///
+    /// Configuration rather than constants so a tier's numbers change without a
+    /// release. See `services::quota`.
+    pub quotas: crate::services::quota::Quotas,
+
     // Email (Resend)
     pub resend_api_key: String,
     pub email_from: String,
@@ -204,6 +210,52 @@ impl Config {
 
         let port: u16 = optional!("SERVER_PORT", "8080").parse().unwrap_or(8080);
 
+        // ── Plan limits ───────────────────────────────────────────────────────
+        //
+        // ⚠️ A bad value fails startup rather than defaulting, matching how every
+        // other required setting behaves here. A mistyped `QUOTA_FREE_VAULTS=tree`
+        // that silently became "unlimited" would hand the product away on the free
+        // tier, and nothing outside the process would show it.
+        let quotas = {
+            use crate::services::quota::{parse_limit, PlanLimits, Quotas};
+            let d = Quotas::default();
+
+            // `QUOTA_<PLAN>_<WHAT>`, falling back to that plan's default.
+            macro_rules! limit {
+                ($plan:expr, $what:expr, $default:expr) => {{
+                    let key = concat!("QUOTA_", $plan, "_", $what);
+                    match env::var(key) {
+                        Ok(raw) if !raw.trim().is_empty() => match parse_limit(&raw) {
+                            Ok(v) => v,
+                            Err(why) => return Err(ConfigError::Invalid(format!("{key}: {why}"))),
+                        },
+                        _ => $default,
+                    }
+                }};
+            }
+
+            macro_rules! plan_limits {
+                ($plan:expr, $defaults:expr) => {
+                    PlanLimits {
+                        vaults: limit!($plan, "VAULTS", $defaults.vaults),
+                        versions_per_vault: limit!($plan, "VERSIONS", $defaults.versions_per_vault),
+                        api_tokens: limit!($plan, "TOKENS", $defaults.api_tokens),
+                        audit_retention_days: limit!(
+                            $plan,
+                            "AUDIT_DAYS",
+                            $defaults.audit_retention_days
+                        ),
+                    }
+                };
+            }
+
+            Quotas {
+                free: plan_limits!("FREE", d.free),
+                team: plan_limits!("TEAM", d.team),
+                enterprise: plan_limits!("ENTERPRISE", d.enterprise),
+            }
+        };
+
         // Default to the log transport only in development, where there is no
         // real mailbox. Anywhere else, mail must actually be sent.
         let email_transport = match env::var("EMAIL_TRANSPORT").ok().as_deref() {
@@ -264,6 +316,7 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty()),
             max_request_size_kb: optional!("MAX_REQUEST_SIZE_KB", "64").parse().unwrap_or(64),
+            quotas,
         })
     }
 

@@ -78,6 +78,9 @@ pub async fn create_vault(
 
     let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
 
+    // Before any work, so a refusal costs nothing and leaves nothing behind.
+    crate::services::quota::check_vault_limit(&state.db, &state.config.quotas, user_id).await?;
+
     // Valid environment values
     let valid_envs = ["production", "staging", "development", "test"];
     if !valid_envs.contains(&req.environment.as_str()) {
@@ -261,6 +264,38 @@ pub async fn vault_audit(
 
     let events = crate::services::audit::list_for_vault(&state.db, access.vault_id, LIMIT).await?;
 
+    // ── Plan retention ────────────────────────────────────────────────────────
+    //
+    // ⚠️ **Retention here means what you can SEE, not what is kept.** `audit_events`
+    // is append-only by trigger since migration 006 — `audit_events_no_delete` raises
+    // an exception — so nothing prunes it and nothing can. The row survives; the plan
+    // decides how far back the API will show it.
+    //
+    // That distinction matters and should not be blurred in any copy describing this:
+    // "7-day audit retention" is a visibility limit, and claiming it as deletion would
+    // be a data-handling statement that is not true.
+    //
+    // ⚠️ Filtered here rather than in SQL deliberately. `list_for_vault` uses
+    // `query_as!`, which is checked at compile time against the `.sqlx` cache — adding
+    // a bound would need that cache regenerated against a live database, and a stale
+    // cache breaks CI rather than this file. The rows are already ordered newest
+    // first and capped at 200, so filtering at the boundary costs nothing.
+    let owner_plan = crate::services::quota::plan_for(&state.db, access.user_id).await?;
+    let retention_days = state
+        .config
+        .quotas
+        .for_plan(owner_plan)
+        .audit_retention_days;
+
+    let cutoff =
+        retention_days.map(|days| chrono::Utc::now() - chrono::Duration::days(i64::from(days)));
+    let total_before_retention = events.len();
+    let events: Vec<_> = events
+        .into_iter()
+        .filter(|e| cutoff.is_none_or(|c| e.created_at >= c))
+        .collect();
+    let hidden = total_before_retention - events.len();
+
     Ok(Json(serde_json::json!({
         "events": events
             .into_iter()
@@ -275,5 +310,10 @@ pub async fn vault_audit(
             }))
             .collect::<Vec<_>>(),
         "limit": LIMIT,
+        // Told rather than left to be inferred. A trail that silently stops is
+        // indistinguishable from a vault with no older activity, and the difference
+        // is exactly what someone investigating an incident needs to know.
+        "retention_days": retention_days,
+        "hidden_by_retention": hidden,
     })))
 }

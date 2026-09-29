@@ -37,6 +37,20 @@ pub enum AppError {
     #[error("Insufficient permissions")]
     Forbidden,
 
+    /// A plan limit was reached.
+    ///
+    /// ⚠️ **Answers with code `FORBIDDEN`, not a new code, and that is on purpose.**
+    /// Every shipped client maps error codes it knows and falls back to the *status*
+    /// for the rest — and neither the CLI nor the app has a 403 arm in that fallback,
+    /// so a `QUOTA_EXCEEDED` code would surface as "unexpected response: HTTP 403"
+    /// and the message explaining the limit would be thrown away.
+    ///
+    /// Reusing `FORBIDDEN` means `ApiError::Forbidden { message }` renders the text
+    /// verbatim in every version already installed. A distinct code can be added once
+    /// clients understand it, not before.
+    #[error("{0}")]
+    QuotaExceeded(String),
+
     // ─── Resource errors ───────────────────────────────────────────────────────
     #[error("Resource not found")]
     NotFound,
@@ -94,6 +108,7 @@ impl IntoResponse for AppError {
                 "LOCKED",
                 "Account temporarily locked".to_string(),
             ),
+            AppError::QuotaExceeded(ref msg) => (StatusCode::FORBIDDEN, "FORBIDDEN", msg.clone()),
             AppError::Forbidden => (
                 StatusCode::FORBIDDEN,
                 "FORBIDDEN",
