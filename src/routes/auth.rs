@@ -199,10 +199,7 @@ pub async fn srp_init(
     Json(req): Json<SrpInitRequest>,
 ) -> Result<Json<SrpInitResponse>, AppError> {
     // Rate limiting (unchanged)
-    let rate_key = format!(
-        "rate:srp_init:{}",
-        blake3::hash(req.email.as_bytes()).to_hex()
-    );
+    let rate_key = format!("rate:srp_init:{}", email_subject(&req.email));
     let allowed = state.cache.check_rate_limit(&rate_key, 5, 900).await?;
     if !allowed {
         return Err(AppError::RateLimited {
@@ -279,6 +276,23 @@ struct SrpSessionState {
     is_real_user: bool,           // Track if this is a real user (for constant-time logic)
 }
 
+/// The Valkey key subject for an email address.
+///
+/// ⚠️ **Normalises before hashing, and that is the whole point.** `srp_init`'s rate
+/// limit used to hash `req.email` as sent, while the address was lowercased only
+/// afterwards — so `Ajit@Example.com` and `ajit@example.com` landed in *different*
+/// buckets and each got its own 5-per-900s budget. Case permutations of one address
+/// therefore multiplied the limit arbitrarily.
+///
+/// Both the rate limit and the lockout go through here so they cannot drift apart
+/// again, and so they describe the same subject the database does: `users` stores the
+/// trimmed, lowercased form.
+fn email_subject(email: &str) -> String {
+    blake3::hash(email.trim().to_lowercase().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
 // ─── SRP Verify Handler ────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -350,25 +364,45 @@ pub async fn srp_verify(
     // and not a prohibitive one against a weak password.
     //
     // So the bound is a failure counter, exactly as `totp_verify_login` does it.
-    // Keyed by user rather than by session, or an attacker would simply fetch a
-    // fresh session — and `srp_init`'s own limit is per *email*, which is the
-    // same subject, so the two compose.
-    let lockout_key = srp_state.user_id.map(|id| format!("srp_lockout:{id}"));
+    // Keyed by subject rather than by session, or an attacker would simply fetch a
+    // fresh session.
+    //
+    // ⚠️ **Keyed on the EMAIL, not the user id, and that is a fix rather than a
+    // detail.** It was `srp_state.user_id`, which is `None` for the fabricated
+    // session an unknown address receives — so an unknown address was never counted
+    // and never locked. After enough failures a registered address answered `423`
+    // while an unregistered one kept answering `401`, and that difference is an
+    // oracle for which addresses exist.
+    //
+    // `/srp/init` goes to real trouble to prevent exactly that: it invents a salt and
+    // a verifier for an unknown address so the response is indistinguishable from a
+    // real account's. The lockout undid it one status code at a time.
+    //
+    // Reachable, which is what made it worth fixing: a failed `/srp/verify`
+    // deliberately leaves the session alive, so a single `/srp/init` funds as many
+    // attempts as fit in the session's 300-second life.
+    //
+    // The email is the subject `/srp/init` already rate-limits on, so the two compose
+    // and a fabricated session is counted exactly like a real one.
+    let lockout_key = format!("srp_lockout:{}", email_subject(&srp_state.email));
 
-    if let Some(key) = &lockout_key {
-        let failures: u64 = state.cache.get_json::<u64>(key).await?.unwrap_or(0);
-        if failures >= SRP_MAX_FAILURES {
-            return Err(AppError::AccountLocked);
-        }
+    let failures: u64 = state
+        .cache
+        .get_json::<u64>(&lockout_key)
+        .await?
+        .unwrap_or(0);
+    if failures >= SRP_MAX_FAILURES {
+        return Err(AppError::AccountLocked);
     }
 
     if let Err(e) = server_verifier.verify_client(&client_proof_bytes) {
         let _ = e;
         // Count the failure before answering, so a client that gives up mid-flight
         // has still been counted.
-        if let Some(key) = &lockout_key {
-            state.cache.incr_with_ttl(key, SRP_LOCKOUT_SECONDS).await?;
-        }
+        state
+            .cache
+            .incr_with_ttl(&lockout_key, SRP_LOCKOUT_SECONDS)
+            .await?;
         tracing::warn!(user_id = ?srp_state.user_id, "SRP verification failed");
         return Err(AppError::Unauthorized);
     }
@@ -387,9 +421,7 @@ pub async fn srp_verify(
     // A correct password clears the counter, so a user who mistypes twice and
     // then succeeds starts clean rather than carrying failures toward a lockout
     // they never earned.
-    if let Some(key) = &lockout_key {
-        state.cache.del(key).await?;
-    }
+    state.cache.del(&lockout_key).await?;
 
     // Must have real user at this point
     let user_id = srp_state.user_id.ok_or(AppError::Unauthorized)?;
@@ -1421,4 +1453,47 @@ pub async fn delete_account(
 
     tracing::info!(blobs = doomed_blobs.len(), "account deleted");
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::email_subject;
+
+    /// ⚠️ The bypass this fixes: the rate-limit key was derived from the address as
+    /// sent, so case permutations of one address each got their own 5-per-900s
+    /// budget. `AJIT@x.com`, `Ajit@X.com` and `ajit@x.com` are one subject.
+    #[test]
+    fn one_address_is_one_subject_however_it_is_typed() {
+        let canonical = email_subject("ajit@example.com");
+        for variant in [
+            "AJIT@EXAMPLE.COM",
+            "Ajit@Example.Com",
+            "  ajit@example.com  ",
+            "ajit@example.com\n",
+        ] {
+            assert_eq!(
+                email_subject(variant),
+                canonical,
+                "{variant:?} should hash to the same subject"
+            );
+        }
+    }
+
+    #[test]
+    fn different_addresses_are_different_subjects() {
+        assert_ne!(
+            email_subject("ajit@example.com"),
+            email_subject("ajit@example.org")
+        );
+    }
+
+    /// The value is a digest, never the address itself — `audit_events` and the
+    /// cache must not hold a readable email.
+    #[test]
+    fn the_subject_never_contains_the_address() {
+        let s = email_subject("ajit@example.com");
+        assert!(!s.contains("ajit"), "{s}");
+        assert!(!s.contains('@'), "{s}");
+        assert_eq!(s.len(), 64, "blake3 hex is 64 chars: {s}");
+    }
 }

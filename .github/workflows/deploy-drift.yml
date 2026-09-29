@@ -1,0 +1,170 @@
+# .github/workflows/deploy-drift.yml
+#
+# Is what is running on api.evnx.dev the same thing as `main`?
+#
+# ⚠️ Why this exists. Production once ran nine commits behind for ten days, which
+# meant `POST /vaults/:id/rekey` returned 404 while `evnx vault revoke` had shipped
+# in every CLI release since v0.5.0 — so Phase 3's headline feature, revocation that
+# actually revokes, was broken for every user. Nobody noticed. It was found by
+# probing the API by hand.
+#
+# ⚠️ Uptime monitoring would not have caught it, and still would not: the server
+# answered every request correctly throughout. It was serving old code, not failing.
+# "Is it up" and "is it current" are different questions and only one of them was
+# being asked.
+#
+# ⚠️ Nor would an external monitor with a keyword check, which can only assert one
+# fixed expected value — somebody has to update it on every release, and forgetting
+# to act after a merge is precisely what caused the original drift. This runs inside
+# the repository so it can see both sides: what is deployed, and what `main` is.
+
+name: Deploy drift
+
+on:
+  schedule:
+    # 09:00 UTC daily. Drift is measured in days, so hourly would add noise without
+    # shortening the window that matters.
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  HEALTH_URL: https://api.evnx.dev/health
+  # How long `main` may sit ahead of production before this is a problem.
+  #
+  # Not zero: a merge is not a deploy, and deploying is a deliberate act because
+  # migrations run at container startup. Two days is comfortably inside the ten that
+  # went unnoticed and comfortably outside a normal merge-then-deploy gap.
+  GRACE_DAYS: "2"
+
+jobs:
+  drift:
+    name: Compare /health build against main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the deployed commit may be many commits back, and
+          # `rev-list --count` has to reach it.
+          fetch-depth: 0
+
+      - name: Ask production what it is running
+        id: deployed
+        run: |
+          # pipefail, for the same reason the release workflow needed it: without
+          # it the exit status of `curl | jq` is jq's, so an unreachable host would
+          # produce an empty value and a green step.
+          set -o pipefail
+
+          if ! body=$(curl -fsS --max-time 20 "$HEALTH_URL"); then
+            echo "unreachable=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "unreachable=false" >> "$GITHUB_OUTPUT"
+
+          sha=$(printf '%s' "$body" | jq -r '.build // empty')
+          if [ -z "$sha" ] || [ "$sha" = "null" ]; then
+            echo "::error::$HEALTH_URL answered, but carried no build field: $body"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Deployed build: $sha"
+
+      # ⚠️ Deliberately NOT a failure of this job.
+      #
+      # An unreachable API is an outage, which is the uptime monitor's job and is
+      # already alerting. Failing here too would mean one incident producing two
+      # alerts from two systems, and would train someone to ignore this one.
+      - name: Production is unreachable — not a drift result
+        if: steps.deployed.outputs.unreachable == 'true'
+        run: |
+          echo "::warning::Could not reach $HEALTH_URL, so drift could not be checked."
+          {
+            echo "### Deploy drift — not checked"
+            echo
+            echo "\`$HEALTH_URL\` was unreachable, so this run says nothing about drift."
+            echo "That is an availability question and belongs to uptime monitoring."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compare against main
+        if: steps.deployed.outputs.unreachable == 'false'
+        run: |
+          set -o pipefail
+          deployed="${{ steps.deployed.outputs.sha }}"
+          head_sha=$(git rev-parse HEAD)
+
+          summary() { echo "$1" >> "$GITHUB_STEP_SUMMARY"; }
+
+          # `build` is a short SHA, so match by prefix rather than assuming a length.
+          case "$head_sha" in
+            "$deployed"*)
+              echo "In sync: production is running $deployed, which is the head of main."
+              summary "### ✅ Deploy drift — none"
+              summary ""
+              summary "Production is running \`$deployed\`, which is the head of \`main\`."
+              exit 0
+              ;;
+          esac
+
+          # ⚠️ A SHA that is not in this repository is not drift, and saying it is
+          # would be a false alarm. It means production is running something built
+          # from a branch, a fork, or an image that no longer corresponds to history.
+          # That is worth knowing and is a different problem.
+          if ! git cat-file -e "${deployed}^{commit}" 2>/dev/null; then
+            echo "::error::Production reports build $deployed, which is not a commit in this repository."
+            summary "### ⚠️ Deploy drift — unknown build"
+            summary ""
+            summary "Production reports \`$deployed\`, which is **not a commit on this repository**."
+            summary "It may have been built from a branch or a fork."
+            exit 1
+          fi
+
+          behind=$(git rev-list --count "${deployed}..HEAD")
+
+          # ⚠️ How long has `main` been AHEAD — not how old the deployed commit is.
+          #
+          # Those differ, and using the wrong one produces false alarms. Deploying a
+          # commit that was merged three weeks ago is perfectly current until someone
+          # merges something newer; measuring the deployed commit's own age would call
+          # that three weeks of drift the moment the next commit lands.
+          #
+          # The oldest undeployed commit is the one that has been waiting longest, so
+          # its age is the length of the drift.
+          oldest_undeployed=$(git log --format=%cI --reverse "${deployed}..HEAD" | head -1)
+          age_days=$(( ( $(date -u +%s) - $(date -u -d "$oldest_undeployed" +%s) ) / 86400 ))
+
+          echo "Deployed $deployed is $behind commit(s) behind main; the oldest undeployed commit is $age_days day(s) old."
+
+          if [ "$age_days" -le "${GRACE_DAYS}" ]; then
+            echo "Within the ${GRACE_DAYS}-day grace period — not reporting."
+            summary "### ✅ Deploy drift — within grace"
+            summary ""
+            summary "Production is \`$deployed\`, **$behind commit(s)** behind \`main\`; the oldest undeployed commit is $age_days day(s) old."
+            summary "That is inside the ${GRACE_DAYS}-day grace period."
+            exit 0
+          fi
+
+          {
+            echo "### 🔴 Deploy drift"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Deployed | \`$deployed\` |"
+            echo "| Head of \`main\` | \`$(git rev-parse --short HEAD)\` |"
+            echo "| Commits behind | **$behind** |"
+            echo "| Oldest undeployed commit | **$age_days day(s)** old |"
+            echo
+            echo "**Undeployed commits:**"
+            echo
+            echo '```'
+            git log --oneline "${deployed}..HEAD" | head -20
+            echo '```'
+            echo
+            echo "Deploy with \`docs/DEPLOYMENT.md\` §9, then confirm \`/health\`'s \`build\` field changes —"
+            echo "that field is what would have caught the two believed-done deploys before it existed."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::error::api.evnx.dev is $behind commit(s) behind main; the oldest undeployed commit has been waiting $age_days days."
+          exit 1
