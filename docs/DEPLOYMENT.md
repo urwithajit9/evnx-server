@@ -367,6 +367,78 @@ nothing writes mid-restore, and starts it again afterwards.
 
 ---
 
+## 8b. Monitoring — three services, three different jobs
+
+⚠️ They are **not alternatives**. Each catches a failure the others structurally
+cannot, and the evnx outages so far have been one of each.
+
+| | Watches | Catches | Cannot catch |
+|---|---|---|---|
+| **UptimeRobot** | `GET /health/ready` | the API being down or degraded | a backup that never ran |
+| **BetterStack** | `GET /health/ready` | the same, with incident handling and a status page | the same |
+| **Healthchecks.io** | an inbound ping from `backup.sh` | a backup that never ran | the API being down |
+
+### ⚠️ Point the HTTP monitors at `/health/ready`, not `/health`
+
+`/health` is a static JSON literal. It answers `{"status":"ok"}` with Postgres
+unreachable and Valkey gone, because nothing in it touches either — a monitor
+pointed there reports a healthy service while every request that matters returns
+500, which is precisely the failure the monitor exists to catch.
+
+`/health/ready` runs `SELECT 1` and a Valkey read, and answers **503** when either
+fails. It is unauthenticated (a monitor cannot sign in) and deliberately says
+nothing but subsystem names and `ok`/`failed`.
+
+`/health` stays as it is because `deploy-drift.yml` reads its `build` field, and a
+transient database blip must not make deploy drift unreadable.
+
+```
+URL       https://api.evnx.dev/health/ready
+Interval  5 minutes (UptimeRobot free) / 3 minutes (BetterStack free)
+Expect    HTTP 200
+Alert     after 2 consecutive failures, so one blip is not a page
+```
+
+Running both is not redundant in the way it looks: a monitoring service can itself
+be down or misconfigured, and the second one is what tells you the first stopped
+checking. Send them to different channels — email and phone, say — or the duplicate
+becomes noise and both get muted.
+
+### Healthchecks.io — the dead man's switch
+
+Create a check named `evnx-backup`, period **1 day**, grace **2 hours** (the timer
+fires around 03:00 with systemd's randomised delay). Copy its ping URL into
+`.env.prod`:
+
+```bash
+echo 'BACKUP_HEALTHCHECK_URL=https://hc-ping.com/<your-uuid>' >> .env.prod
+```
+
+`backup.sh` then pings `/start` when it begins, the base URL only after the dump has
+uploaded and passed its content check, and `/fail` on any `die`. Unset, every ping is
+a no-op and the backup behaves exactly as before; a ping that fails is swallowed,
+because a monitoring outage must never turn a successful backup into a failed one.
+
+Test it by making a run fail on purpose — `ENV_FILE=/nonexistent ./scripts/backup.sh`
+— and confirming the alert arrives. **An untested alarm is worth as much as an
+untested backup.**
+
+⚠️ Treat the ping URL as a credential: anyone holding it can silence the alarm by
+pinging it themselves.
+
+### Why this section exists
+
+The nightly backup failed **every night from 15 to 30 September 2026** — fifteen
+nights — and nothing said so. Three independent faults, each sufficient on its own,
+and the one that kept it invisible for the last nine nights produced no log output
+at all. `OnFailure=` was also never installed, so even the failures that did speak
+had nowhere to speak to.
+
+A dead man's switch is the only one of these three that would have caught it on the
+first night.
+
+---
+
 ## 9. Updating
 
 ```bash
