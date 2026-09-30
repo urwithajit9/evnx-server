@@ -45,7 +45,17 @@ die() { log "ERROR: $*" >&2; exit 1; }
 
 # Read only the variables needed. Sourcing the whole file would pull JWT_SECRET
 # and friends into this process for no reason.
-get() { grep -E "^$1=" "$ENV_FILE" | tail -1 | cut -d= -f2- | tr -d '"'"'"'' ; }
+#
+# ⚠️ `|| true` is load-bearing. This is a pipeline used inside an assignment,
+# under `set -euo pipefail`: when the key is ABSENT, `grep` exits 1, `pipefail`
+# propagates it, and `set -e` kills the script — before the `${VAR:-default}`
+# fallback on the very same line that exists to handle exactly that case.
+#
+# The failure is silent and instant: no message, no log line, exit 1. It looks
+# identical to a crash, and a nightly timer failing this way tells you nothing
+# at all. Every caller below already treats an empty result as "use the default",
+# so a missing optional key must return empty rather than abort.
+get() { grep -E "^$1=" "$ENV_FILE" | tail -1 | cut -d= -f2- | tr -d '"'"'"'' || true ; }
 
 PGUSER="$(get POSTGRES_USER)";       PGUSER="${PGUSER:-evnx}"
 PGDB="$(get POSTGRES_DB)";           PGDB="${PGDB:-evnx}"
