@@ -1,5 +1,6 @@
 // src/routes/members.rs
 
+use crate::middleware::client_ip::ClientContext;
 use crate::{
     db::{members, users as db_users, vaults},
     errors::AppError,
@@ -30,6 +31,7 @@ pub struct AddMemberRequest {
 
 pub async fn add_member(
     State(state): State<AppState>,
+    client: ClientContext,
     // Admin or above — sharing hands out a key, so it is not a developer-level act.
     access: VaultAccess<AtLeastAdmin>,
     Json(req): Json<AddMemberRequest>,
@@ -112,6 +114,7 @@ pub async fn add_member(
         vault_id,
         requester_id,
         "member_grant",
+        &client,
         serde_json::json!({
             "member_user_id": target.id,
             "role": granted.as_str(),
@@ -198,6 +201,7 @@ pub struct SetRoleRequest {
 /// small loss and keeps the rule to one sentence.
 pub async fn set_member_role(
     State(state): State<AppState>,
+    client: ClientContext,
     // Admin or above to reach this at all; the finer rules are below.
     access: VaultAccess<AtLeastAdmin>,
     Path((_, member_user_id)): Path<(Uuid, Uuid)>,
@@ -251,6 +255,7 @@ pub async fn set_member_role(
         vault_id,
         access.user_id,
         "member_role_change",
+        &client,
         serde_json::json!({
             "member_user_id": member_user_id,
             "from": current_role.as_str(),
@@ -263,6 +268,7 @@ pub async fn set_member_role(
 
 pub async fn remove_member(
     State(state): State<AppState>,
+    client: ClientContext,
     // Any member, because leaving is always allowed. Removing *somebody else*
     // needs more, and that is checked below against the target's own rank.
     access: VaultAccess<AtLeastViewer>,
@@ -316,6 +322,7 @@ pub async fn remove_member(
         vault_id,
         requester_id,
         "member_revoke",
+        &client,
         serde_json::json!({
             "member_user_id": member_user_id,
             "role": target_role.as_str(),

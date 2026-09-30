@@ -1,6 +1,7 @@
 // src/routes/tokens.rs
 
 use crate::errors::AppError;
+use crate::middleware::client_ip::ClientContext;
 use crate::services::jwt::Claims;
 use crate::AppState;
 use axum::{
@@ -32,6 +33,7 @@ pub struct TokenResponse {
 
 pub async fn create_token(
     State(state): State<AppState>,
+    client: ClientContext,
     axum::Extension(claims): axum::Extension<Claims>,
     Json(req): Json<CreateTokenRequest>,
 ) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), AppError> {
@@ -87,8 +89,8 @@ pub async fn create_token(
                     vault_id: req.vault_id,
                     user_id: Some(user_id),
                     event_type: "token_create".into(),
-                    ip_hash: None,
-                    user_agent_hash: None,
+                    ip_hash: client.ip_hash.clone(),
+                    user_agent_hash: client.user_agent_hash.clone(),
                     metadata: Some(serde_json::json!({ "token_id": token_id, "scope": scope_for_audit, "vault_id": vault_id_for_audit })),
                 },
             )

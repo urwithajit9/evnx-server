@@ -4667,3 +4667,130 @@ async fn deleting_a_version_that_does_not_exist_is_404() {
     .await;
     assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
 }
+
+// ─── Client addresses — T21 ───────────────────────────────────────────────────
+
+/// ⚠️ A sign-in wrote nothing to `audit_events` at all before 2026-09-30, which
+/// made "anomaly detection on login" detection over an empty set. This asserts the
+/// row exists and carries the request's origin.
+#[tokio::test]
+async fn a_login_is_recorded_with_its_origin() {
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+    srp_login(&server, &account).await;
+
+    // The write is spawned, like the alert email, so it lands just after the
+    // response. Poll rather than sleep a fixed amount.
+    let pool = sqlx::PgPool::connect(&test_config().await.database_url)
+        .await
+        .unwrap();
+    let mut row: Option<(Option<String>, Option<String>, serde_json::Value)> = None;
+    for _ in 0..40 {
+        row = sqlx::query_as(
+            "SELECT ip_hash, user_agent_hash, metadata FROM audit_events \
+             WHERE user_id = $1 AND event_type = 'login' LIMIT 1",
+        )
+        .bind(account.user_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        if row.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let (ip_hash, ua_hash, metadata) = row.expect("a successful login recorded no audit event");
+    assert_eq!(metadata["method"], "password");
+
+    // ⚠️ Whatever landed must not be an address. The harness supplies no peer and
+    // no user agent, so both are NULL here — the point is that neither ever holds
+    // something readable.
+    for h in [&ip_hash, &ua_hash].into_iter().flatten() {
+        assert_eq!(h.len(), 64, "not a blake3 hex digest: {h}");
+        assert!(
+            !h.contains('.') && !h.contains(':'),
+            "looks like an address: {h}"
+        );
+    }
+}
+
+/// The column has held `NULL` since the first migration. This is the guard that it
+/// is now written by *something*, so a regression that unplumbs it is visible.
+#[tokio::test]
+async fn the_audit_view_still_withholds_the_origin_columns() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+
+    let body = bearer(server.get(&format!("/api/v1/vaults/{vault}/audit")), &jwt)
+        .await
+        .text();
+
+    // Stable digests correlate a person's activity across events without naming
+    // them — useful to an operator, a tracking primitive handed to every colleague
+    // who shares a vault. They stay in the database.
+    assert!(!body.contains("ip_hash"), "the audit view leaked ip_hash");
+    assert!(
+        !body.contains("user_agent_hash"),
+        "the audit view leaked user_agent_hash"
+    );
+}
+
+// ─── Readiness — O5 ───────────────────────────────────────────────────────────
+
+/// ⚠️ `/health` reports `ok` with every dependency down, because it is a static
+/// literal. An uptime monitor pointed at it watches nothing. This is the endpoint
+/// monitors should use, and these assert the difference is real.
+#[tokio::test]
+async fn readiness_reports_each_dependency() {
+    let server = test_app().await;
+    let resp = server.get("/health/ready").await;
+    resp.assert_status_ok();
+
+    let body = resp.json::<serde_json::Value>();
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["checks"]["database"], "ok");
+    assert_eq!(body["checks"]["cache"], "ok");
+}
+
+/// Unauthenticated and readable by anyone on the internet, so it must carry
+/// subsystem names and verdicts and nothing else. A driver's error string can
+/// contain a connection string.
+#[tokio::test]
+async fn readiness_says_nothing_beyond_ok_or_failed() {
+    let server = test_app().await;
+    let body = server.get("/health/ready").await.text();
+
+    for leak in [
+        "postgres",
+        "postgresql",
+        "redis",
+        "valkey",
+        "password",
+        "@",
+        "5432",
+        "6379",
+    ] {
+        assert!(
+            !body.to_lowercase().contains(leak),
+            "readiness leaked {leak:?}: {body}"
+        );
+    }
+    // Nor the build or version, which /health carries and a monitor has no use for.
+    assert!(!body.contains("build"), "{body}");
+}
+
+/// `/health` stays cheap and dependency-free: `deploy-drift.yml` reads its `build`
+/// field, and a transient database blip must not make deploy drift unreadable.
+#[tokio::test]
+async fn liveness_stays_separate_from_readiness() {
+    let server = test_app().await;
+    let body = server.get("/health").await.json::<serde_json::Value>();
+    assert_eq!(body["status"], "ok");
+    assert!(body["build"].is_string(), "deploy-drift reads this field");
+    assert!(
+        body.get("checks").is_none(),
+        "/health must not grow dependency checks — that is /health/ready's job"
+    );
+}

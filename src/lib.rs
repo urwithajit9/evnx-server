@@ -52,6 +52,64 @@ pub fn build_router(state: AppState) -> Router {
 /// Deliberately does **not** touch Postgres or Valkey — it answers "is the
 /// process up", so an infra blip never takes the container out of rotation.
 /// Use a separate readiness probe for dependency health.
+/// Is the service actually able to serve a request?
+///
+/// ⚠️ **`/health` cannot answer this and was never meant to.** It is a static JSON
+/// literal: it reports `ok` with Postgres unreachable and Valkey gone, because
+/// nothing in it touches either. An uptime monitor pointed at `/health` therefore
+/// reports a healthy service while every request that matters returns 500 — which
+/// is the exact failure an uptime monitor exists to catch, and the reason this
+/// endpoint was added rather than making `/health` heavier.
+///
+/// The two stay separate deliberately:
+///
+/// * `/health` is **liveness** — cheap, dependency-free, and read by
+///   `deploy-drift.yml` for its `build` field. A transient database blip must not
+///   make deploy drift unreadable.
+/// * `/health/ready` is **readiness** — point external monitoring here.
+///
+/// ─── What it deliberately does not say ───────────────────────────────────────
+///
+/// Unauthenticated, because a monitor cannot sign in. So it returns subsystem
+/// names and `ok`/`failed` and nothing else: no error text, no host, no timing, no
+/// version. A driver's error string can carry a connection string, and this is the
+/// one endpoint on the server that anyone on the internet can read at will.
+///
+/// `503` on failure, so a monitor sees a non-2xx rather than having to parse the
+/// body — which is what every one of them checks by default.
+pub async fn readiness_check(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    // A trivial round trip, not a pool-status read: a pool can report healthy
+    // handles while the server behind it refuses queries.
+    let database = sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&state.db)
+        .await
+        .is_ok();
+
+    // Any read that reaches the server proves the connection; the key need not
+    // exist, and its absence is a successful answer.
+    let cache = state.cache.exists("readiness-probe").await.is_ok();
+
+    let ok = database && cache;
+    let code = if ok {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        code,
+        axum::Json(serde_json::json!({
+            "status": if ok { "ok" } else { "degraded" },
+            "checks": {
+                "database": if database { "ok" } else { "failed" },
+                "cache":    if cache    { "ok" } else { "failed" },
+            },
+        })),
+    )
+}
+
 pub async fn health_check() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
         "status": "ok",

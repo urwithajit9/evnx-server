@@ -39,7 +39,33 @@ WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 log() { printf '%s  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
-die() { log "ERROR: $*" >&2; exit 1; }
+die() { log "ERROR: $*" >&2; ping_hc "/fail"; exit 1; }
+
+# ─── The dead man's switch ──────────────────────────────────────────────────
+#
+# ⚠️ This is the one alert that catches a backup which never RAN. `OnFailure=`
+# reports a run that ran and failed; it cannot report a powered-off box, a timer
+# someone disabled, or a systemd that broke — and `.last-success` below is local
+# evidence nobody is watching. Something off-box has to notice the absence.
+#
+# That gap is not hypothetical here: the nightly backup failed every night from
+# 15 to 30 September and, for the last nine of those, produced no output at all.
+#
+# HEALTHCHECK_URL is optional; unset, every ping is a no-op and the backup behaves
+# exactly as before. Failures to ping are swallowed on purpose: a monitoring
+# outage must never turn a successful backup into a failed one.
+#
+# ⚠️ The URL is a credential — anyone holding it can silence the alarm by pinging
+# it themselves. It is never logged, and never echoed into an error.
+# Initialised from the environment, not blanked: every other setting here reads
+# "environment beats .env.prod beats the default", and one that silently ignored
+# an exported value would be a trap for a one-off run.
+HEALTHCHECK_URL="${HEALTHCHECK_URL:-}"
+
+ping_hc() {
+  [ -n "$HEALTHCHECK_URL" ] || return 0
+  curl -fsS -m 10 --retry 3 -o /dev/null "${HEALTHCHECK_URL}${1:-}" 2>/dev/null || true
+}
 
 [ -r "$ENV_FILE" ] || die "cannot read $ENV_FILE"
 
@@ -69,6 +95,12 @@ REGION="$(get STORAGE_REGION)";      REGION="${REGION:-auto}"
 # the example file but is silently ignored is a trap.
 BUCKET="${BACKUP_BUCKET:-$(get BACKUP_BUCKET)}"
 BUCKET="${BUCKET:-evnx-backups}"
+HEALTHCHECK_URL="${HEALTHCHECK_URL:-$(get BACKUP_HEALTHCHECK_URL)}"
+
+# Signals "this run has begun", so the monitor can also flag a run that starts and
+# then hangs — a dump that stalls on a lock looks identical to one that never
+# started, unless the start is announced.
+ping_hc "/start"
 
 [ -n "$ENDPOINT" ]              || die "STORAGE_ENDPOINT is empty"
 [ -n "$AWS_ACCESS_KEY_ID" ]     || die "AWS_ACCESS_KEY_ID is empty"
@@ -145,5 +177,10 @@ docker run --rm \
 # a broken systemd. This file is the only local evidence for that case. The
 # staleness check in DEPLOYMENT.md §8 reads it.
 date -u +%Y-%m-%dT%H:%M:%SZ > "$SCRIPT_DIR/.last-success"
+
+# Only here, after the dump uploaded and its content check passed. Pinging
+# earlier would report success for a run that went on to fail, which is the
+# failure mode a dead man's switch is supposed to remove rather than add.
+ping_hc ""
 
 log "backup complete"

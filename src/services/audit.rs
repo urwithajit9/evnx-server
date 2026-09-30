@@ -59,9 +59,12 @@ pub fn record_membership_event(
     vault_id: Uuid,
     actor_id: Uuid,
     event_type: &'static str,
+    client: &crate::middleware::client_ip::ClientContext,
     metadata: serde_json::Value,
 ) {
     let pool = pool.clone();
+    let ip_hash = client.ip_hash.clone();
+    let user_agent_hash = client.user_agent_hash.clone();
     tokio::spawn(async move {
         if let Err(e) = record(
             &pool,
@@ -69,8 +72,8 @@ pub fn record_membership_event(
                 vault_id: Some(vault_id),
                 user_id: Some(actor_id),
                 event_type: event_type.into(),
-                ip_hash: None,
-                user_agent_hash: None,
+                ip_hash,
+                user_agent_hash,
                 metadata: Some(metadata),
             },
         )

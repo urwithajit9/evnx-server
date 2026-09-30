@@ -69,6 +69,7 @@ use std::collections::BTreeSet;
 use uuid::Uuid;
 use validator::Validate;
 
+use crate::middleware::client_ip::ClientContext;
 use crate::{
     db::{rotation, totp as db_totp, users},
     errors::AppError,
@@ -389,6 +390,7 @@ pub struct RotateResponse {
 /// Replace the master password, and every wrap that depends on it.
 pub async fn rotate_master_key(
     State(state): State<AppState>,
+    client: ClientContext,
     axum::Extension(claims): axum::Extension<Claims>,
     Json(req): Json<RotateRequest>,
 ) -> Result<Json<RotateResponse>, AppError> {
@@ -523,8 +525,8 @@ pub async fn rotate_master_key(
             vault_id: None,
             user_id: Some(user_id),
             event_type: "master_key_rotated".into(),
-            ip_hash: None,
-            user_agent_hash: None,
+            ip_hash: client.ip_hash.clone(),
+            user_agent_hash: client.user_agent_hash.clone(),
             // Counts and policy only. No salts, no verifier, no wrap.
             metadata: Some(serde_json::json!({
                 "vaults_rewrapped":  req.vault_wraps.len(),
@@ -661,6 +663,7 @@ pub struct UndoResponse {
 /// Prove the old password and put it back.
 pub async fn undo_verify(
     State(state): State<AppState>,
+    client: ClientContext,
     Json(req): Json<UndoVerifyRequest>,
 ) -> Result<Json<UndoResponse>, AppError> {
     let key = format!("undo_srp:{}", req.session_id);
@@ -762,8 +765,8 @@ pub async fn undo_verify(
             vault_id: None,
             user_id: Some(user_id),
             event_type: "master_key_restored".into(),
-            ip_hash: None,
-            user_agent_hash: None,
+            ip_hash: client.ip_hash.clone(),
+            user_agent_hash: client.user_agent_hash.clone(),
             metadata: Some(serde_json::json!({
                 "vaults_restored":       restored,
                 "vaults_not_in_snapshot": orphans.len(),

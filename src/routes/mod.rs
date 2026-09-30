@@ -190,6 +190,9 @@ pub fn create_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(crate::health_check))
+        // Readiness, for external uptime monitoring. `/health` answers `ok` with
+        // every dependency down, so pointing a monitor at it watches nothing.
+        .route("/health/ready", get(crate::readiness_check))
         .nest("/api/v1/auth", auth_routes)
         .nest("/api/v1/vaults", vault_routes)
         .nest(

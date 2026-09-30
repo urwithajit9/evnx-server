@@ -10,6 +10,7 @@ use sha2::Sha256;
 use srp::groups::G_2048;
 use srp::server::SrpServer;
 
+use crate::middleware::client_ip::ClientContext;
 use crate::{
     db::{tokens as db_tokens, totp as db_totp, users},
     errors::AppError,
@@ -319,6 +320,7 @@ pub struct SrpVerifyResponse {
 /// On failure: generic error (never reveal whether email/password is wrong vs session expired).
 pub async fn srp_verify(
     State(state): State<AppState>,
+    client: ClientContext,
     Json(req): Json<SrpVerifyRequest>,
 ) -> Result<Json<SrpVerifyResponse>, AppError> {
     // Fetch session from Valkey
@@ -476,6 +478,7 @@ pub async fn srp_verify(
     // response timing say something about the account. Same discipline as the
     // verification email on register.
     notify_new_login(&state, &user.email, session_id);
+    record_login(&state, user_id, &client, "password");
 
     Ok(Json(SrpVerifyResponse {
         server_proof: server_proof_hex,
@@ -543,11 +546,13 @@ pub async fn resend_verification(
     // tighter than a login: 3 per hour is generous for a human who lost an email
     // and stingy for anyone using us to send mail at a third party.
     //
-    // NOTE: per-IP limiting is not applied here because this server does not yet
-    // extract client IPs in handlers (audit events all pass `ip_hash: None`).
-    // Adding it means plumbing `ConnectInfo` and deciding how far to trust
-    // `X-Forwarded-For` from Caddy — a separate change, tracked rather than
-    // bolted on here.
+    // NOTE: still per-address rather than per-IP, though client addresses are now
+    // available (`middleware::client_ip`). Deliberate: an IP-keyed limit would be
+    // keyed on a value that is trustworthy only when `TRUST_PROXY_HEADER` is on and
+    // the proxy sanitises the header, and a rate limit that quietly stops limiting
+    // on a misconfigured deployment is worse than one that never claimed to. The
+    // two throttle different attacks; this one bounds mail sent at a third party,
+    // and the address is the right key for that.
     let rate_key = format!(
         "rate:resend_verify:{}",
         blake3::hash(email.as_bytes()).to_hex()
@@ -741,6 +746,49 @@ pub(crate) fn fake_salt() -> String {
 ///
 /// Errors are logged without the recipient's address: a failure to notify is
 /// worth knowing about, and repeating the address into the log is not.
+/// Record that a login completed.
+///
+/// ⚠️ **This event did not exist before 2026-09-30.** `srp_verify` sent an alert
+/// email and wrote nothing to `audit_events`, so the trail held no record of a
+/// sign-in at all — which makes "anomaly detection on login" (task 22) detection
+/// over an empty set. Plumbing client addresses is only half the job; the other
+/// half is having a row to put one in.
+///
+/// Spawned, like the alert: a slow insert must not sit in the login's response
+/// path, and a login that succeeded must not be reported as failed because the
+/// log write was.
+///
+/// Failed logins are deliberately **not** recorded yet. They are the more
+/// interesting signal and also one an attacker can generate at will — bounded by
+/// `srp_lockout`, but still a question about retention and volume that belongs
+/// with task 22's design rather than ahead of it.
+fn record_login(state: &AppState, user_id: Uuid, client: &ClientContext, method: &str) {
+    let db = state.db.clone();
+    let ip_hash = client.ip_hash.clone();
+    let user_agent_hash = client.user_agent_hash.clone();
+    let method = method.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = crate::services::audit::record(
+            &db,
+            crate::services::audit::AuditEvent {
+                vault_id: None,
+                user_id: Some(user_id),
+                event_type: "login".into(),
+                ip_hash,
+                user_agent_hash,
+                // The method only. The address and the agent string are already in
+                // the hashed columns and belong nowhere else — metadata is returned
+                // to clients, those columns are not.
+                metadata: Some(serde_json::json!({ "method": method })),
+            },
+        )
+        .await
+        {
+            tracing::warn!(error = %e, "could not record a login");
+        }
+    });
+}
+
 fn notify_new_login(state: &AppState, email: &str, session_id: Uuid) {
     let mail = state.email.clone();
     let to = email.to_string();
@@ -1000,6 +1048,7 @@ fn generate_backup_codes() -> Vec<String> {
 /// Verify TOTP code during login (when requires_totp = true).
 pub async fn totp_verify_login(
     State(state): State<AppState>,
+    client: ClientContext,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let totp_pending_token = req
@@ -1088,6 +1137,7 @@ pub async fn totp_verify_login(
             // The second factor is where a 2FA login actually completes, so the
             // alert belongs here rather than after the password step.
             notify_new_login(&state, &user.email, session_id);
+            record_login(&state, user_id, &client, "password+totp");
 
             let backup_codes_remaining = db_totp::remaining(&state.db, user_id).await?;
             Ok(Json(serde_json::json!({
@@ -1315,6 +1365,7 @@ pub struct DeleteAccountRequest {
 pub async fn delete_account(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<Claims>,
+    client: ClientContext,
     Json(req): Json<DeleteAccountRequest>,
 ) -> Result<axum::http::StatusCode, AppError> {
     let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
@@ -1423,7 +1474,7 @@ pub async fn delete_account(
             vault_id: None,
             user_id: Some(user_id),
             event_type: "account_deleted".into(),
-            ip_hash: None,
+            ip_hash: client.ip_hash.clone(),
             user_agent_hash: None,
             metadata: Some(serde_json::json!({ "vaults_deleted": doomed_blobs.len() })),
         },

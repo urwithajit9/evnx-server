@@ -10,6 +10,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::middleware::client_ip::ClientContext;
 use crate::{
     db::versions,
     errors::AppError,
@@ -42,6 +43,7 @@ pub struct PushVersionResponse {
 
 pub async fn push_version(
     State(state): State<AppState>,
+    client: ClientContext,
     // Developer or above. A viewer is refused before the body is read — the
     // requirement is in the signature, not in the body, so it cannot be skipped.
     access: VaultAccess<AtLeastDeveloper>,
@@ -123,8 +125,8 @@ pub async fn push_version(
                     user_id: Some(user_id),
                     event_type: "push".into(),
                     metadata: Some(serde_json::json!({ "version": version_num })),
-                    ip_hash: None,
-                    user_agent_hash: None,
+                    ip_hash: client.ip_hash.clone(),
+                    user_agent_hash: client.user_agent_hash.clone(),
                 },
             )
             .await;
@@ -168,6 +170,7 @@ pub async fn get_latest_version(
 
 pub async fn download_blob(
     State(state): State<AppState>,
+    client: ClientContext,
     // Any member may pull. The blob is ciphertext either way — the server could
     // not hand over plaintext if it wanted to — so this gate is about metadata
     // and audit trail, not confidentiality.
@@ -207,8 +210,8 @@ pub async fn download_blob(
                     user_id: Some(user_id),
                     event_type: "pull".into(),
                     metadata: Some(serde_json::json!({ "version": version_num })),
-                    ip_hash: None,
-                    user_agent_hash: None,
+                    ip_hash: client.ip_hash.clone(),
+                    user_agent_hash: client.user_agent_hash.clone(),
                 },
             )
             .await;
@@ -291,6 +294,7 @@ pub async fn list_versions(
 /// making room only ever means deleting old ones.
 pub async fn delete_version(
     State(state): State<AppState>,
+    client: ClientContext,
     access: VaultAccess<AtLeastAdmin>,
     Path((_vault_id, version_num)): Path<(Uuid, i32)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -322,8 +326,8 @@ pub async fn delete_version(
             vault_id: Some(vault_id),
             user_id: Some(user_id),
             event_type: "version_deleted".into(),
-            ip_hash: None,
-            user_agent_hash: None,
+            ip_hash: client.ip_hash.clone(),
+            user_agent_hash: client.user_agent_hash.clone(),
             metadata: Some(serde_json::json!({ "version_num": version_num })),
         },
     )

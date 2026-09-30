@@ -16,10 +16,15 @@ use serde::{de::DeserializeOwned, Serialize};
 ///
 /// ⚠️ Rate limiting is keyed by **email hash, not by IP**, and the two are not
 /// interchangeable: an email key throttles attacks against one account, an IP
-/// key throttles one attacker across many. Only the first exists. Client
-/// addresses are not plumbed through to handlers at all — every audit event
-/// passes `ip_hash: None` — and doing so means deciding how far to trust
-/// `X-Forwarded-For` from Caddy, which is a separate change.
+/// key throttles one attacker across many. Only the first exists.
+///
+/// Client addresses ARE available now (`middleware::client_ip`, 2026-09-30) and
+/// audit events carry them — but an IP-keyed limit is still deliberately absent.
+/// It would be keyed on a value that is only trustworthy when
+/// `TRUST_PROXY_HEADER` is on *and* the proxy sanitises the header, and a limit
+/// that silently stops limiting on a misconfigured deployment is worse than one
+/// that never claimed to. If it is added, the trust decision has to be part of it
+/// rather than assumed.
 ///
 /// An earlier revision of this comment listed `rate:auth:{ip_hash}` and
 /// `rate:register:{ip_hash}`. Neither key has ever existed.

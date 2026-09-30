@@ -88,6 +88,19 @@ async fn main() {
     let email = EmailService::from_config(&config);
     tracing::info!(transport = email.transport_name(), "✓ Email configured");
 
+    // ⚠️ Said once, loudly, because the consequence is silent. Behind a proxy with
+    // this off, every audit row records the proxy's own address: one value for
+    // every user, which looks like data and is not. The setting defaults to off
+    // because the other mistake — trusting a header nothing sanitises — lets a
+    // client choose what gets written about them, and that is worse.
+    if config.is_production() && !config.trust_proxy_header {
+        tracing::warn!(
+            "TRUST_PROXY_HEADER is off in production — audit events will record the \
+             proxy's address, not the client's. Set it to true when running behind \
+             docker/Caddyfile, which replaces X-Forwarded-For with the real peer."
+        );
+    }
+
     let cache = CacheService::new(valkey.clone());
     let state = AppState::new(db, cache, valkey, config.clone(), jwt, email, storage);
     let app = build_router(state);
@@ -105,13 +118,20 @@ async fn main() {
 
     tracing::info!("✓ Listening on http://{}", addr);
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!("Server error: {}", e);
-            std::process::exit(1);
-        });
+    // `into_make_service_with_connect_info` is what puts the peer address in the
+    // request extensions; without it `ClientContext` has no socket to fall back to
+    // and silently records nothing. Nothing else in the stack needs it, which is
+    // exactly why it is easy to leave out.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .unwrap_or_else(|e| {
+        tracing::error!("Server error: {}", e);
+        std::process::exit(1);
+    });
 }
 
 /// Wait for Ctrl+C or SIGTERM, then let Axum drain in-flight requests.

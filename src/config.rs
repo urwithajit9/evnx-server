@@ -36,6 +36,17 @@ pub struct Config {
     /// release. See `services::quota`.
     pub quotas: crate::services::quota::Quotas,
 
+    /// Read the client address from `X-Forwarded-For` rather than the socket.
+    ///
+    /// ⚠️ **Defaults to false everywhere, production included.** Trusting the
+    /// header when nothing sanitises it lets any client name its own address, and
+    /// every audit row written afterwards is a value the attacker chose. Getting
+    /// it wrong the other way records the proxy's address — uniform, useless, and
+    /// obviously so. The unsafe direction is the one that has to be asked for.
+    ///
+    /// Behind `docker/Caddyfile` this must be `true`; the startup warning says so.
+    pub trust_proxy_header: bool,
+
     /// How long a master-key rotation can be undone, in hours.
     ///
     /// ⚠️ A security window, so an unparseable value fails startup rather than
@@ -324,6 +335,13 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty()),
             max_request_size_kb: optional!("MAX_REQUEST_SIZE_KB", "64").parse().unwrap_or(64),
+            trust_proxy_header: matches!(
+                optional!("TRUST_PROXY_HEADER", "false")
+                    .trim()
+                    .to_lowercase()
+                    .as_str(),
+                "true" | "1" | "yes"
+            ),
             master_key_undo_window_hours: {
                 let raw = optional!("MASTER_KEY_UNDO_WINDOW_HOURS", "72");
                 match raw.trim().parse::<i64>() {

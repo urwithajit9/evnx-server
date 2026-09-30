@@ -43,6 +43,7 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use uuid::Uuid;
 
+use crate::middleware::client_ip::ClientContext;
 use crate::{
     db::{members, versions},
     errors::AppError,
@@ -213,6 +214,7 @@ pub struct RekeyRequest {
 /// * `404` — the vault, or the member being removed, is not there.
 pub async fn rekey(
     State(state): State<AppState>,
+    client: ClientContext,
     // Admin or above — decided 2026-09-19. Gating this to the owner alone would
     // mean a team whose owner is away cannot revoke a departing colleague, and a
     // revocation that has to wait is the failure mode this phase removes.
@@ -350,6 +352,7 @@ pub async fn rekey(
         vault_id,
         access.user_id,
         "vault_rekey",
+        &client,
         serde_json::json!({
             "versions_rekeyed":  req.versions.len(),
             "members_rewrapped": req.members.len(),
