@@ -399,42 +399,42 @@ Expect    HTTP 200
 
 #### What the free tiers actually give you (checked 2026-09-30)
 
-**UptimeRobot — Free, $0/month, no card:**
+| | UptimeRobot Free | BetterStack Free | Healthchecks.io Hobbyist |
+|---|---|---|---|
+| Cost | $0, no card | $0 | $0 |
+| Capacity | 50 monitors | 10 monitors & heartbeats, 1 status page | 20 checks |
+| Interval | **5 min** | **3 min** | n/a — inbound ping |
+| Alert channels | e-mail, mobile push, 25 one-off SMS credits | **Slack and e-mail only** | e-mail and integrations |
+| History | — | 3 GB logs / traces, 3 days | **100 log entries per check** |
+| ⚠️ Limits | **5 integrations**, no extra seats, no login seats | no phone or SMS | — |
 
-| | |
-|---|---|
-| Monitors | 50 |
-| Interval | **5 minutes** |
-| Types | HTTP, port, ping, keyword, API, UDP |
-| Also | multi-location checks, slow-response alerts, SSL and domain-expiry monitors, full status pages |
-| ⚠️ Integrations | **only 5** |
-| ⚠️ Seats | notify-only seats unavailable; no login seats — one person, one login |
+⚠️ **Do the arithmetic before choosing an alert threshold.** UptimeRobot's 5-minute
+interval with "alert after 2 consecutive failures" means **10 to 15 minutes** before
+anyone is told. Far better than the previous state, where an outage was noticed by a
+user, but not a number to assume rather than know.
 
-⚠️ **Do the arithmetic before choosing an alert threshold.** A 5-minute interval with
-"alert after 2 consecutive failures" means **10 to 15 minutes** before anyone is told.
-That is still far better than the current state, where an outage is noticed by a user,
-but it is not a number to assume rather than know.
+The split that follows from those numbers:
 
-The sensible split, given two monitors at different intervals:
+* **UptimeRobot — alert on the first failure**, to e-mail and mobile push. Its
+  interval already supplies the delay a wait-for-two rule is usually buying.
+* **BetterStack — alert after two**, to **Slack**. Slower, more certain, and on a
+  genuinely different channel rather than a second copy in the same inbox.
 
-* **UptimeRobot — alert on the first failure.** Fastest signal, and the 5-minute
-  interval already provides the delay that a "wait for 2" rule is usually buying.
-* **BetterStack — alert after two.** Slower and more certain, so it confirms rather
-  than duplicates.
+⚠️ Neither free tier gives sustained phone alerts — UptimeRobot's 25 SMS credits are
+one-off. If a page at 3 a.m. matters, that is the thing to pay for, and it is the only
+thing here worth paying for yet.
 
-Send them to **different channels** — one to email, one to the phone. Two monitors
-pointed at the same inbox produce two identical pages for one blip, and the usual
-outcome is that both get muted, leaving you with nothing while believing you have two.
+Two monitors pointed at the same inbox produce two identical pages for one blip, and
+the usual outcome is that both get muted — leaving nothing while appearing to be two.
+Different channels is the whole reason for running two.
 
-⚠️ The 5-integration cap is per account, not per monitor, and the SSL and
+⚠️ UptimeRobot's 5-integration cap is per account, not per monitor, and SSL and
 domain-expiry monitors are worth one each: `api.evnx.dev`, `app.evnx.dev` and
 `evnx.dev` all have certificates that expire.
 
-
-Running both is not redundant in the way it looks: a monitoring service can itself
-be down or misconfigured, and the second one is what tells you the first stopped
-checking. Send them to different channels — email and phone, say — or the duplicate
-becomes noise and both get muted.
+⚠️ Healthchecks.io keeps **100 log entries per check**. At one backup a night that is
+roughly three months of history — ample, but not an audit trail. The audit trail is
+`audit_events`, and the dumps themselves are in R2.
 
 ### Healthchecks.io — the dead man's switch
 
