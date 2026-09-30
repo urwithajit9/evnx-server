@@ -25,7 +25,12 @@ DRY_RUN=0
 
 log() { printf '%s  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 die() { log "ERROR: $*" >&2; exit 1; }
-get() { grep -E "^$1=" "$ENV_FILE" | tail -1 | cut -d= -f2- | tr -d '"'"'"'' ; }
+# ⚠️ `|| true` is load-bearing — see the same note in backup.sh. This is a pipeline
+# inside an assignment under `set -euo pipefail`, so a key that is ABSENT makes grep
+# exit 1 and kills the script before the `${VAR:-default}` on the same line. Silent,
+# instant, exit 1. In backup.sh that cost fifteen nights of failed backups nobody
+# could diagnose; here it would land in the middle of a restore, which is worse.
+get() { grep -E "^$1=" "$ENV_FILE" | tail -1 | cut -d= -f2- | tr -d '"'"'"'' || true ; }
 
 [ -r "$ENV_FILE" ] || die "cannot read $ENV_FILE"
 PGUSER="$(get POSTGRES_USER)"; PGUSER="${PGUSER:-evnx}"
@@ -64,20 +69,47 @@ gzip -t "$DUMP" || die "$DUMP fails its gzip integrity check"
 zcat "$DUMP" | grep -q "CREATE TABLE public.vault_members" || die "no vault_members in dump"
 log "dump verified"
 
+counts() {
+  docker exec "$CONTAINER" psql -U "$PGUSER" -d "$1" -tAc "
+    SELECT 'users='||(SELECT count(*) FROM users)
+        ||'  vaults='||(SELECT count(*) FROM vaults)
+        ||'  members='||(SELECT count(*) FROM vault_members)
+        ||'  versions='||(SELECT count(*) FROM vault_versions);"
+}
+
 if [ "$DRY_RUN" = 1 ]; then
   SCRATCH="evnx_restore_test_$(date -u +%s)"
   log "dry run — restoring into scratch database $SCRATCH"
   docker exec "$CONTAINER" createdb -U "$PGUSER" "$SCRATCH"
+  # Dropped even if something below fails, or a failed drill leaves a stray
+  # database behind on every run.
+  trap 'docker exec "$CONTAINER" dropdb --if-exists -U "$PGUSER" "$SCRATCH" >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+
+  # Errors are tolerated here, not ignored: a `--clean --if-exists` dump restored
+  # into an EMPTY database emits a DROP notice for every table it cannot find, and
+  # psql exits non-zero on them while having done the right thing. The check that
+  # the restore actually worked is the row count below, which fails loudly if the
+  # tables are not there.
   # shellcheck disable=SC2002
   zcat "$DUMP" | docker exec -i "$CONTAINER" psql -U "$PGUSER" -d "$SCRATCH" -q >/dev/null 2>&1 || true
-  log "row counts in the restored copy:"
-  docker exec "$CONTAINER" psql -U "$PGUSER" -d "$SCRATCH" -tAc "
-    SELECT 'users='||(SELECT count(*) FROM users)
-        ||' vaults='||(SELECT count(*) FROM vaults)
-        ||' members='||(SELECT count(*) FROM vault_members)
-        ||' versions='||(SELECT count(*) FROM vault_versions);" | sed 's/^/    /'
-  docker exec "$CONTAINER" dropdb -U "$PGUSER" "$SCRATCH"
+
+  RESTORED="$(counts "$SCRATCH")" \
+    || die "the restored copy has no readable tables — the dump did not apply"
+
+  # ⚠️ Printed next to production, because a number on its own is not a result.
+  # A dump that restores to zero rows prints "dry run complete" just as happily as
+  # a good one, and that is exactly the reassurance an untested backup gives you.
+  LIVE="$(counts "$PGDB")" || LIVE="(could not read $PGDB)"
+
+  log "restored copy: $RESTORED"
+  log "production:    $LIVE"
+
+  case "$RESTORED" in
+    *"users=0"*) die "the restored copy has no users — this dump would not bring the service back" ;;
+  esac
+
   log "dry run complete — production untouched"
+  log "⚠️ Small differences from production are expected: the dump is older than now."
   exit 0
 fi
 
