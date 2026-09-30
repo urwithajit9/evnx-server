@@ -394,10 +394,42 @@ transient database blip must not make deploy drift unreadable.
 
 ```
 URL       https://api.evnx.dev/health/ready
-Interval  5 minutes (UptimeRobot free) / 3 minutes (BetterStack free)
 Expect    HTTP 200
-Alert     after 2 consecutive failures, so one blip is not a page
 ```
+
+#### What the free tiers actually give you (checked 2026-09-30)
+
+**UptimeRobot — Free, $0/month, no card:**
+
+| | |
+|---|---|
+| Monitors | 50 |
+| Interval | **5 minutes** |
+| Types | HTTP, port, ping, keyword, API, UDP |
+| Also | multi-location checks, slow-response alerts, SSL and domain-expiry monitors, full status pages |
+| ⚠️ Integrations | **only 5** |
+| ⚠️ Seats | notify-only seats unavailable; no login seats — one person, one login |
+
+⚠️ **Do the arithmetic before choosing an alert threshold.** A 5-minute interval with
+"alert after 2 consecutive failures" means **10 to 15 minutes** before anyone is told.
+That is still far better than the current state, where an outage is noticed by a user,
+but it is not a number to assume rather than know.
+
+The sensible split, given two monitors at different intervals:
+
+* **UptimeRobot — alert on the first failure.** Fastest signal, and the 5-minute
+  interval already provides the delay that a "wait for 2" rule is usually buying.
+* **BetterStack — alert after two.** Slower and more certain, so it confirms rather
+  than duplicates.
+
+Send them to **different channels** — one to email, one to the phone. Two monitors
+pointed at the same inbox produce two identical pages for one blip, and the usual
+outcome is that both get muted, leaving you with nothing while believing you have two.
+
+⚠️ The 5-integration cap is per account, not per monitor, and the SSL and
+domain-expiry monitors are worth one each: `api.evnx.dev`, `app.evnx.dev` and
+`evnx.dev` all have certificates that expire.
+
 
 Running both is not redundant in the way it looks: a monitoring service can itself
 be down or misconfigured, and the second one is what tells you the first stopped
@@ -406,7 +438,7 @@ becomes noise and both get muted.
 
 ### Healthchecks.io — the dead man's switch
 
-Create a check named `evnx-backup`, period **1 day**, grace **2 hours** (the timer
+Create a check named `evnx-backups`, period **1 day**, grace **2 hours** (the timer
 fires around 03:00 with systemd's randomised delay). Copy its ping URL into
 `.env.prod`:
 
@@ -419,9 +451,28 @@ uploaded and passed its content check, and `/fail` on any `die`. Unset, every pi
 a no-op and the backup behaves exactly as before; a ping that fails is swallowed,
 because a monitoring outage must never turn a successful backup into a failed one.
 
-Test it by making a run fail on purpose — `ENV_FILE=/nonexistent ./scripts/backup.sh`
-— and confirming the alert arrives. **An untested alarm is worth as much as an
-untested backup.**
+Test it by making a run fail on purpose, and confirm the alert arrives. **An untested
+alarm is worth as much as an untested backup.**
+
+```bash
+BACKUP_BUCKET=definitely-not-a-bucket ./scripts/backup.sh   # fails at the preflight
+sudo systemctl start evnx-backup.service                    # then clear it
+```
+
+⚠️ **Use that form, not `ENV_FILE=/nonexistent`.** The latter dies before
+`.env.prod` is read, so `BACKUP_HEALTHCHECK_URL` is still empty and **no `/fail` ping
+is sent** — the run exits 1 and the check stays green, which tests the exit code and
+nothing else. Failing at the preflight happens after the config loads, so the ping
+goes out.
+
+⚠️ And run the second command. A failure test leaves the check **red** until a
+successful run clears it, and a check that is already red cannot tell you about the
+next real failure.
+
+That the first form does not ping is not a gap, incidentally: if `.env.prod` really
+became unreadable at 03:00 there would be no ping at all, and Healthchecks.io alarms
+on the **absence** after the grace period. The `/fail` ping only makes the alarm
+faster; the absence is what makes it certain.
 
 ⚠️ Treat the ping URL as a credential: anyone holding it can silence the alarm by
 pinging it themselves.
