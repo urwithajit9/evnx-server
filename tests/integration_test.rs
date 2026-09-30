@@ -4487,3 +4487,183 @@ async fn a_deleted_vault_does_not_block_a_rotation() {
     assert_eq!(resp.json::<serde_json::Value>()["vaults_rewrapped"], 1);
     assert!(try_srp_login(&server, &email, &next).await.is_some());
 }
+
+// ─── Deleting a version — D19 ─────────────────────────────────────────────────
+//
+// ⚠️ These exist because the version quota refused a push with "Delete older
+// versions of this vault to make room" while there was no way to delete a version.
+// The limit and the remedy have to stay true together, so the quota test below is
+// the one that matters: it pushes to the limit, deletes, and pushes again.
+
+/// Push one version. Returns the status so a refusal can be asserted.
+async fn push_one(server: &TestServer, jwt: &str, vault: Uuid, base_version: i32) -> StatusCode {
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault}/versions")),
+        jwt,
+    )
+    .json(&serde_json::json!({
+        "nonce":        "AAAAAAAAAAAAAAAA",
+        "ciphertext":   "Zm9v",
+        "blob_hash":    blake3::hash(b"foo").to_hex().to_string(),
+        "key_names":    ["A"],
+        "key_count":    1,
+        "base_version": base_version,
+    }))
+    .await
+    .status_code()
+}
+
+async fn version_count(server: &TestServer, jwt: &str, vault: Uuid) -> usize {
+    bearer(server.get(&format!("/api/v1/vaults/{vault}/versions")), jwt)
+        .await
+        .json::<serde_json::Value>()["versions"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn an_old_version_can_be_deleted() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+
+    assert_eq!(push_one(&server, &jwt, vault, 0).await, StatusCode::CREATED);
+    assert_eq!(push_one(&server, &jwt, vault, 1).await, StatusCode::CREATED);
+    assert_eq!(version_count(&server, &jwt, vault).await, 2);
+
+    let resp = bearer(
+        server.delete(&format!("/api/v1/vaults/{vault}/versions/1")),
+        &jwt,
+    )
+    .await;
+    resp.assert_status_ok();
+    assert_eq!(resp.json::<serde_json::Value>()["deleted"], 1);
+    assert_eq!(version_count(&server, &jwt, vault).await, 1);
+}
+
+/// ⚠️ The invariant the rest of the system leans on: the latest version is the one
+/// most recently pushed. Deleting it would silently change what `cloud pull` and
+/// `cloud run` return — the next deploy would pick up older secrets with nobody
+/// having asked, and nothing in the output would say so.
+#[tokio::test]
+async fn the_latest_version_cannot_be_deleted() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+
+    assert_eq!(push_one(&server, &jwt, vault, 0).await, StatusCode::CREATED);
+    assert_eq!(push_one(&server, &jwt, vault, 1).await, StatusCode::CREATED);
+
+    let resp = bearer(
+        server.delete(&format!("/api/v1/vaults/{vault}/versions/2")),
+        &jwt,
+    )
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::CONFLICT);
+    assert!(
+        resp.text().contains("latest"),
+        "the refusal must say why: {}",
+        resp.text()
+    );
+    assert_eq!(version_count(&server, &jwt, vault).await, 2);
+}
+
+/// ⚠️ **The whole reason this endpoint exists.** The quota tells people to delete
+/// an old version to make room; this asserts that doing so actually makes room. If
+/// it ever stops being true, the error message becomes a lie again.
+#[tokio::test]
+async fn deleting_a_version_makes_room_under_the_quota() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+
+    // The default Free tier allows 5 versions per vault.
+    for base in 0..5 {
+        assert_eq!(
+            push_one(&server, &jwt, vault, base).await,
+            StatusCode::CREATED,
+            "push {} of 5 should be allowed",
+            base + 1
+        );
+    }
+
+    let refused = bearer(
+        server.post(&format!("/api/v1/vaults/{vault}/versions")),
+        &jwt,
+    )
+    .json(&serde_json::json!({
+        "nonce": "AAAAAAAAAAAAAAAA",
+        "ciphertext": "Zm9v",
+        "blob_hash": blake3::hash(b"foo").to_hex().to_string(),
+        "key_names": ["A"], "key_count": 1, "base_version": 5,
+    }))
+    .await;
+    assert_eq!(refused.status_code(), StatusCode::FORBIDDEN);
+
+    // ⚠️ The message must name something that exists. It said "delete older
+    // versions" for a while when nothing could.
+    let msg = refused.text();
+    assert!(
+        msg.contains("evnx cloud delete-version"),
+        "the quota refusal must name the command that resolves it: {msg}"
+    );
+
+    bearer(
+        server.delete(&format!("/api/v1/vaults/{vault}/versions/1")),
+        &jwt,
+    )
+    .await
+    .assert_status_ok();
+
+    // The latest is still 5, so that is what a push bases on — deleting an old
+    // version frees a slot without renumbering anything.
+    assert_eq!(
+        push_one(&server, &jwt, vault, 5).await,
+        StatusCode::CREATED,
+        "deleting a version must make room for another"
+    );
+}
+
+/// A developer adds history; removing it takes an admin. The blob goes from object
+/// storage and nothing brings it back.
+#[tokio::test]
+async fn a_developer_cannot_delete_a_version() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &owner_jwt).await;
+    assert_eq!(
+        push_one(&server, &owner_jwt, vault, 0).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        push_one(&server, &owner_jwt, vault, 1).await,
+        StatusCode::CREATED
+    );
+
+    let (_id, dev_jwt) = member_at(&server, &owner_jwt, vault, "developer").await;
+
+    let resp = bearer(
+        server.delete(&format!("/api/v1/vaults/{vault}/versions/1")),
+        &dev_jwt,
+    )
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+    assert_eq!(version_count(&server, &owner_jwt, vault).await, 2);
+}
+
+#[tokio::test]
+async fn deleting_a_version_that_does_not_exist_is_404() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+    assert_eq!(push_one(&server, &jwt, vault, 0).await, StatusCode::CREATED);
+    assert_eq!(push_one(&server, &jwt, vault, 1).await, StatusCode::CREATED);
+
+    let resp = bearer(
+        server.delete(&format!("/api/v1/vaults/{vault}/versions/99")),
+        &jwt,
+    )
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
+}

@@ -159,3 +159,34 @@ pub async fn all_version_nums(pool: &PgPool, vault_id: Uuid) -> Result<Vec<i32>,
     .await?;
     Ok(rows.into_iter().map(|r| r.version_num).collect())
 }
+
+/// Remove one version, returning its blob key so the caller can free the object.
+///
+/// ⚠️ The blob key comes back from the same statement that deletes the row, rather
+/// than from a read before it. A `SELECT` then `DELETE` can disagree under
+/// concurrency — two callers both read the key, both delete, and the second frees
+/// an object the first already freed — while `RETURNING` reports exactly what this
+/// statement removed, or nothing if another caller got there first.
+///
+/// `None` means there was no such version. Nothing references `vault_versions`, so
+/// the row goes without cascade.
+pub async fn delete_by_num<'e, E>(
+    executor: E,
+    vault_id: Uuid,
+    version_num: i32,
+) -> Result<Option<String>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar!(
+        r#"
+        DELETE FROM vault_versions
+         WHERE vault_id = $1 AND version_num = $2
+        RETURNING blob_key
+        "#,
+        vault_id,
+        version_num,
+    )
+    .fetch_optional(executor)
+    .await
+}

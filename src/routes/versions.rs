@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::{
     db::versions,
     errors::AppError,
-    middleware::vault_role::{AtLeastDeveloper, AtLeastViewer, VaultAccess},
+    middleware::vault_role::{AtLeastAdmin, AtLeastDeveloper, AtLeastViewer, VaultAccess},
     state::AppState,
 };
 
@@ -257,4 +257,96 @@ pub async fn list_versions(
         .collect();
 
     Ok(Json(serde_json::json!({ "versions": list })))
+}
+
+// ─── Deleting a version ───────────────────────────────────────────────────────
+
+/// Remove one version of a vault, and its blob.
+///
+/// ─── Why this exists ─────────────────────────────────────────────────────────
+///
+/// ⚠️ It was written because the version quota refused a push with *"Delete older
+/// versions of this vault to make room"* while there was **no way to delete a
+/// version** — no endpoint, no command. A free-tier account that reached the limit
+/// could never push again, and the remedy the error named did not exist. An error
+/// message that advises an impossible action is worse than one that admits there is
+/// nothing to be done, because it sends people looking.
+///
+/// ─── Why an admin, and not whoever can push ──────────────────────────────────
+///
+/// A developer can add history; removing it takes an admin. Pushing is additive and
+/// recoverable — the previous version is still there. This is neither: the blob goes
+/// from object storage and no server-side action brings it back, because the server
+/// never held anything that could reconstruct it.
+///
+/// ─── Why the latest version cannot be deleted ────────────────────────────────
+///
+/// `cloud pull` and `cloud run` fetch the latest. Deleting it would silently change
+/// what every consumer of this vault receives — the next deploy would pick up older
+/// secrets with nobody having asked for that, and nothing in the output would say
+/// so. Refusing keeps one invariant that the rest of the system leans on: the latest
+/// version is the one that was most recently pushed.
+///
+/// It also costs nothing. The limit is reached by accumulating old versions, so
+/// making room only ever means deleting old ones.
+pub async fn delete_version(
+    State(state): State<AppState>,
+    access: VaultAccess<AtLeastAdmin>,
+    Path((_vault_id, version_num)): Path<(Uuid, i32)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let VaultAccess {
+        vault_id, user_id, ..
+    } = access;
+
+    let latest = versions::get_latest_version_num(&state.db, vault_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    if version_num == latest {
+        return Err(AppError::Conflict(format!(
+            "version {version_num} is the latest, and deleting it would change what \
+             `evnx cloud pull` returns without anyone asking. Push a newer version \
+             first, or delete the whole vault. Nothing has been changed."
+        )));
+    }
+
+    let blob_key = versions::delete_by_num(&state.db, vault_id, version_num)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    // Recorded before the blob goes, and awaited rather than spawned: this is the
+    // only remaining evidence that the version existed at all.
+    if let Err(e) = crate::services::audit::record(
+        &state.db,
+        crate::services::audit::AuditEvent {
+            vault_id: Some(vault_id),
+            user_id: Some(user_id),
+            event_type: "version_deleted".into(),
+            ip_hash: None,
+            user_agent_hash: None,
+            metadata: Some(serde_json::json!({ "version_num": version_num })),
+        },
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "could not record a version deletion");
+    }
+
+    // ⚠️ After the row, and best-effort. The other order is worse: freeing the blob
+    // first and then failing the row delete leaves a version that cannot be
+    // downloaded and looks fine in every listing. An orphaned object is wasted
+    // bytes; a version pointing at nothing is a lie. Same trade as `delete_account`.
+    if let Err(e) = state.storage.delete_blob(&blob_key).await {
+        tracing::warn!(
+            error = %e,
+            "version deleted, but its blob could not be removed from storage"
+        );
+    }
+
+    tracing::info!(%vault_id, version_num, "version deleted");
+
+    Ok(Json(serde_json::json!({
+        "deleted": version_num,
+        "latest":  latest,
+    })))
 }

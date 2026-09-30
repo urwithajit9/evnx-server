@@ -81,6 +81,11 @@ pub fn create_router(state: AppState) -> Router {
             get(versions::get_latest_version),
         )
         .route("/:vault_id/versions/:n/blob", get(versions::download_blob))
+        // ⚠️ Admin, not developer. A developer adds history; removing it — and the
+        // blob with it, irrecoverably — takes an admin. The endpoint exists because
+        // the version quota told people to delete old versions while there was no
+        // way to do so; see routes::versions::delete_version.
+        .route("/:vault_id/versions/:n", delete(versions::delete_version))
         // Re-keying. Blobs are staged one at a time, then one atomic swap —
         // see routes::rekey for why it cannot be a single request.
         .route("/:vault_id/rekey/blobs", post(rekey::stage_blob))

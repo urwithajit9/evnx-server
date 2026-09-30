@@ -266,7 +266,13 @@ pub async fn check_version_limit(
             "versions per vault",
             limit,
             plan,
-            "Delete older versions of this vault to make room.",
+            // ⚠️ This used to say "Delete older versions of this vault to make room"
+            // when there was no way to delete a version — no endpoint, no command. An
+            // error that advises an impossible action is worse than one admitting there
+            // is nothing to be done, because it sends people looking for a door that is
+            // not there. Both now exist; keep this sentence and that fact together.
+            "Delete an older version to make room: `evnx cloud history` lists them and \
+             `evnx cloud delete-version` removes one. The latest cannot be deleted.",
         ));
     }
     Ok(())

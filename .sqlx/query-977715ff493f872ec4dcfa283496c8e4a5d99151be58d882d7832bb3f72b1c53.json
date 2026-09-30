@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM vault_versions\n         WHERE vault_id = $1 AND version_num = $2\n        RETURNING blob_key\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "blob_key",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "977715ff493f872ec4dcfa283496c8e4a5d99151be58d882d7832bb3f72b1c53"
+}
