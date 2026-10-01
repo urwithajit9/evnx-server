@@ -95,6 +95,32 @@ sqlx migrate run
 sqlx migrate info
 ```
 
+### ⚠️ After adding or changing any `sqlx::query!`
+
+The offline cache in `.sqlx/` is what lets CI compile without a database
+(`SQLX_OFFLINE: true`). Regenerate it with **`--all-targets`**:
+
+```bash
+cargo sqlx prepare -- --all-targets
+```
+
+**The `-- --all-targets` is not optional.** Without it `cargo sqlx prepare`
+covers the library and binary only, so a `query!` added inside `tests/` is
+missing from the cache — and local `cargo build` still passes, because it does
+not compile tests either. CI then fails at `cargo clippy --all-targets` with
+*"`SQLX_OFFLINE=true` but there is no cached data for this query"*.
+
+That has happened. Verify the way CI does, not the way `cargo build` does:
+
+```bash
+cargo clean -p evnx-server
+env -u DATABASE_URL SQLX_OFFLINE=true cargo clippy --all-targets -- -D warnings
+```
+
+⚠️ The `cargo clean` matters. A warm `target/` can compile against artefacts
+built when `DATABASE_URL` was set, so the check passes locally and fails in CI
+on a cold runner.
+
 ### 4. Start the server
 
 ```bash
