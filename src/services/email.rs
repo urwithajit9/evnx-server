@@ -129,7 +129,8 @@ impl EmailService {
         to: &str,
         session_id: &str,
         when: chrono::DateTime<chrono::Utc>,
-        unrecognised: bool,
+        notable: bool,
+        reasons: &[&str],
     ) -> Result<(), EmailError> {
         // First segment of the UUID: enough to match against the session list,
         // short enough to read in a notification.
@@ -158,12 +159,11 @@ impl EmailService {
         // digest and a hash cannot be geolocated, so evnx has no location to
         // report. Someone on a mobile network gets a different digest from the
         // same sofa, and the copy must not imply otherwise.
-        let (subject, heading, lead) = if unrecognised {
+        let (subject, heading, lead) = if notable {
             (
-                "New sign-in to evnx — a device we don't recognise",
-                "New sign-in from a device we don't recognise",
-                "<p>Your account was signed into on <strong>{when}</strong> from a \
-                 network and browser we have not seen on this account before.</p>",
+                "New sign-in to evnx — something looked unusual",
+                "New sign-in that looked unusual",
+                "<p>Your account was signed into on <strong>{when}</strong>.</p>",
             )
         } else {
             (
@@ -174,24 +174,39 @@ impl EmailService {
         };
         let lead = lead.replace("{when}", &when.format("%d %b %Y at %H:%M UTC").to_string());
 
-        let reassurance = if unrecognised {
-            r#"If this was you, there is nothing to do — you will stop seeing this
-                wording once we have seen this device before. evnx cannot see
-                <em>where</em> a sign-in came from: client addresses are hashed before
-                they are stored, so this is "not seen before", never a location."#
+        // ⚠️ The email is built from the **reasons**, not the score. A number
+        // cannot be argued with or acted on; "the network and browser are both
+        // new to this account" can. The score decides whether to say anything;
+        // these decide what.
+        let why = if notable && !reasons.is_empty() {
+            let items: String = reasons
+                .iter()
+                .map(|r| format!(r#"<li style="margin:4px 0">{r}</li>"#))
+                .collect();
+            format!(r#"<ul style="color:#E6EDF3;padding-left:20px;margin:14px 0">{items}</ul>"#)
+        } else {
+            String::new()
+        };
+
+        let reassurance = if notable {
+            r#"If this was you, there is nothing to do. evnx cannot see <em>where</em>
+                a sign-in came from — client addresses are hashed before they are
+                stored — so nothing above is a location, and a different network can
+                simply mean a phone that reconnected."#
         } else {
             r#"If this was you, nothing to do. evnx cannot see where a sign-in came
                 from — client addresses are hashed before they are stored — so this
                 notice carries the session rather than a location."#
         };
 
-        let heading_colour = if unrecognised { "#D29922" } else { "#E8652A" };
+        let heading_colour = if notable { "#D29922" } else { "#E8652A" };
 
         let html = format!(
             r#"
             <div style="font-family:ui-monospace,monospace;max-width:560px;margin:40px auto;padding:32px;background:#0d1117;color:#E6EDF3;border-radius:12px;border:1px solid #30363d">
               <h2 style="color:{heading_colour};margin-top:0">{heading}</h2>
               {lead}
+              {why}
               <p style="color:#8B949E">Session <code>{short}</code></p>
               {action}
               <p style="margin-top:24px;color:#8B949E;font-size:12px">

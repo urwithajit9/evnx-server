@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            (SELECT count(*) FROM audit_events\n               WHERE user_id = $1 AND event_type = 'login_locked'\n                 AND created_at > NOW() - INTERVAL '7 days') AS \"lockouts!\",\n            (SELECT max(created_at) FROM audit_events\n               WHERE user_id = $1 AND event_type = 'login') AS \"last_login\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "lockouts!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "last_login",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "5375e261673da62e90252be9a3ff60d797904f8e970163c0088de13aecf78624"
+}

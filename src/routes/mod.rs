@@ -10,6 +10,7 @@ use axum::{
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 pub mod auth;
+pub mod devices;
 pub mod export;
 pub mod master_key;
 pub mod members;
@@ -172,6 +173,18 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/tokens/:token_id", delete(tokens::revoke_token))
         // Sessions. The login-alert email points users here.
+        // ── Devices ─────────────────────────────────────────────────────────
+        //
+        // ⚠️ Beside sessions, and deliberately not merged with them. A session
+        // is a live credential you can revoke; a device is an origin you have
+        // signed in from, which may have no session left at all. Disavowing one
+        // revokes *every* session and is a different act from revoking one.
+        //
+        // `require_user_session`, like the rest of account management: a CI
+        // token must not be able to enumerate where its owner signs in from,
+        // nor to sign them out everywhere.
+        .route("/devices", get(devices::list_devices))
+        .route("/devices/disavow", post(devices::disavow_device))
         .route("/sessions", get(sessions::list_sessions))
         .route("/sessions/others", delete(sessions::revoke_other_sessions))
         .route("/sessions/:session_id", delete(sessions::revoke_session))

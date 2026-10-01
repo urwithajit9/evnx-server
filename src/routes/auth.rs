@@ -562,9 +562,9 @@ pub async fn srp_verify(
     // A mail outage must not fail a login, and awaiting delivery would let
     // response timing say something about the account. Same discipline as the
     // verification email on register.
-    // ⚠️ Before `record_login`, which is spawned — see `looks_unrecognised`.
-    let unrecognised = looks_unrecognised(&state, user_id, &client).await;
-    notify_new_login(&state, &user.email, session_id, unrecognised);
+    // ⚠️ Before `record_login`, which is spawned — see `assess`.
+    let risk = assess(&state, user_id, &client, "password").await;
+    notify_new_login(&state, &user.email, session_id, &risk);
     record_login(&state, user_id, &client, "password");
 
     Ok(Json(SrpVerifyResponse {
@@ -841,30 +841,32 @@ pub(crate) fn fake_salt() -> String {
 /// over an empty set. Plumbing client addresses is only half the job; the other
 /// half is having a row to put one in.
 ///
-/// Is this login from an origin the account has not used before?
+/// How unusual does this login look, and why?
 ///
 /// ⚠️ **Must be called before `record_login`.** That write is spawned, so if
 /// this login's own row lands first the lookup matches itself and no login is
 /// ever new.
 ///
 /// A lookup failure is **not** an alarm. A database hiccup must not tell
-/// someone their account was accessed from somewhere strange, so an error here
-/// degrades to the ordinary wording and is logged.
-async fn looks_unrecognised(state: &AppState, user_id: Uuid, client: &ClientContext) -> bool {
-    match crate::services::audit::login_familiarity(
+/// someone their account was accessed from somewhere strange, so an error
+/// degrades to "nothing unusual" and is logged.
+///
+/// ⚠️ The result never blocks the login. It chooses wording, and that is the
+/// whole of its authority — see the note above `RiskReason`.
+async fn assess(
+    state: &AppState,
+    user_id: Uuid,
+    client: &ClientContext,
+    method: &str,
+) -> crate::services::audit::LoginRisk {
+    crate::services::audit::assess_login(
         &state.db,
         user_id,
         client.ip_hash.as_deref(),
         client.user_agent_hash.as_deref(),
+        method,
     )
     .await
-    {
-        Ok(f) => f.is_unrecognised(),
-        Err(e) => {
-            tracing::warn!(error = %e, "could not check login familiarity");
-            false
-        }
-    }
 }
 
 /// Spawned, like the alert: a slow insert must not sit in the login's response
@@ -907,13 +909,20 @@ fn record_login(state: &AppState, user_id: Uuid, client: &ClientContext, method:
 /// guaranteed — and if this login's own row lands first, the lookup matches
 /// itself and nothing is ever new. The caller does the lookup; this only
 /// delivers the verdict.
-fn notify_new_login(state: &AppState, email: &str, session_id: Uuid, unrecognised: bool) {
+fn notify_new_login(
+    state: &AppState,
+    email: &str,
+    session_id: Uuid,
+    risk: &crate::services::audit::LoginRisk,
+) {
     let mail = state.email.clone();
     let to = email.to_string();
     let when = chrono::Utc::now();
+    let notable = risk.is_notable();
+    let reasons: Vec<&'static str> = risk.sentences();
     tokio::spawn(async move {
         if let Err(e) = mail
-            .send_login_alert(&to, &session_id.to_string(), when, unrecognised)
+            .send_login_alert(&to, &session_id.to_string(), when, notable, &reasons)
             .await
         {
             tracing::warn!(%session_id, "could not send the login alert: {e}");
@@ -1229,6 +1238,10 @@ pub async fn totp_verify_login(
     // the common case and costs nothing — then fall back to redeeming a code.
     // Redemption is a single atomic UPDATE, so two concurrent logins cannot spend
     // the same code.
+    // Carried out of the match so the alert can say which factor was used.
+    // ⚠️ Falling back to a recovery code means the authenticator is gone —
+    // lost phone, or not the owner. Worth saying in the email either way.
+    let mut used_backup_code = false;
     let outcome = match verify_totp_code(&secret_base32, code) {
         Ok(()) => Ok(()),
         Err(_) => {
@@ -1237,6 +1250,7 @@ pub async fn totp_verify_login(
                     user_id = %user_id,
                     "Login used a TOTP recovery code"
                 );
+                used_backup_code = true;
                 Ok(())
             } else {
                 Err(AppError::Unauthorized)
@@ -1260,9 +1274,18 @@ pub async fn totp_verify_login(
             // The second factor is where a 2FA login actually completes, so the
             // alert belongs here rather than after the password step.
             // ⚠️ Before `record_login`, which is spawned.
-            let unrecognised = looks_unrecognised(&state, user_id, &client).await;
-            notify_new_login(&state, &user.email, session_id, unrecognised);
-            record_login(&state, user_id, &client, "password+totp");
+            //
+            // The method string reaches the scorer, which treats a recovery
+            // code differently from an authenticator — someone falling back to
+            // one has lost their phone, or is not the owner.
+            let method = if used_backup_code {
+                "password+backup_code"
+            } else {
+                "password+totp"
+            };
+            let risk = assess(&state, user_id, &client, method).await;
+            notify_new_login(&state, &user.email, session_id, &risk);
+            record_login(&state, user_id, &client, method);
 
             let backup_codes_remaining = db_totp::remaining(&state.db, user_id).await?;
             Ok(Json(serde_json::json!({

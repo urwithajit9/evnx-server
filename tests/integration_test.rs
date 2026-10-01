@@ -5716,3 +5716,285 @@ async fn a_lockout_writes_exactly_one_row_however_many_attempts() {
 
     assert_eq!(rows, 1, "seven attempts must leave one row, not seven");
 }
+
+// ─── Chain 2 Slice B + C — devices, disavowal, scoring ────────────────────────
+
+#[tokio::test]
+async fn devices_and_disavowal_require_a_user_session() {
+    let server = test_app().await;
+
+    // No credential at all.
+    assert_eq!(
+        server.get("/api/v1/auth/devices").await.status_code(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        server
+            .post("/api/v1/auth/devices/disavow")
+            .json(&serde_json::json!({ "device_id": "abc" }))
+            .await
+            .status_code(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// ⚠️ A CI token must not be able to enumerate where its owner signs in from,
+/// nor to sign them out everywhere.
+///
+/// `require_user_session` answers 403 for a valid API token — a different
+/// credential *type*, deliberately distinct from 401 "not recognised".
+#[tokio::test]
+async fn an_api_token_cannot_read_or_disavow_devices() {
+    let server = test_app().await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    let user_id = seed_user(&server, &db, "dev-token").await;
+
+    // Mint a token row directly; the shape is what the guard inspects.
+    let raw = format!("evnx_tok_{}", Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO api_tokens (user_id, name, token_hash, scope)
+         VALUES ($1, 'ci', $2, 'read_write')",
+    )
+    .bind(user_id)
+    .bind(blake3::hash(raw.as_bytes()).to_hex().to_string())
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let r = bearer(server.get("/api/v1/auth/devices"), &raw).await;
+    assert_eq!(
+        r.status_code(),
+        StatusCode::FORBIDDEN,
+        "an API token is the wrong credential type here, not an unknown one"
+    );
+}
+
+/// Sign-ins from one origin collapse into a single device row.
+#[tokio::test]
+async fn repeat_sign_ins_from_one_origin_are_one_device() {
+    let server = test_app().await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    let user_id = seed_user(&server, &db, "dev-group").await;
+
+    for _ in 0..3 {
+        seed_login(&db, user_id, Some("ip-A"), Some("agent-A")).await;
+    }
+    seed_login(&db, user_id, Some("ip-B"), Some("agent-B")).await;
+
+    let rows = sqlx::query!(
+        r#"SELECT ip_hash, count(*) AS "n!" FROM audit_events
+           WHERE user_id = $1 AND event_type = 'login'
+           GROUP BY ip_hash, user_agent_hash"#,
+        user_id
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "four sign-ins from two origins is two devices"
+    );
+    let counts: Vec<i64> = {
+        let mut c: Vec<i64> = rows.iter().map(|r| r.n).collect();
+        c.sort_unstable();
+        c
+    };
+    assert_eq!(counts, vec![1, 3]);
+}
+
+/// ⚠️ **The loop that makes Slice C possible at all.**
+///
+/// Disavow an origin, then assess a login from that same origin. Without the
+/// label there is no signal stronger than inference; with it, the score is
+/// dominated by something a person actually said.
+#[tokio::test]
+async fn a_disavowed_origin_dominates_the_next_assessment() {
+    let server = test_app().await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    let user_id = seed_user(&server, &db, "dev-label").await;
+
+    // A familiar origin: signed in from before, so inference alone says fine.
+    seed_login(&db, user_id, Some("ip-X"), Some("agent-X")).await;
+
+    let before = evnx_server::services::audit::assess_login(
+        &db,
+        user_id,
+        Some("ip-X"),
+        Some("agent-X"),
+        "password",
+    )
+    .await;
+    assert!(
+        !before.is_notable(),
+        "a familiar origin should look ordinary before anyone says otherwise"
+    );
+
+    // The account holder says it was not them.
+    evnx_server::services::audit::record(
+        &db,
+        evnx_server::services::audit::AuditEvent {
+            vault_id: None,
+            user_id: Some(user_id),
+            event_type: "device_disavowed".into(),
+            ip_hash: Some("ip-X".into()),
+            user_agent_hash: Some("agent-X".into()),
+            metadata: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let after = evnx_server::services::audit::assess_login(
+        &db,
+        user_id,
+        Some("ip-X"),
+        Some("agent-X"),
+        "password",
+    )
+    .await;
+
+    assert!(
+        after.is_notable(),
+        "an origin the owner disavowed must not read as ordinary again"
+    );
+    assert_eq!(
+        after.headline(),
+        Some(evnx_server::services::audit::RiskReason::PreviouslyDisavowed),
+        "testimony should outrank every inference"
+    );
+}
+
+/// A disavowal is scoped to the account that made it.
+#[tokio::test]
+async fn one_accounts_disavowal_does_not_affect_another() {
+    let server = test_app().await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    let alice = seed_user(&server, &db, "dev-iso-a").await;
+    let bob = seed_user(&server, &db, "dev-iso-b").await;
+
+    seed_login(&db, bob, Some("ip-S"), Some("agent-S")).await;
+    evnx_server::services::audit::record(
+        &db,
+        evnx_server::services::audit::AuditEvent {
+            vault_id: None,
+            user_id: Some(alice),
+            event_type: "device_disavowed".into(),
+            ip_hash: Some("ip-S".into()),
+            user_agent_hash: Some("agent-S".into()),
+            metadata: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let r = evnx_server::services::audit::assess_login(
+        &db,
+        bob,
+        Some("ip-S"),
+        Some("agent-S"),
+        "password",
+    )
+    .await;
+
+    assert!(
+        !r.reasons
+            .contains(&evnx_server::services::audit::RiskReason::PreviouslyDisavowed),
+        "Alice's judgement must not score Bob's login"
+    );
+}
+
+/// A recovery code is noticed, and alone is not an alarm.
+#[tokio::test]
+async fn a_recovery_code_is_scored_but_does_not_alarm_on_its_own() {
+    let server = test_app().await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    let user_id = seed_user(&server, &db, "dev-backup").await;
+    seed_login(&db, user_id, Some("ip-K"), Some("agent-K")).await;
+
+    let r = evnx_server::services::audit::assess_login(
+        &db,
+        user_id,
+        Some("ip-K"),
+        Some("agent-K"),
+        "password+backup_code",
+    )
+    .await;
+
+    assert!(r
+        .reasons
+        .contains(&evnx_server::services::audit::RiskReason::BackupCodeUsed));
+    assert!(
+        !r.is_notable(),
+        "a known device plus a recovery code is a lost phone, not an intrusion"
+    );
+}
+
+/// ⚠️ A first-ever login must not be called dormant.
+#[tokio::test]
+async fn a_brand_new_account_is_not_dormant() {
+    let server = test_app().await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    let user_id = seed_user(&server, &db, "dev-new").await;
+
+    let r = evnx_server::services::audit::assess_login(
+        &db,
+        user_id,
+        Some("ip-N"),
+        Some("agent-N"),
+        "password",
+    )
+    .await;
+
+    assert!(
+        !r.reasons
+            .contains(&evnx_server::services::audit::RiskReason::Dormant),
+        "never having signed in is not the same as not having signed in for a long time"
+    );
+}
+
+/// A recent lockout colours the next successful login.
+#[tokio::test]
+async fn a_recent_lockout_is_carried_into_the_next_login() {
+    let server = test_app().await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    let user_id = seed_user(&server, &db, "dev-lock").await;
+    seed_login(&db, user_id, Some("ip-L"), Some("agent-L")).await;
+
+    evnx_server::services::audit::record(
+        &db,
+        evnx_server::services::audit::AuditEvent {
+            vault_id: None,
+            user_id: Some(user_id),
+            event_type: "login_locked".into(),
+            ip_hash: Some("ip-attacker".into()),
+            user_agent_hash: Some("agent-attacker".into()),
+            metadata: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let r = evnx_server::services::audit::assess_login(
+        &db,
+        user_id,
+        Some("ip-L"),
+        Some("agent-L"),
+        "password",
+    )
+    .await;
+
+    assert!(
+        r.reasons
+            .contains(&evnx_server::services::audit::RiskReason::RecentLockout),
+        "someone signing in right after an attack on their account should be told"
+    );
+}

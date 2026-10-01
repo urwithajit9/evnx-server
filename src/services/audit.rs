@@ -343,3 +343,348 @@ mod familiarity_tests {
         );
     }
 }
+
+// ─── Chain 2 Slice C — scoring ────────────────────────────────────────────────
+//
+// ⚠️ Read this before changing a number below.
+//
+// This is a **rules engine written as a score**, not a model, and the
+// difference is not pedantry. There is no training set: nothing in
+// `audit_events` said which logins were fraudulent until Slice B began
+// recording disavowals, and until those accumulate every weight here is
+// reasoned rather than measured.
+//
+// Two consequences follow, and both are load-bearing:
+//
+//  1. **It never blocks.** The score picks wording in an email and an ordering
+//     in a list. It does not refuse a login, and must not be made to. A false
+//     positive that blocked one would lock someone out of a vault **the server
+//     cannot recover** — the key is wrapped under their master password and
+//     there is no reset. The failure costs are not symmetric and no threshold
+//     makes them so.
+//
+//  2. **Reasons travel with the score.** A bare number cannot be argued with,
+//     audited, or explained to the person it is about. Every caller gets the
+//     list of what fired, and the email is built from the reasons rather than
+//     from the total.
+
+/// Why a login looked unusual. Ordered strongest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskReason {
+    /// This exact origin was disavowed by the account holder.
+    ///
+    /// ⚠️ The only signal here that is **evidence rather than inference** — a
+    /// person said so. Weighted above everything else for that reason, and it
+    /// is the one signal that did not exist before Slice B.
+    PreviouslyDisavowed,
+    /// Neither the address digest nor the user-agent digest has been seen.
+    NewOrigin,
+    /// The account was locked out by failed password proofs in the recent past.
+    RecentLockout,
+    /// The second factor was a backup code rather than a TOTP code.
+    BackupCodeUsed,
+    /// No sign-in for a long time before this one.
+    Dormant,
+}
+
+impl RiskReason {
+    /// Weights, chosen by reasoning and spaced so the ordering is the point
+    /// rather than the arithmetic.
+    ///
+    /// ⚠️ `PreviouslyDisavowed` is **worth more than every other reason
+    /// combined**, and the test holds that rather than the number.
+    ///
+    /// It was 100 first, which happened to tie exactly with 40+30+20+10 — so
+    /// the stated intent ("nothing else needs to agree") was not actually true
+    /// of the arithmetic. Four inferences adding up to the same weight as one
+    /// person saying "that was not me" gets the epistemics backwards: the
+    /// others are guesses about behaviour, this is testimony from the only
+    /// party who knows.
+    pub fn weight(self) -> u32 {
+        match self {
+            RiskReason::PreviouslyDisavowed => 500,
+            RiskReason::NewOrigin => 40,
+            RiskReason::RecentLockout => 30,
+            RiskReason::BackupCodeUsed => 20,
+            RiskReason::Dormant => 10,
+        }
+    }
+
+    /// One clause, written for the person whose account it is.
+    ///
+    /// ⚠️ Every one of these stays inside what the architecture knows. None
+    /// mentions a place, because `ip_hash` is a keyed digest and a hash cannot
+    /// be geolocated.
+    pub fn sentence(self) -> &'static str {
+        match self {
+            RiskReason::PreviouslyDisavowed => {
+                "this is a device you previously told us was not you"
+            }
+            RiskReason::NewOrigin => "the network and browser are both new to this account",
+            RiskReason::RecentLockout => {
+                "this account was locked recently after repeated failed passwords"
+            }
+            RiskReason::BackupCodeUsed => "a recovery code was used instead of your authenticator",
+            RiskReason::Dormant => "there had been no sign-in for a long time",
+        }
+    }
+}
+
+/// How unusual a login looked, and why.
+#[derive(Debug, Clone, Default)]
+pub struct LoginRisk {
+    pub reasons: Vec<RiskReason>,
+}
+
+/// Score at which the alert changes its wording.
+///
+/// ⚠️ Set so that **`NewOrigin` alone reaches it** — that is Slice A's
+/// behaviour, and Slice C must not quietly make the product less talkative than
+/// it was yesterday. Everything else raises the score above the line rather
+/// than across it.
+pub const NOTABLE_SCORE: u32 = 40;
+
+impl LoginRisk {
+    pub fn score(&self) -> u32 {
+        self.reasons.iter().map(|r| r.weight()).sum()
+    }
+
+    /// Worth changing the email for.
+    pub fn is_notable(&self) -> bool {
+        self.score() >= NOTABLE_SCORE
+    }
+
+    /// The strongest reason, for a subject line that has room for one.
+    pub fn headline(&self) -> Option<RiskReason> {
+        self.reasons.iter().copied().max_by_key(|r| r.weight())
+    }
+
+    pub fn sentences(&self) -> Vec<&'static str> {
+        let mut rs = self.reasons.clone();
+        rs.sort_by_key(|r| std::cmp::Reverse(r.weight()));
+        rs.into_iter().map(|r| r.sentence()).collect()
+    }
+}
+
+/// How long without a sign-in counts as dormant.
+///
+/// 90 days: long enough that "I forgot I had this" is the common reading, short
+/// enough to still be inside a quarterly rotation. ⚠️ Weighted lowest of the
+/// five because, alone, it describes an ordinary user rather than an attack.
+const DORMANT_DAYS: i64 = 90;
+
+/// Assess a login against everything the architecture can see.
+///
+/// ⚠️ **Call before `record_login`.** Every query here reads prior rows, and
+/// the write is spawned — if this login's own row lands first it matches
+/// itself and nothing is ever unusual.
+///
+/// A failure degrades to "nothing unusual" and is logged. A database hiccup
+/// must not tell someone their account was accessed by a stranger.
+pub async fn assess_login(
+    pool: &PgPool,
+    user_id: Uuid,
+    ip_hash: Option<&str>,
+    user_agent_hash: Option<&str>,
+    method: &str,
+) -> LoginRisk {
+    let mut reasons = Vec::new();
+
+    match login_familiarity(pool, user_id, ip_hash, user_agent_hash).await {
+        Ok(f) if f.is_unrecognised() => reasons.push(RiskReason::NewOrigin),
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "could not check login familiarity");
+            // ⚠️ Returning early rather than scoring on partial information.
+            // A half-assessed login reported as ordinary is better than one
+            // reported as alarming because a query failed.
+            return LoginRisk::default();
+        }
+    }
+
+    // The label from Slice B. Matched on the digests themselves, so it survives
+    // the device list being paginated or pruned.
+    match sqlx::query!(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM audit_events
+            WHERE user_id = $1
+              AND event_type = 'device_disavowed'
+              AND ip_hash IS NOT DISTINCT FROM $2
+              AND user_agent_hash IS NOT DISTINCT FROM $3
+        ) AS "disavowed!"
+        "#,
+        user_id,
+        ip_hash,
+        user_agent_hash,
+    )
+    .fetch_one(pool)
+    .await
+    {
+        Ok(r) if r.disavowed => reasons.push(RiskReason::PreviouslyDisavowed),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "could not check disavowals"),
+    }
+
+    // Lockouts and dormancy, from the same table in one pass.
+    match sqlx::query!(
+        r#"
+        SELECT
+            (SELECT count(*) FROM audit_events
+               WHERE user_id = $1 AND event_type = 'login_locked'
+                 AND created_at > NOW() - INTERVAL '7 days') AS "lockouts!",
+            (SELECT max(created_at) FROM audit_events
+               WHERE user_id = $1 AND event_type = 'login') AS "last_login"
+        "#,
+        user_id,
+    )
+    .fetch_one(pool)
+    .await
+    {
+        Ok(r) => {
+            if r.lockouts > 0 {
+                reasons.push(RiskReason::RecentLockout);
+            }
+            // ⚠️ `None` is a first login, not a dormant one. Treating "never"
+            // as "a very long time" would mark every new account dormant.
+            if let Some(last) = r.last_login {
+                if (chrono::Utc::now() - last).num_days() >= DORMANT_DAYS {
+                    reasons.push(RiskReason::Dormant);
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "could not read lockout or dormancy history"),
+    }
+
+    if method.contains("backup") {
+        reasons.push(RiskReason::BackupCodeUsed);
+    }
+
+    LoginRisk { reasons }
+}
+
+#[cfg(test)]
+mod risk_tests {
+    use super::*;
+
+    fn risk(rs: &[RiskReason]) -> LoginRisk {
+        LoginRisk {
+            reasons: rs.to_vec(),
+        }
+    }
+
+    /// ⚠️ Slice C must not make the product quieter than Slice A was.
+    ///
+    /// A new origin alone changed the email yesterday. If the threshold were
+    /// set above `NewOrigin`'s weight, shipping the scorer would silently stop
+    /// alerts people had already started relying on.
+    #[test]
+    fn a_new_origin_alone_still_changes_the_email() {
+        assert!(risk(&[RiskReason::NewOrigin]).is_notable());
+    }
+
+    #[test]
+    fn nothing_unusual_is_not_notable() {
+        assert!(!risk(&[]).is_notable());
+    }
+
+    /// ⚠️ The weakest signal must not alarm on its own. Dormancy describes an
+    /// ordinary person returning to an account, not an attack.
+    #[test]
+    fn dormancy_alone_is_not_enough() {
+        assert!(!risk(&[RiskReason::Dormant]).is_notable());
+    }
+
+    #[test]
+    fn a_backup_code_alone_is_not_enough() {
+        assert!(!risk(&[RiskReason::BackupCodeUsed]).is_notable());
+    }
+
+    /// Two weak signals together are worth a word, where either alone is not.
+    #[test]
+    fn weak_signals_accumulate() {
+        assert!(!risk(&[RiskReason::Dormant]).is_notable());
+        assert!(!risk(&[RiskReason::BackupCodeUsed]).is_notable());
+        assert!(risk(&[
+            RiskReason::Dormant,
+            RiskReason::RecentLockout,
+            RiskReason::BackupCodeUsed
+        ])
+        .is_notable());
+    }
+
+    /// ⚠️ The one signal that is evidence rather than inference.
+    ///
+    /// A person said this origin was not them. Nothing else needs to agree,
+    /// and it must outrank every other reason in the subject line.
+    #[test]
+    fn a_disavowed_origin_outranks_everything() {
+        let r = risk(&[RiskReason::PreviouslyDisavowed]);
+        assert!(r.is_notable());
+        assert!(
+            r.score()
+                > RiskReason::NewOrigin.weight()
+                    + RiskReason::RecentLockout.weight()
+                    + RiskReason::BackupCodeUsed.weight()
+                    + RiskReason::Dormant.weight(),
+            "a disavowal must outweigh every inferred signal combined"
+        );
+
+        let mixed = risk(&[
+            RiskReason::Dormant,
+            RiskReason::PreviouslyDisavowed,
+            RiskReason::NewOrigin,
+        ]);
+        assert_eq!(mixed.headline(), Some(RiskReason::PreviouslyDisavowed));
+    }
+
+    #[test]
+    fn reasons_are_ordered_strongest_first() {
+        let r = risk(&[
+            RiskReason::Dormant,
+            RiskReason::NewOrigin,
+            RiskReason::PreviouslyDisavowed,
+        ]);
+        assert_eq!(
+            r.sentences(),
+            vec![
+                RiskReason::PreviouslyDisavowed.sentence(),
+                RiskReason::NewOrigin.sentence(),
+                RiskReason::Dormant.sentence(),
+            ]
+        );
+    }
+
+    /// ⚠️ Nothing the user reads may claim a location.
+    ///
+    /// `ip_hash` is a keyed digest and a hash cannot be geolocated. This is the
+    /// test that stops a well-meaning copy edit from introducing a claim the
+    /// architecture cannot support.
+    #[test]
+    fn no_reason_claims_a_place() {
+        let forbidden = [
+            "location",
+            "country",
+            "city",
+            "region",
+            "where you",
+            "near ",
+            "travel",
+        ];
+        for r in [
+            RiskReason::PreviouslyDisavowed,
+            RiskReason::NewOrigin,
+            RiskReason::RecentLockout,
+            RiskReason::BackupCodeUsed,
+            RiskReason::Dormant,
+        ] {
+            let s = r.sentence().to_lowercase();
+            for word in forbidden {
+                assert!(
+                    !s.contains(word),
+                    "{r:?} implies a place evnx cannot know: {s:?} contains {word:?}"
+                );
+            }
+        }
+    }
+}

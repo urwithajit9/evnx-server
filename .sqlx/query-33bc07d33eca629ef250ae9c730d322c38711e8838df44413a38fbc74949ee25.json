@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT EXISTS (\n            SELECT 1 FROM audit_events\n            WHERE user_id = $1\n              AND event_type = 'device_disavowed'\n              AND ip_hash IS NOT DISTINCT FROM $2\n              AND user_agent_hash IS NOT DISTINCT FROM $3\n        ) AS \"disavowed!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "disavowed!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "33bc07d33eca629ef250ae9c730d322c38711e8838df44413a38fbc74949ee25"
+}
