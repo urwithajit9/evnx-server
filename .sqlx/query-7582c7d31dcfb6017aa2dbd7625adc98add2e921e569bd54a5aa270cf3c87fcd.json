@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            EXISTS (\n                SELECT 1 FROM audit_events\n                WHERE user_id = $1 AND event_type = 'login' AND ip_hash = $2\n            ) AS \"known_ip!\",\n            EXISTS (\n                SELECT 1 FROM audit_events\n                WHERE user_id = $1 AND event_type = 'login' AND user_agent_hash = $3\n            ) AS \"known_agent!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "known_ip!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 1,
+        "name": "known_agent!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "7582c7d31dcfb6017aa2dbd7625adc98add2e921e569bd54a5aa270cf3c87fcd"
+}

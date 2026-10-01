@@ -47,6 +47,20 @@ pub struct Config {
     /// Behind `docker/Caddyfile` this must be `true`; the startup warning says so.
     pub trust_proxy_header: bool,
 
+    /// Key material for the audit IP / user-agent digests.
+    ///
+    /// ⚠️ **Separate from `JWT_SECRET` on purpose.** The digests were keyed off
+    /// `JWT_SECRET`, which made them stable — and made a JWT secret rotation
+    /// silently re-key every stored digest. That is a fair trade for an audit
+    /// column nobody compares; it is **not** a fair trade now that a login
+    /// alert says "we do not recognise this device", because the first login
+    /// after a rotation says that to *every user at once*, on the day the
+    /// operator is already dealing with whatever prompted the rotation.
+    ///
+    /// Unset, it falls back to `JWT_SECRET` so existing deployments keep
+    /// comparing against the rows they already have. Set it to decouple the two.
+    pub audit_hash_key: String,
+
     /// How long a master-key rotation can be undone, in hours.
     ///
     /// ⚠️ A security window, so an unparseable value fails startup rather than
@@ -193,6 +207,14 @@ impl Config {
         let resend_api_key = require!("RESEND_API_KEY");
         let email_from = require!("EMAIL_FROM");
 
+        // Resolved here rather than in the struct literal below, which moves
+        // `jwt_secret`. Falls back to it, so digests written before this setting
+        // existed stay comparable — see `middleware::client_ip`.
+        let audit_hash_key = env::var("AUDIT_HASH_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| jwt_secret.clone());
+
         if !missing.is_empty() {
             return Err(ConfigError::MissingVariables(
                 missing.iter().map(|s| s.to_string()).collect(),
@@ -335,6 +357,7 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty()),
             max_request_size_kb: optional!("MAX_REQUEST_SIZE_KB", "64").parse().unwrap_or(64),
+            audit_hash_key,
             trust_proxy_header: matches!(
                 optional!("TRUST_PROXY_HEADER", "false")
                     .trim()

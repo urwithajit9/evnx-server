@@ -5354,3 +5354,365 @@ async fn an_api_token_cannot_read_usage() {
         .await
         .assert_status(StatusCode::UNAUTHORIZED);
 }
+
+// ─── Chain 2 Slice A — login familiarity ───────────────────────────────────────
+//
+// The query behind "we don't recognise this device". Driven against real rows
+// rather than the full SRP dance, because what is under test is the comparison,
+// not the login — and the login paths already have their own tests.
+
+/// Insert a `login` row directly, standing in for a prior sign-in.
+async fn seed_login(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    ip_hash: Option<&str>,
+    agent_hash: Option<&str>,
+) {
+    evnx_server::services::audit::record(
+        db,
+        evnx_server::services::audit::AuditEvent {
+            vault_id: None,
+            user_id: Some(user_id),
+            event_type: "login".into(),
+            ip_hash: ip_hash.map(str::to_string),
+            user_agent_hash: agent_hash.map(str::to_string),
+            metadata: None,
+        },
+    )
+    .await
+    .expect("seed a login row");
+}
+
+/// A real user row, so the foreign key on `audit_events.user_id` is satisfied.
+async fn seed_user(server: &TestServer, db: &sqlx::PgPool, prefix: &str) -> Uuid {
+    let email = unique_email(prefix);
+    server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&email))
+        .await;
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(db)
+        .await
+        .expect("the registered user")
+}
+
+#[tokio::test]
+async fn an_account_with_no_history_has_nothing_to_compare_against() {
+    let server = test_app().await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    let user_id = seed_user(&server, &db, "fam-fresh").await;
+
+    let f = evnx_server::services::audit::login_familiarity(
+        &db,
+        user_id,
+        Some("ip-digest-1"),
+        Some("agent-digest-1"),
+    )
+    .await
+    .unwrap();
+
+    // ⚠️ The FIRST login of a new account is, strictly, from an unrecognised
+    // device — there is no history. That is correct and harmless: the alert is
+    // sent to the address that just registered, and saying "a device we don't
+    // recognise" about the very first sign-in is true.
+    assert!(!f.known_ip);
+    assert!(!f.known_agent);
+    assert!(
+        f.comparable,
+        "two digests were supplied, so it is comparable"
+    );
+    assert!(f.is_unrecognised());
+}
+
+#[tokio::test]
+async fn signing_in_again_from_the_same_origin_is_recognised() {
+    let server = test_app().await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    let user_id = seed_user(&server, &db, "fam-same").await;
+
+    seed_login(&db, user_id, Some("ip-A"), Some("agent-A")).await;
+
+    let f = evnx_server::services::audit::login_familiarity(
+        &db,
+        user_id,
+        Some("ip-A"),
+        Some("agent-A"),
+    )
+    .await
+    .unwrap();
+
+    assert!(f.known_ip && f.known_agent);
+    assert!(
+        !f.is_unrecognised(),
+        "the second sign-in from one machine must not alarm"
+    );
+}
+
+#[tokio::test]
+async fn a_second_machine_is_unrecognised() {
+    let server = test_app().await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    let user_id = seed_user(&server, &db, "fam-second").await;
+
+    seed_login(&db, user_id, Some("ip-A"), Some("agent-A")).await;
+
+    let f = evnx_server::services::audit::login_familiarity(
+        &db,
+        user_id,
+        Some("ip-B"),
+        Some("agent-B"),
+    )
+    .await
+    .unwrap();
+
+    assert!(f.is_unrecognised(), "a wholly new origin should alarm");
+}
+
+#[tokio::test]
+async fn a_browser_update_on_a_known_network_does_not_alarm() {
+    let server = test_app().await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    let user_id = seed_user(&server, &db, "fam-update").await;
+
+    seed_login(&db, user_id, Some("ip-A"), Some("agent-old")).await;
+
+    let f = evnx_server::services::audit::login_familiarity(
+        &db,
+        user_id,
+        Some("ip-A"),
+        Some("agent-new"),
+    )
+    .await
+    .unwrap();
+
+    assert!(f.known_ip && !f.known_agent);
+    assert!(
+        !f.is_unrecognised(),
+        "same network, updated browser — the commonest false positive there is"
+    );
+}
+
+/// ⚠️ The isolation that makes the whole signal mean anything.
+#[tokio::test]
+async fn another_users_history_does_not_count_as_yours() {
+    let server = test_app().await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    let alice = seed_user(&server, &db, "fam-alice").await;
+    let bob = seed_user(&server, &db, "fam-bob").await;
+
+    // A busy shared origin — an office, a VPN exit.
+    seed_login(&db, alice, Some("ip-shared"), Some("agent-shared")).await;
+
+    let f = evnx_server::services::audit::login_familiarity(
+        &db,
+        bob,
+        Some("ip-shared"),
+        Some("agent-shared"),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        f.is_unrecognised(),
+        "familiarity is per account — Alice's history must not vouch for Bob"
+    );
+}
+
+/// ⚠️ Only `login` rows count.
+///
+/// `push` and `pull` carry the same digests and are far more numerous. If they
+/// counted, a CI runner pulling all day would make its own origin familiar and
+/// a stolen token's first interactive sign-in would look routine.
+#[tokio::test]
+async fn a_pull_does_not_make_an_origin_familiar() {
+    let server = test_app().await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    let user_id = seed_user(&server, &db, "fam-pull").await;
+
+    evnx_server::services::audit::record(
+        &db,
+        evnx_server::services::audit::AuditEvent {
+            vault_id: None,
+            user_id: Some(user_id),
+            event_type: "pull".into(),
+            ip_hash: Some("ip-ci".into()),
+            user_agent_hash: Some("agent-ci".into()),
+            metadata: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let f = evnx_server::services::audit::login_familiarity(
+        &db,
+        user_id,
+        Some("ip-ci"),
+        Some("agent-ci"),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        f.is_unrecognised(),
+        "a pull must not vouch for an interactive sign-in"
+    );
+}
+
+#[tokio::test]
+async fn no_digests_at_all_is_not_an_alarm() {
+    let server = test_app().await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    let user_id = seed_user(&server, &db, "fam-none").await;
+
+    let f = evnx_server::services::audit::login_familiarity(&db, user_id, None, None)
+        .await
+        .unwrap();
+
+    assert!(!f.comparable);
+    assert!(
+        !f.is_unrecognised(),
+        "a client behind no proxy and sending no user agent must not alarm on every login"
+    );
+}
+
+// ─── D24 — the SRP lockout must not say which addresses exist ──────────────────
+
+/// Five bad proofs then two more, against one live session, returning the
+/// status of each. A failed `/srp/verify` deliberately leaves the session
+/// alive, so one `/srp/init` funds the whole run.
+async fn failed_proof_sequence(server: &TestServer, email: &str) -> Vec<StatusCode> {
+    let init = server
+        .post("/api/v1/auth/srp/init")
+        .json(&serde_json::json!({ "email": email, "client_public": "a".repeat(512) }))
+        .await;
+    let session_id = init.json::<serde_json::Value>()["session_id"]
+        .as_str()
+        .expect("srp/init returns a session for any address, real or not")
+        .to_string();
+
+    let mut out = Vec::new();
+    for _ in 0..7 {
+        let r = server
+            .post("/api/v1/auth/srp/verify")
+            .json(&serde_json::json!({
+                "session_id": session_id,
+                "client_proof": "f".repeat(64),
+            }))
+            .await;
+        out.push(r.status_code());
+    }
+    out
+}
+
+/// ⚠️ **The oracle `/srp/init` exists to prevent, closed one level down.**
+///
+/// `/srp/init` fabricates a salt and a verifier for an unknown address so its
+/// response is indistinguishable from a real account's. The lockout undid that
+/// one status code at a time: the counter sat *below* the `is_real_user` early
+/// return, so a fabricated session never reached it. A registered address
+/// answered `423` after five failures; an unregistered one answered `401`
+/// forever, and the difference named which addresses exist.
+///
+/// The two sequences must be identical.
+#[tokio::test]
+async fn an_unknown_address_locks_out_exactly_like_a_real_one() {
+    let server = test_app().await;
+    let registered = unique_email("d24-real");
+    server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&registered))
+        .await;
+    let unknown = unique_email("d24-ghost");
+
+    let real = failed_proof_sequence(&server, &registered).await;
+    let ghost = failed_proof_sequence(&server, &unknown).await;
+
+    assert_eq!(
+        real, ghost,
+        "the status sequence differs between a registered and an unregistered \
+         address, which names which addresses exist"
+    );
+    assert_eq!(
+        real.last(),
+        Some(&StatusCode::LOCKED),
+        "both should end locked, not merely agree on being unauthorised"
+    );
+}
+
+/// ⚠️ And the symmetry must **not** extend to the database.
+///
+/// Matching responses is the point; matching audit rows is the opposite of it.
+/// `audit_events` is append-only and nothing can prune it, so a row saying
+/// "someone tried to sign in as this address and it does not exist" would
+/// rebuild the oracle permanently, in the one place it could never be removed.
+#[tokio::test]
+async fn a_lockout_on_a_nonexistent_account_writes_no_audit_row() {
+    let server = test_app().await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+
+    let before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE event_type = 'login_locked' AND user_id IS NULL",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+
+    failed_proof_sequence(&server, &unique_email("d24-noaudit")).await;
+
+    // The write is spawned; give it a moment to have not happened.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let after: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE event_type = 'login_locked' AND user_id IS NULL",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        before, after,
+        "a guess at an address that does not exist was written down"
+    );
+}
+
+/// One row per lockout, not one per attempt.
+///
+/// ⚠️ `audit_events` is append-only by trigger and nothing can prune it, so a
+/// row per attempt hands an attacker permanent, unbounded control of the
+/// table's size.
+#[tokio::test]
+async fn a_lockout_writes_exactly_one_row_however_many_attempts() {
+    let server = test_app().await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    let email = unique_email("d24-onerow");
+    server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&email))
+        .await;
+
+    let statuses = failed_proof_sequence(&server, &email).await;
+    assert_eq!(statuses.len(), 7, "seven attempts were made");
+
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events a JOIN users u ON u.id = a.user_id
+         WHERE u.email = $1 AND a.event_type = 'login_locked'",
+    )
+    .bind(&email)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+
+    assert_eq!(rows, 1, "seven attempts must leave one row, not seven");
+}

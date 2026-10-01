@@ -396,10 +396,45 @@ pub async fn srp_verify(
 
     let srp_server = SrpServer::<Sha256>::new(&G_2048);
 
+    // ─── Brute-force lockout, BEFORE the real/fake branch ────────────────────
+    //
+    // ⚠️ **Order is the security property here.** This block used to sit below
+    // the `is_real_user` early return, which meant a fabricated session never
+    // reached it: an unknown address was never counted and never locked. After
+    // five failures a registered address answered `423` and an unregistered one
+    // went on answering `401` — the account-enumeration oracle that
+    // `/srp/init` fabricates a salt and verifier specifically to prevent, handed
+    // back one status code at a time.
+    //
+    // The comment below the counter already described keying on the email as
+    // the fix for exactly this. It was necessary and not sufficient: the key was
+    // right and the code was unreachable for the case it was written for.
+    //
+    // Keyed by subject rather than by session, or an attacker fetches a fresh
+    // session. The email is the subject `/srp/init` already rate-limits on, so
+    // the two compose.
+    let lockout_key = format!("srp_lockout:{}", email_subject(&srp_state.email));
+    let failures: u64 = state
+        .cache
+        .get_json::<u64>(&lockout_key)
+        .await?
+        .unwrap_or(0);
+    if failures >= SRP_MAX_FAILURES {
+        return Err(AppError::AccountLocked);
+    }
+
     // Constant-time: always run crypto even for fake users
     if !srp_state.is_real_user {
         // Dummy computation to match timing, then fail immediately
         let _ = srp_server.process_reply(&b_bytes, &verifier_bytes, &client_public_bytes);
+        // ⚠️ Counted, exactly as a real account's failure is — that is what
+        // makes the two indistinguishable. Nothing is written to `audit_events`:
+        // there is no user to attribute it to, and recording the guess would
+        // rebuild the same oracle in a table nothing can delete from.
+        state
+            .cache
+            .incr_with_ttl(&lockout_key, SRP_LOCKOUT_SECONDS)
+            .await?;
         return Err(AppError::Unauthorized);
     }
 
@@ -411,58 +446,50 @@ pub async fn srp_verify(
     // Verify client proof M1
     let client_proof_bytes = hex::decode(&req.client_proof).map_err(|_| AppError::Unauthorized)?;
 
-    // ─── Brute-force lockout ─────────────────────────────────────────────────
+    // The session is deleted only on SUCCESS, and that is deliberate — a
+    // mistyped password must not send the user back through `/srp/init`, which
+    // is itself capped at 5 per 15 minutes, or three typos would lock someone
+    // out for a quarter of an hour.
     //
-    // ⚠️ The session below is deleted only on SUCCESS, and that is deliberate —
-    // a mistyped password must not send the user back through `/srp/init`, which
-    // is itself capped at 5 per 15 minutes, or three typos would lock them out
-    // for a quarter of an hour.
-    //
-    // But leaving it at that means one `/srp/init` buys unlimited guesses for the
-    // session's 300-second life, and `srp_verify` has no rate limit of its own.
-    // Each guess costs the attacker an Argon2id derivation, which is a real cost
-    // and not a prohibitive one against a weak password.
-    //
-    // So the bound is a failure counter, exactly as `totp_verify_login` does it.
-    // Keyed by subject rather than by session, or an attacker would simply fetch a
-    // fresh session.
-    //
-    // ⚠️ **Keyed on the EMAIL, not the user id, and that is a fix rather than a
-    // detail.** It was `srp_state.user_id`, which is `None` for the fabricated
-    // session an unknown address receives — so an unknown address was never counted
-    // and never locked. After enough failures a registered address answered `423`
-    // while an unregistered one kept answering `401`, and that difference is an
-    // oracle for which addresses exist.
-    //
-    // `/srp/init` goes to real trouble to prevent exactly that: it invents a salt and
-    // a verifier for an unknown address so the response is indistinguishable from a
-    // real account's. The lockout undid it one status code at a time.
-    //
-    // Reachable, which is what made it worth fixing: a failed `/srp/verify`
-    // deliberately leaves the session alive, so a single `/srp/init` funds as many
-    // attempts as fit in the session's 300-second life.
-    //
-    // The email is the subject `/srp/init` already rate-limits on, so the two compose
-    // and a fabricated session is counted exactly like a real one.
-    let lockout_key = format!("srp_lockout:{}", email_subject(&srp_state.email));
-
-    let failures: u64 = state
-        .cache
-        .get_json::<u64>(&lockout_key)
-        .await?
-        .unwrap_or(0);
-    if failures >= SRP_MAX_FAILURES {
-        return Err(AppError::AccountLocked);
-    }
+    // Which is why the counter above exists: one `/srp/init` would otherwise buy
+    // unlimited guesses for the session's 300-second life, and `srp_verify` has
+    // no rate limit of its own. Each guess costs the attacker an Argon2id
+    // derivation — a real cost, and not a prohibitive one against a weak
+    // password.
 
     if let Err(e) = server_verifier.verify_client(&client_proof_bytes) {
         let _ = e;
         // Count the failure before answering, so a client that gives up mid-flight
         // has still been counted.
-        state
+        let now = state
             .cache
             .incr_with_ttl(&lockout_key, SRP_LOCKOUT_SECONDS)
             .await?;
+
+        // ⚠️ Recorded once, when the counter *reaches* the limit — not per
+        // attempt. `audit_events` is append-only by trigger and nothing can
+        // prune it, so a row per attempt would hand an attacker permanent,
+        // unbounded control of the table's size. One row per lockout keeps the
+        // thing worth knowing — this account is under attack — at a rate
+        // `srp_lockout` already bounds.
+        //
+        // ⚠️ And only for an account that exists. `srp_state.user_id` is `None`
+        // for the session `/srp/init` fabricates for an unknown address, which
+        // it does precisely so the server is not an account oracle. Writing the
+        // guess down would rebuild that oracle in a table nothing can delete
+        // from.
+        if now == SRP_MAX_FAILURES {
+            if let Some(user_id) = srp_state.user_id {
+                crate::services::audit::record_lockout(
+                    &state.db,
+                    user_id,
+                    &client,
+                    now,
+                    SRP_LOCKOUT_SECONDS,
+                );
+            }
+        }
+
         tracing::warn!(user_id = ?srp_state.user_id, "SRP verification failed");
         return Err(AppError::Unauthorized);
     }
@@ -535,7 +562,9 @@ pub async fn srp_verify(
     // A mail outage must not fail a login, and awaiting delivery would let
     // response timing say something about the account. Same discipline as the
     // verification email on register.
-    notify_new_login(&state, &user.email, session_id);
+    // ⚠️ Before `record_login`, which is spawned — see `looks_unrecognised`.
+    let unrecognised = looks_unrecognised(&state, user_id, &client).await;
+    notify_new_login(&state, &user.email, session_id, unrecognised);
     record_login(&state, user_id, &client, "password");
 
     Ok(Json(SrpVerifyResponse {
@@ -812,6 +841,32 @@ pub(crate) fn fake_salt() -> String {
 /// over an empty set. Plumbing client addresses is only half the job; the other
 /// half is having a row to put one in.
 ///
+/// Is this login from an origin the account has not used before?
+///
+/// ⚠️ **Must be called before `record_login`.** That write is spawned, so if
+/// this login's own row lands first the lookup matches itself and no login is
+/// ever new.
+///
+/// A lookup failure is **not** an alarm. A database hiccup must not tell
+/// someone their account was accessed from somewhere strange, so an error here
+/// degrades to the ordinary wording and is logged.
+async fn looks_unrecognised(state: &AppState, user_id: Uuid, client: &ClientContext) -> bool {
+    match crate::services::audit::login_familiarity(
+        &state.db,
+        user_id,
+        client.ip_hash.as_deref(),
+        client.user_agent_hash.as_deref(),
+    )
+    .await
+    {
+        Ok(f) => f.is_unrecognised(),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not check login familiarity");
+            false
+        }
+    }
+}
+
 /// Spawned, like the alert: a slow insert must not sit in the login's response
 /// path, and a login that succeeded must not be reported as failed because the
 /// log write was.
@@ -847,13 +902,18 @@ fn record_login(state: &AppState, user_id: Uuid, client: &ClientContext, method:
     });
 }
 
-fn notify_new_login(state: &AppState, email: &str, session_id: Uuid) {
+/// ⚠️ `unrecognised` must be computed **before** `record_login` runs, not
+/// inside this function. Both are spawned, so the ordering between them is not
+/// guaranteed — and if this login's own row lands first, the lookup matches
+/// itself and nothing is ever new. The caller does the lookup; this only
+/// delivers the verdict.
+fn notify_new_login(state: &AppState, email: &str, session_id: Uuid, unrecognised: bool) {
     let mail = state.email.clone();
     let to = email.to_string();
     let when = chrono::Utc::now();
     tokio::spawn(async move {
         if let Err(e) = mail
-            .send_login_alert(&to, &session_id.to_string(), when)
+            .send_login_alert(&to, &session_id.to_string(), when, unrecognised)
             .await
         {
             tracing::warn!(%session_id, "could not send the login alert: {e}");
@@ -1199,7 +1259,9 @@ pub async fn totp_verify_login(
 
             // The second factor is where a 2FA login actually completes, so the
             // alert belongs here rather than after the password step.
-            notify_new_login(&state, &user.email, session_id);
+            // ⚠️ Before `record_login`, which is spawned.
+            let unrecognised = looks_unrecognised(&state, user_id, &client).await;
+            notify_new_login(&state, &user.email, session_id, unrecognised);
             record_login(&state, user_id, &client, "password+totp");
 
             let backup_codes_remaining = db_totp::remaining(&state.db, user_id).await?;

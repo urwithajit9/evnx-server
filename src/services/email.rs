@@ -129,6 +129,7 @@ impl EmailService {
         to: &str,
         session_id: &str,
         when: chrono::DateTime<chrono::Utc>,
+        unrecognised: bool,
     ) -> Result<(), EmailError> {
         // First segment of the UUID: enough to match against the session list,
         // short enough to read in a notification.
@@ -146,25 +147,61 @@ impl EmailService {
             None => r#"<p style="margin-top:20px">Run <code>evnx auth sessions list</code> to review, and <code>evnx auth sessions revoke-others</code> if this was not you.</p>"#.to_string(),
         };
 
+        // ⚠️ The wording is the whole feature. This alert fires on **every**
+        // login, and an alert that always fires is one people filter — so the
+        // only thing that makes it worth sending is that it distinguishes the
+        // unusual case from the ordinary one.
+        //
+        // ⚠️ And it must stay honest about what it knows. "A device we do not
+        // recognise" is true: two keyed digests have not been seen on a prior
+        // login. "A new location" would be false — `ip_hash` is a keyed BLAKE3
+        // digest and a hash cannot be geolocated, so evnx has no location to
+        // report. Someone on a mobile network gets a different digest from the
+        // same sofa, and the copy must not imply otherwise.
+        let (subject, heading, lead) = if unrecognised {
+            (
+                "New sign-in to evnx — a device we don't recognise",
+                "New sign-in from a device we don't recognise",
+                "<p>Your account was signed into on <strong>{when}</strong> from a \
+                 network and browser we have not seen on this account before.</p>",
+            )
+        } else {
+            (
+                "New sign-in to your evnx account",
+                "New sign-in to evnx",
+                "<p>Your account was signed into on <strong>{when}</strong>.</p>",
+            )
+        };
+        let lead = lead.replace("{when}", &when.format("%d %b %Y at %H:%M UTC").to_string());
+
+        let reassurance = if unrecognised {
+            r#"If this was you, there is nothing to do — you will stop seeing this
+                wording once we have seen this device before. evnx cannot see
+                <em>where</em> a sign-in came from: client addresses are hashed before
+                they are stored, so this is "not seen before", never a location."#
+        } else {
+            r#"If this was you, nothing to do. evnx cannot see where a sign-in came
+                from — client addresses are hashed before they are stored — so this
+                notice carries the session rather than a location."#
+        };
+
+        let heading_colour = if unrecognised { "#D29922" } else { "#E8652A" };
+
         let html = format!(
             r#"
             <div style="font-family:ui-monospace,monospace;max-width:560px;margin:40px auto;padding:32px;background:#0d1117;color:#E6EDF3;border-radius:12px;border:1px solid #30363d">
-              <h2 style="color:#E8652A;margin-top:0">New sign-in to evnx</h2>
-              <p>Your account was signed into on <strong>{when}</strong>.</p>
+              <h2 style="color:{heading_colour};margin-top:0">{heading}</h2>
+              {lead}
               <p style="color:#8B949E">Session <code>{short}</code></p>
               {action}
               <p style="margin-top:24px;color:#8B949E;font-size:12px">
-                If this was you, nothing to do. evnx cannot see where a sign-in came
-                from — client addresses are hashed before they are stored — so this
-                notice carries the session rather than a location.
+                {reassurance}
               </p>
             </div>
         "#,
-            when = when.format("%d %b %Y at %H:%M UTC"),
         );
 
-        self.send(to, "New sign-in to your evnx account", &html, None)
-            .await
+        self.send(to, subject, &html, None).await
     }
 
     /// The master password was changed.

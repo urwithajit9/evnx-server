@@ -136,3 +136,210 @@ pub async fn list_for_vault(
     .fetch_all(pool)
     .await
 }
+
+/// Whether this account has signed in from this origin before.
+///
+/// # What "recognised" means here, and what it does not
+///
+/// Two keyed digests — the client address and the user agent — compared against
+/// every prior `login` row for this user. Nothing else. There is no location in
+/// this, there cannot be, and the wording that reaches a person must not imply
+/// one: `ip_hash` is a keyed BLAKE3 digest and **a hash cannot be geolocated**.
+///
+/// ⚠️ **A `None` digest is not "new".** A request with no peer address and no
+/// user-agent header produces `None`, and treating absence as novelty would
+/// alarm people over a missing header. Absence is "cannot tell", and a device
+/// is only called unrecognised when there is something to compare.
+///
+/// ⚠️ **Rotating the hash key makes every device new.** The digests are keyed,
+/// so a rotation makes old rows incomparable and this returns "unrecognised"
+/// for everyone at once. That is why the key is `AUDIT_HASH_KEY` rather than
+/// `JWT_SECRET` — see `middleware::client_ip`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoginFamiliarity {
+    /// This address digest has appeared on a prior `login` for this user.
+    pub known_ip: bool,
+    /// This user-agent digest has appeared on a prior `login` for this user.
+    pub known_agent: bool,
+    /// There was something to compare at all.
+    pub comparable: bool,
+}
+
+impl LoginFamiliarity {
+    /// Worth telling the user about.
+    ///
+    /// Deliberately **both** signals, not either. A user agent alone changes on
+    /// every browser update, and alerting on that trains people to ignore the
+    /// alert — which is the failure this whole feature exists to undo, since the
+    /// alert already fires on every single login.
+    pub fn is_unrecognised(&self) -> bool {
+        self.comparable && !self.known_ip && !self.known_agent
+    }
+}
+
+/// Look up whether this origin has been seen for this user before.
+///
+/// Runs on `idx_audit_events_user`, which already exists —
+/// `(user_id, created_at DESC)` — with an equality filter on top. Two `EXISTS`
+/// probes rather than one scan, because either column may be `NULL`.
+///
+/// ⚠️ **Called before the row for *this* login is written.** `record_login` is
+/// spawned, so ordering is not guaranteed — the caller must do this lookup
+/// first, or the current login matches itself and nothing is ever new.
+pub async fn login_familiarity(
+    pool: &PgPool,
+    user_id: Uuid,
+    ip_hash: Option<&str>,
+    user_agent_hash: Option<&str>,
+) -> Result<LoginFamiliarity, sqlx::Error> {
+    if ip_hash.is_none() && user_agent_hash.is_none() {
+        return Ok(LoginFamiliarity {
+            known_ip: false,
+            known_agent: false,
+            comparable: false,
+        });
+    }
+
+    let row = sqlx::query!(
+        r#"
+        SELECT
+            EXISTS (
+                SELECT 1 FROM audit_events
+                WHERE user_id = $1 AND event_type = 'login' AND ip_hash = $2
+            ) AS "known_ip!",
+            EXISTS (
+                SELECT 1 FROM audit_events
+                WHERE user_id = $1 AND event_type = 'login' AND user_agent_hash = $3
+            ) AS "known_agent!"
+        "#,
+        user_id,
+        ip_hash,
+        user_agent_hash,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(LoginFamiliarity {
+        known_ip: row.known_ip,
+        known_agent: row.known_agent,
+        comparable: true,
+    })
+}
+
+/// Record that an account was locked after repeated failed password proofs.
+///
+/// # Why a lockout, and not every failed attempt
+///
+/// Failed logins are the stronger signal and also the one **an attacker
+/// generates at will**. `audit_events` is append-only by trigger since
+/// migration 006 — *nothing prunes it and nothing can* — so a row written per
+/// attempt hands an attacker unbounded, permanent control of the table's size.
+///
+/// One row per lockout keeps the thing worth knowing — *this account is being
+/// attacked* — at a rate `srp_lockout` already bounds to one per fifteen
+/// minutes per account.
+///
+/// ⚠️ The obvious middle option — one row per run, updated with a running
+/// count — is **unrepresentable**, because the append-only trigger refuses
+/// `UPDATE`. That is the trigger doing its job, not a limitation to work
+/// around.
+///
+/// # ⚠️ Only for accounts that exist
+///
+/// `user_id` is `NonZero`-ish by intent here: the caller must pass a real id.
+/// `/srp/init` fabricates a salt and verifier for an unknown address precisely
+/// so the server is not an account oracle, and writing "someone tried to sign
+/// in as this address and it does not exist" into an append-only table would
+/// rebuild that oracle in the database, permanently.
+pub fn record_lockout(
+    pool: &PgPool,
+    user_id: Uuid,
+    client: &crate::middleware::client_ip::ClientContext,
+    failures: u64,
+    window_seconds: u64,
+) {
+    let pool = pool.clone();
+    let ip_hash = client.ip_hash.clone();
+    let user_agent_hash = client.user_agent_hash.clone();
+    tokio::spawn(async move {
+        if let Err(e) = record(
+            &pool,
+            AuditEvent {
+                vault_id: None,
+                user_id: Some(user_id),
+                event_type: "login_locked".into(),
+                ip_hash,
+                user_agent_hash,
+                // Counts and a duration. No address, no agent string, no email
+                // — the digests are in their own columns and are not returned
+                // to clients.
+                metadata: Some(serde_json::json!({
+                    "failures": failures,
+                    "window_seconds": window_seconds,
+                })),
+            },
+        )
+        .await
+        {
+            tracing::warn!(error = %e, "could not record a lockout");
+        }
+    });
+}
+
+#[cfg(test)]
+mod familiarity_tests {
+    use super::*;
+
+    fn f(known_ip: bool, known_agent: bool, comparable: bool) -> LoginFamiliarity {
+        LoginFamiliarity {
+            known_ip,
+            known_agent,
+            comparable,
+        }
+    }
+
+    #[test]
+    fn a_wholly_new_origin_is_unrecognised() {
+        assert!(f(false, false, true).is_unrecognised());
+    }
+
+    #[test]
+    fn a_known_origin_is_not() {
+        assert!(!f(true, true, true).is_unrecognised());
+    }
+
+    /// ⚠️ The rule that keeps the alert worth reading.
+    ///
+    /// A user agent changes on every browser update. Alerting on that alone
+    /// would fire for ordinary people doing ordinary things, and an alert that
+    /// cries wolf is the exact failure this feature exists to undo — the alert
+    /// already fires on every single login.
+    #[test]
+    fn a_browser_update_alone_does_not_alarm() {
+        assert!(
+            !f(true, false, true).is_unrecognised(),
+            "same network, new agent — a browser update, not an intrusion"
+        );
+    }
+
+    /// The mirror case: a known browser on a new network is a train, a café or
+    /// a reconnected phone. Common, and not worth an alarm on its own.
+    #[test]
+    fn a_new_network_alone_does_not_alarm() {
+        assert!(!f(false, true, true).is_unrecognised());
+    }
+
+    /// ⚠️ Absence is "cannot tell", never "new".
+    ///
+    /// A request with no peer address and no user-agent header yields two
+    /// `None`s. Treating that as novelty would alarm someone over a missing
+    /// header — and would fire on every login from any client that sends no
+    /// user agent.
+    #[test]
+    fn nothing_to_compare_is_never_an_alarm() {
+        assert!(
+            !f(false, false, false).is_unrecognised(),
+            "no digests at all must not read as a new device"
+        );
+    }
+}

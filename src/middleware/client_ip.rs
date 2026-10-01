@@ -20,17 +20,30 @@
 //! like it, which is worse than storing the address openly because it invites
 //! everyone downstream to treat it as safe.
 //!
-//! The key is derived from `JWT_SECRET` with a domain-separated
-//! `blake3::derive_key`, so no new secret has to be deployed and the digest is
-//! not reversible without it. Two consequences worth knowing:
+//! The key is `AUDIT_HASH_KEY`, domain-separated through `blake3::derive_key`,
+//! and it **falls back to `JWT_SECRET` when unset** so no deployment has to add
+//! a secret to keep working. Two consequences worth knowing:
 //!
 //! * digests stay **stable and comparable**, which is what makes them useful for
 //!   noticing that a session came from somewhere this account has not been before
 //!   — the whole point of the column;
-//! * **rotating `JWT_SECRET` re-keys them**, so old rows stop correlating with new
-//!   ones. That is the right trade — it is a secret rotation, and losing the
-//!   ability to link a year-old login to today's is a small price — but it should
-//!   not come as a surprise to whoever rotates it.
+//! * **rotating the key re-keys them**, so old rows stop correlating with new
+//!   ones.
+//!
+//! ## ⚠️ Why the key is its own setting, and not `JWT_SECRET`
+//!
+//! It *was* `JWT_SECRET`, on the reasoning that no new secret had to be
+//! deployed. That was fine while nothing compared the digests. It stopped being
+//! fine when the login alert began saying **"from a device we do not
+//! recognise"**: every stored digest becomes incomparable the moment the JWT
+//! secret rotates, so the next login says that to **every user at once** — a
+//! security warning to the whole user base, on the day an operator is already
+//! handling whatever prompted the rotation.
+//!
+//! Splitting them costs one optional variable and lets the two rotate on their
+//! own schedules. ⚠️ Setting `AUDIT_HASH_KEY` for the first time has the same
+//! effect once, by definition; do it with login alerts suppressed, or accept
+//! one round of "new device" for everybody.
 //!
 //! ## Where the address comes from
 //!
@@ -71,7 +84,7 @@ use crate::errors::AppError;
 use crate::state::AppState;
 
 /// Domain separation for the IP-hash key. Changing this string re-keys every
-/// future digest, exactly as rotating `JWT_SECRET` does.
+/// future digest, exactly as rotating `AUDIT_HASH_KEY` does.
 const IP_HASH_CONTEXT: &str = "evnx-server 2026-09-30 audit ip-hash v1";
 
 /// Stable, non-reversible identifiers for one request's origin.
@@ -135,7 +148,11 @@ impl FromRequestParts<AppState> for ClientContext {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let secret = &state.config.jwt_secret;
+        // ⚠️ `audit_hash_key`, not `jwt_secret`. It falls back to the JWT
+        // secret when unset, so digests written before the setting existed stay
+        // comparable — but a deployment that sets it can rotate its JWT secret
+        // without marking every device unrecognised. See `config::audit_hash_key`.
+        let secret = &state.config.audit_hash_key;
 
         let ip_hash = client_addr(parts, state.config.trust_proxy_header)
             .map(|addr| keyed(secret, addr.as_bytes()));
