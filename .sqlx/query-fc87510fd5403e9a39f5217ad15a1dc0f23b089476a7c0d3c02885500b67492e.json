@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT email, email_verified, totp_enabled, plan,\n               created_at, updated_at, last_login_at,\n               ed25519_public_key, x25519_public_key, mlkem_public_key\n        FROM users WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "email",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "email_verified",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 2,
+        "name": "totp_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 3,
+        "name": "plan",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "last_login_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "ed25519_public_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "x25519_public_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "mlkem_public_key",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "fc87510fd5403e9a39f5217ad15a1dc0f23b089476a7c0d3c02885500b67492e"
+}

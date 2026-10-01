@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT vv.vault_id, vv.version_num, vv.blob_hash, vv.blob_size_bytes,\n               vv.key_count, vv.key_names, vv.pushed_at,\n               u.email AS \"pushed_by_email?\"\n        FROM vault_versions vv\n        LEFT JOIN users u ON u.id = vv.pushed_by\n        WHERE vv.vault_id = ANY($1)\n        ORDER BY vv.vault_id, vv.version_num\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "vault_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "version_num",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "blob_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "blob_size_bytes",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "key_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "key_names",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 6,
+        "name": "pushed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "pushed_by_email?",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "3e1666206678022f3b132a2caa9bbcfe3290445cc582c3f20c42e62ac593ed5f"
+}

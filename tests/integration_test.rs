@@ -4930,3 +4930,268 @@ async fn a_correct_totp_code_clears_the_failure_counter() {
         "a success must clear the counter, not leave it accumulating"
     );
 }
+
+// ─── O3: data export (GDPR Article 20) ───────────────────────────────────────
+//
+// ⚠️ The export is the one endpoint whose job is to hand the account's data to a
+// file on someone's disk. Everything it must NOT carry is therefore a privacy
+// incident rather than a bug, and the tests below are written to fail loudly if
+// a future `SELECT *` sweeps a credential in.
+
+async fn export_of(server: &TestServer, jwt: &str) -> serde_json::Value {
+    let resp = bearer(server.get("/api/v1/auth/account/export"), jwt).await;
+    resp.assert_status_ok();
+    resp.json::<serde_json::Value>()
+}
+
+/// Push a version and return its number.
+async fn push_version(server: &TestServer, jwt: &str, vault_id: Uuid, base: i32) -> i32 {
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/versions")),
+        jwt,
+    )
+    .json(&serde_json::json!({
+        "nonce": "AAAAAAAAAAAAAAAA",
+        "ciphertext": "Zm9v",
+        // Computed, not filler: the handler verifies blob_hash against the
+        // BLAKE3 of the ciphertext it was given, so a placeholder is a 422.
+        // The 403-only push tests nearby get away with filler because they are
+        // refused by the guard before the body is ever read.
+        "blob_hash": blake3::hash(b"foo").to_hex().to_string(),
+        "key_names": ["DATABASE_URL", "API_KEY"],
+        "key_count": 2,
+        "base_version": base,
+    }))
+    .await;
+    resp.assert_status(StatusCode::CREATED);
+    resp.json::<serde_json::Value>()["version_num"]
+        .as_i64()
+        .unwrap() as i32
+}
+
+/// ⚠️ **The test this endpoint exists to not fail.**
+///
+/// `register_payload` uses distinct filler per field, so each can be searched for
+/// by value in the serialised export. A `SELECT *` that swept the users row would
+/// fail here rather than in production.
+#[tokio::test]
+async fn the_export_carries_public_keys_and_no_secret_material() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+
+    let raw = serde_json::to_string(&export_of(&server, &jwt).await).unwrap();
+
+    // Public by definition — these are what other people encrypt to, and leaving
+    // them out would make the export less portable for no gain.
+    for (what, needle) in [
+        ("ed25519 public key", "C".repeat(44)),
+        ("x25519 public key", "D".repeat(44)),
+        ("ML-KEM public key", "F".repeat(1580)),
+    ] {
+        assert!(raw.contains(&needle), "{what} should be exported");
+    }
+
+    // ⚠️ None of these may ever appear. The srp_verifier is the worst of them:
+    // it is password-equivalent for an OFFLINE dictionary attack, so a file in
+    // someone's Downloads folder carrying it is a cracking target.
+    for (what, needle) in [
+        ("srp_verifier", "a".repeat(512)),
+        ("srp_salt", "A".repeat(44)),
+        ("argon2_salt", "B".repeat(44)),
+        ("encrypted_private_key", "E".repeat(96)),
+    ] {
+        assert!(
+            !raw.contains(&needle),
+            "{what} must NOT be in a downloadable export"
+        );
+    }
+
+    // And by name, for anything added later under a different value.
+    for field in [
+        "srp_verifier",
+        "srp_salt",
+        "argon2_salt",
+        "totp_secret",
+        "token_hash",
+        "encrypted_private_key",
+        "ip_hash",
+        "user_agent_hash",
+    ] {
+        assert!(
+            !raw.contains(field),
+            "the export names `{field}`, which is credential or key material"
+        );
+    }
+}
+
+/// ⚠️ Someone opening this file is looking for their secrets. The first thing
+/// they must learn is that the secrets are deliberately absent and how to get
+/// them instead — stated in the document, not only in the docs.
+#[tokio::test]
+async fn the_export_says_where_the_secrets_are_and_are_not() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let body = export_of(&server, &jwt).await;
+
+    let notice = &body["evnx_export"]["your_secrets_are_not_in_this_file"];
+    assert!(
+        notice.is_object(),
+        "the export must state plainly that it holds no secrets"
+    );
+    let how = notice["how_to_get_them"].as_str().unwrap_or_default();
+    assert!(
+        how.contains("evnx cloud pull"),
+        "it must name the command that DOES get the secrets, got: {how}"
+    );
+    assert!(
+        body["evnx_export"]["also_not_included"].is_object(),
+        "the export must list what else is withheld"
+    );
+}
+
+/// A CI token must not be able to pull down the account's entire metadata map —
+/// every vault name, every member's email, the whole activity trail. 403 (wrong
+/// credential type) rather than 401, matching the rest of account management.
+#[tokio::test]
+async fn an_api_token_cannot_export_the_account() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let token = create_api_token(&server, &jwt, "read_write", None).await;
+
+    let resp = bearer(server.get("/api/v1/auth/account/export"), &token).await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+
+    server
+        .get("/api/v1/auth/account/export")
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+}
+
+/// The portable part: what exists, who can reach it, and what each version held
+/// by variable NAME.
+#[tokio::test]
+async fn the_export_lists_vaults_members_and_version_history() {
+    let server = test_app().await;
+    let (_owner, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    let (_bid, _bjwt) = member_at(&server, &jwt, vault_id, "developer").await;
+    push_version(&server, &jwt, vault_id, 0).await;
+
+    let body = export_of(&server, &jwt).await;
+    let vaults = body["vaults"].as_array().expect("vaults array");
+    let v = vaults
+        .iter()
+        .find(|v| v["id"].as_str() == Some(&vault_id.to_string()))
+        .expect("the vault should be in the export");
+
+    assert_eq!(v["you_are_the_owner"], true);
+    assert_eq!(v["your_role"], "owner");
+    assert_eq!(
+        v["members"].as_array().unwrap().len(),
+        2,
+        "owner and the developer"
+    );
+
+    let versions = v["versions"].as_array().unwrap();
+    assert_eq!(versions.len(), 1);
+    // Variable NAMES, never values — the server has never held a value.
+    let names = versions[0]["key_names"].as_array().unwrap();
+    assert!(names.iter().any(|n| n == "DATABASE_URL"));
+    assert!(
+        versions[0].get("ciphertext").is_none() && versions[0].get("blob_key").is_none(),
+        "no ciphertext and no storage key belong in an export"
+    );
+}
+
+/// ⚠️ The scoping decision, pinned.
+///
+/// A vault's audit trail records what OTHER members did. Article 20 covers data
+/// concerning the data subject, so the export carries only `user_id = you`.
+/// Exporting vault-wide activity would widen exposure under the banner of a
+/// privacy right, which is exactly backwards.
+#[tokio::test]
+async fn the_export_does_not_carry_another_members_activity() {
+    let server = test_app().await;
+    let (_owner, a_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &a_jwt).await;
+    let (_bid, b_jwt) = member_at(&server, &a_jwt, vault_id, "developer").await;
+
+    let a_version = push_version(&server, &a_jwt, vault_id, 0).await;
+    let b_version = push_version(&server, &b_jwt, vault_id, a_version).await;
+
+    // ⚠️ Audit writes are `tokio::spawn`ed, so B's event may not exist yet.
+    // Waiting for it in B's OWN export proves it was written — without this the
+    // assertion below could pass simply because nothing had landed, which is the
+    // shape of a test that guards nothing.
+    let mut b_sees_it = false;
+    for _ in 0..40 {
+        let b = export_of(&server, &b_jwt).await;
+        if b["audit_events"].as_array().unwrap().iter().any(|e| {
+            e["event_type"] == "push" && e["metadata"]["version"].as_i64() == Some(b_version as i64)
+        }) {
+            b_sees_it = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        b_sees_it,
+        "B's own push event never appeared — the test below would be vacuous"
+    );
+
+    let a = export_of(&server, &a_jwt).await;
+    let events = a["audit_events"].as_array().unwrap();
+    assert!(
+        !events.iter().any(|e| e["event_type"] == "push"
+            && e["metadata"]["version"].as_i64() == Some(b_version as i64)),
+        "A's export carries B's push — the audit trail is scoped to the vault, not the account"
+    );
+}
+
+/// A vault the product says is gone must not reappear in an export.
+#[tokio::test]
+async fn a_deleted_vault_is_not_in_the_export() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+
+    assert!(export_of(&server, &jwt).await["vaults"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v["id"].as_str() == Some(&vault_id.to_string())));
+
+    bearer(server.delete(&format!("/api/v1/vaults/{vault_id}")), &jwt)
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    assert!(
+        !export_of(&server, &jwt).await["vaults"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["id"].as_str() == Some(&vault_id.to_string())),
+        "a soft-deleted vault must not reappear in the export"
+    );
+}
+
+/// API tokens are listed so you know what exists — by name and scope, never by
+/// value. The value exists only as a hash and was shown once at creation.
+#[tokio::test]
+async fn the_export_lists_api_tokens_without_their_values() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let raw_token = create_api_token(&server, &jwt, "read", None).await;
+
+    let body = export_of(&server, &jwt).await;
+    let tokens = body["api_tokens"].as_array().expect("api_tokens array");
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0]["name"], "ci");
+    assert_eq!(tokens[0]["scope"], "read");
+
+    let raw = serde_json::to_string(&body).unwrap();
+    assert!(
+        !raw.contains(&raw_token),
+        "the export carries a live API token value"
+    );
+}

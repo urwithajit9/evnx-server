@@ -10,6 +10,7 @@ use axum::{
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 pub mod auth;
+pub mod export;
 pub mod master_key;
 pub mod members;
 pub mod rekey;
@@ -143,6 +144,9 @@ pub fn create_router(state: AppState) -> Router {
         // the account that issued it. A leaked CI token is exactly the credential
         // that must not be able to erase the account it belongs to.
         .route("/account", delete(auth::delete_account))
+        // ⚠️ Same guard as the delete above, and for the same reason: a CI
+        // token must not be able to pull the account's entire metadata map.
+        .route("/account/export", get(export::export_account))
         // ── Changing the master password ────────────────────────────────────
         //
         // Behind `require_user_session` like the rest of account management, and
