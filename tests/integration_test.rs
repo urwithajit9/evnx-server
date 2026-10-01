@@ -5195,3 +5195,162 @@ async fn the_export_lists_api_tokens_without_their_values() {
         "the export carries a live API token value"
     );
 }
+
+// ─── 3.1a: surfacing the quota limits ────────────────────────────────────────
+//
+// ⚠️ Every number this endpoint reports must be produced by the SAME predicate
+// the matching `check_*_limit` uses. A display that counts even slightly
+// differently is worse than no display: "2 of 3" beside a refusal saying you are
+// full destroys trust in both numbers, and the reader cannot tell which lied.
+// The tests below exist to pin that agreement, not the arithmetic.
+
+async fn usage_of(server: &TestServer, jwt: &str) -> serde_json::Value {
+    let resp = bearer(server.get("/api/v1/auth/usage"), jwt).await;
+    resp.assert_status_ok();
+    resp.json::<serde_json::Value>()
+}
+
+/// ⚠️ **The test this endpoint exists for.** It drives the account to its vault
+/// limit, asserts the display says so, and then asserts the create is actually
+/// refused — so the number and the enforcement are checked against each other
+/// rather than each against my expectation of the other.
+///
+/// It also pins the `>=` semantics: `check_vault_limit` refuses at
+/// `count >= limit`, so `used == limit` means the next one is ALREADY refused.
+/// Anything rendering this must not imply one more is available.
+#[tokio::test]
+async fn usage_agrees_with_the_refusal_about_being_full() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+
+    let before = usage_of(&server, &jwt).await;
+    let limit = before["vaults"]["limit"]
+        .as_i64()
+        .expect("the free plan must declare a vault limit for this test to mean anything");
+    assert_eq!(before["vaults"]["used"], 0);
+
+    for n in 1..=limit {
+        create_vault(&server, &jwt).await;
+        let u = usage_of(&server, &jwt).await;
+        assert_eq!(u["vaults"]["used"], n, "after creating {n} vault(s)");
+    }
+
+    // The display says full...
+    let full = usage_of(&server, &jwt).await;
+    assert_eq!(full["vaults"]["used"], full["vaults"]["limit"]);
+
+    // ...and the server agrees, which is the whole point.
+    let resp = bearer(server.post("/api/v1/vaults"), &jwt)
+        .json(&serde_json::json!({
+            "name": format!("v{}", Uuid::new_v4().simple()),
+            "environment": "development",
+            "encrypted_vault_key": "d3JhcHBlZA==",
+        }))
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        StatusCode::FORBIDDEN,
+        "usage said full but the create was allowed — the two disagree"
+    );
+}
+
+/// ⚠️ A vault shared **to** you is the owner's, and counts against them. Counting
+/// it here would tell someone they were full when they could still create, and
+/// the limit they would then hit is one they cannot act on.
+#[tokio::test]
+async fn a_vault_shared_to_you_does_not_count_against_your_own_limit() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (_bid, b_jwt) = member_at(&server, &owner_jwt, vault_id, "developer").await;
+
+    let b = usage_of(&server, &b_jwt).await;
+    assert_eq!(
+        b["vaults"]["used"], 0,
+        "a vault shared to B is counted against B's own limit"
+    );
+
+    // And it is on the owner's side of the ledger.
+    let owner = usage_of(&server, &owner_jwt).await;
+    assert_eq!(owner["vaults"]["used"], 1);
+}
+
+/// Versions are capped **per vault**, so the report is per vault. A single total
+/// would be a number corresponding to no limit anyone can hit.
+#[tokio::test]
+async fn versions_are_reported_per_vault_not_as_one_total() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let a = create_vault(&server, &jwt).await;
+    let b = create_vault(&server, &jwt).await;
+    push_version(&server, &jwt, a, 0).await;
+    push_version(&server, &jwt, a, 1).await;
+    push_version(&server, &jwt, b, 0).await;
+
+    let u = usage_of(&server, &jwt).await;
+    let rows = u["versions_per_vault"]["vaults"].as_array().unwrap();
+
+    let used_for = |id: Uuid| -> i64 {
+        rows.iter()
+            .find(|r| r["id"].as_str() == Some(&id.to_string()))
+            .and_then(|r| r["used"].as_i64())
+            .unwrap_or(-1)
+    };
+    assert_eq!(used_for(a), 2);
+    assert_eq!(used_for(b), 1);
+    assert!(
+        u["versions_per_vault"]["limit"].is_number(),
+        "the per-vault cap must be reported alongside the counts"
+    );
+}
+
+/// A revoked token cannot be used, so holding its slot would be a limit on
+/// history rather than on access — `check_token_limit` excludes it and so must
+/// the display.
+#[tokio::test]
+async fn a_revoked_token_frees_its_slot_in_the_count() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+
+    let resp = bearer(server.post("/api/v1/auth/tokens"), &jwt)
+        .json(&serde_json::json!({ "name": "ci", "scope": "read" }))
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+    let token_id = resp.json::<serde_json::Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert_eq!(usage_of(&server, &jwt).await["api_tokens"]["used"], 1);
+
+    bearer(
+        server.delete(&format!("/api/v1/auth/tokens/{token_id}")),
+        &jwt,
+    )
+    .await
+    .assert_status(StatusCode::NO_CONTENT);
+
+    assert_eq!(
+        usage_of(&server, &jwt).await["api_tokens"]["used"],
+        0,
+        "a revoked token still occupies a slot in the display"
+    );
+}
+
+/// The response names every vault the account owns. Account-level reads stay off
+/// API tokens throughout — a credential issued for one pipeline should not
+/// enumerate the account's holdings.
+#[tokio::test]
+async fn an_api_token_cannot_read_usage() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let token = create_api_token(&server, &jwt, "read_write", None).await;
+
+    let resp = bearer(server.get("/api/v1/auth/usage"), &token).await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+
+    server
+        .get("/api/v1/auth/usage")
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+}

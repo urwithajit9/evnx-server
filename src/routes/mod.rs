@@ -16,6 +16,7 @@ pub mod members;
 pub mod rekey;
 pub mod sessions;
 pub mod tokens;
+pub mod usage;
 pub mod users;
 pub mod vaults;
 pub mod versions;
@@ -147,6 +148,8 @@ pub fn create_router(state: AppState) -> Router {
         // ⚠️ Same guard as the delete above, and for the same reason: a CI
         // token must not be able to pull the account's entire metadata map.
         .route("/account/export", get(export::export_account))
+        // Session-only too: it names every vault the account owns.
+        .route("/usage", get(usage::usage))
         // ── Changing the master password ────────────────────────────────────
         //
         // Behind `require_user_session` like the rest of account management, and

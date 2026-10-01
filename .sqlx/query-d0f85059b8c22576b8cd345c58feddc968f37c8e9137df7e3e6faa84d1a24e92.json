@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT v.id, v.name, v.environment,\n               COUNT(vv.id) AS \"used!\"\n        FROM vaults v\n        LEFT JOIN vault_versions vv ON vv.vault_id = v.id\n        WHERE v.owner_id = $1 AND v.deleted_at IS NULL\n        GROUP BY v.id, v.name, v.environment\n        ORDER BY v.name, v.environment\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "environment",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "used!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "d0f85059b8c22576b8cd345c58feddc968f37c8e9137df7e3e6faa84d1a24e92"
+}
