@@ -4794,3 +4794,139 @@ async fn liveness_stays_separate_from_readiness() {
         "/health must not grow dependency checks — that is /health/ready's job"
     );
 }
+
+// ─── D18: a second factor that nothing counted ───────────────────────────────
+//
+// ⚠️ Three handlers verified a TOTP code and returned 401 with **no counter**:
+// `/totp/disable`, `/totp/backup-codes` and `DELETE /account`. Six digits is a
+// million possibilities, and a session-holder had all the time they wanted —
+// which is exactly the case a second factor exists for. `/totp/verify` and
+// `/auth/reauth/verify` were bounded; these three were not.
+//
+// Two of the three hand back something durable: disabling removes the factor from
+// the account, and regenerating mints ten fresh recovery codes.
+
+/// Fetch the account's own email — `confirm_email` has to match it.
+async fn account_email(server: &TestServer, jwt: &str) -> String {
+    bearer(server.get("/api/v1/auth/me"), jwt)
+        .await
+        .json::<serde_json::Value>()["email"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// ⚠️ The filed defect. The act behind this code is irreversible and the server
+/// cannot undo it: the vaults it deletes hold the only wrapped copies of their
+/// keys.
+#[tokio::test]
+async fn enough_failed_totp_codes_lock_account_deletion() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let email = account_email(&server, &jwt).await;
+    let (_secret, _codes) = enable_totp_with_codes(&server, &jwt).await;
+
+    let wrong = serde_json::json!({ "confirm_email": email, "totp_code": "000000" });
+
+    let mut locked_at = None;
+    for attempt in 1..=6 {
+        let resp = bearer(server.delete("/api/v1/auth/account"), &jwt)
+            .json(&wrong)
+            .await;
+        if resp.status_code() == StatusCode::LOCKED {
+            locked_at = Some(attempt);
+            break;
+        }
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt} should be 401"
+        );
+    }
+
+    let locked_at = locked_at
+        .expect("deletion should lock — without a counter six digits is a million guesses");
+    assert!(
+        (4..=5).contains(&locked_at),
+        "expected a lockout just past the 3-failure mark, got {locked_at}"
+    );
+
+    // ⚠️ And the account is still there. A lockout that let the guesses through
+    // would be decoration.
+    bearer(server.get("/api/v1/auth/me"), &jwt)
+        .await
+        .assert_status(StatusCode::OK);
+}
+
+/// ⚠️ The property a per-endpoint fix would miss, and the reason the counter is
+/// one shared key rather than one per route.
+///
+/// It is the **same six digits** at every endpoint. Counting separately would let
+/// an attacker spend three guesses at `/totp/disable`, three at
+/// `/totp/backup-codes` and three at `DELETE /account` — turning a 3-strike bound
+/// into a 9-strike one for free, against a secret that does not change between
+/// them.
+#[tokio::test]
+async fn the_totp_failure_counter_is_shared_across_endpoints() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let email = account_email(&server, &jwt).await;
+    let (_secret, _codes) = enable_totp_with_codes(&server, &jwt).await;
+
+    // Two guesses at one endpoint...
+    for _ in 0..2 {
+        let resp = bearer(server.post("/api/v1/auth/totp/disable"), &jwt)
+            .json(&serde_json::json!({ "totp_code": "000000" }))
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ...one at a second...
+    let resp = bearer(server.post("/api/v1/auth/totp/backup-codes"), &jwt)
+        .json(&serde_json::json!({ "totp_code": "000000" }))
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::UNAUTHORIZED);
+
+    // ...and the third endpoint is already locked, having never been tried.
+    let resp = bearer(server.delete("/api/v1/auth/account"), &jwt)
+        .json(&serde_json::json!({ "confirm_email": email, "totp_code": "000000" }))
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        StatusCode::LOCKED,
+        "the counter is per-endpoint — guesses can be spread to multiply the budget"
+    );
+}
+
+/// A correct code clears the counter, so someone who mistypes twice and then gets
+/// it right is not left carrying failures toward a lockout they did not earn.
+#[tokio::test]
+async fn a_correct_totp_code_clears_the_failure_counter() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let (secret, _codes) = enable_totp_with_codes(&server, &jwt).await;
+
+    for _ in 0..2 {
+        bearer(server.post("/api/v1/auth/totp/disable"), &jwt)
+            .json(&serde_json::json!({ "totp_code": "000000" }))
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    // A real code — this both succeeds and resets the count.
+    bearer(server.post("/api/v1/auth/totp/backup-codes"), &jwt)
+        .json(&serde_json::json!({ "totp_code": totp_code(&secret) }))
+        .await
+        .assert_status_ok();
+
+    // So the third wrong guess afterwards is still 401, not 423: the budget
+    // started over rather than carrying two failures forward.
+    let resp = bearer(server.post("/api/v1/auth/totp/disable"), &jwt)
+        .json(&serde_json::json!({ "totp_code": "000000" }))
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "a success must clear the counter, not leave it accumulating"
+    );
+}

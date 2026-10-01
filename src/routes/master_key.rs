@@ -71,11 +71,11 @@ use validator::Validate;
 
 use crate::middleware::client_ip::ClientContext;
 use crate::{
-    db::{rotation, totp as db_totp, users},
+    db::{rotation, users},
     errors::AppError,
     routes::auth::{
-        email_subject, fake_salt, fake_srp_verifier, hash_token, verify_totp_code,
-        SRP_LOCKOUT_SECONDS, SRP_MAX_FAILURES,
+        email_subject, fake_salt, fake_srp_verifier, verify_second_factor, SRP_LOCKOUT_SECONDS,
+        SRP_MAX_FAILURES,
     },
     services::jwt::Claims,
     state::AppState,
@@ -301,24 +301,17 @@ pub async fn reauth_verify(
         // ⚠️ Bounded by the same `totp_lockout` the login path uses. Without a
         // counter, six digits is a million guesses and a session-holder has all
         // the time they want.
-        let totp_lock = format!("totp_lockout:{user_id}");
-        let totp_failures: u64 = state.cache.get_json::<u64>(&totp_lock).await?.unwrap_or(0);
-        if totp_failures >= 3 {
-            return Err(AppError::AccountLocked);
-        }
-
+        //
+        // This was an inline copy of that logic until three OTHER handlers turned
+        // out to have skipped it entirely. It now calls the shared helper, so the
+        // next endpoint that needs a second factor has one thing to call rather
+        // than a block to remember to paste.
         let code = req.totp_code.as_deref().unwrap_or_default();
         let secret = user
             .totp_secret_enc
             .clone()
             .ok_or_else(|| AppError::Internal("TOTP enabled but no secret".into()))?;
-        let ok = verify_totp_code(&secret, code).is_ok()
-            || db_totp::redeem(&state.db, user_id, &hash_token(code)).await?;
-        if !ok {
-            state.cache.incr_with_ttl(&totp_lock, 900).await?;
-            return Err(AppError::Unauthorized);
-        }
-        state.cache.del(&totp_lock).await?;
+        verify_second_factor(&state, user_id, &secret, code).await?;
     }
 
     // Spent, and the counter cleared — a correct proof should not leave the user

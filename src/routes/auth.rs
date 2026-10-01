@@ -191,6 +191,64 @@ pub(crate) const SRP_MAX_FAILURES: u64 = 5;
 /// Matches `totp_lockout` so the two behave the same way.
 pub(crate) const SRP_LOCKOUT_SECONDS: u64 = 900;
 
+/// Failed TOTP codes before the account is locked out.
+///
+/// Three rather than SRP's five: a code is read off a screen and retyped rather
+/// than recalled, so a mistype is rarer — and six digits is only a million
+/// possibilities, which is small enough that the bound has to be tight.
+pub(crate) const TOTP_MAX_FAILURES: u64 = 3;
+
+/// How long a TOTP lockout lasts, and the window failures are counted over.
+pub(crate) const TOTP_LOCKOUT_SECONDS: u64 = 900;
+
+/// Prove a second factor for an account-level act, bounded the way login is.
+///
+/// ⚠️ **Every endpoint that asks for a code must go through this, and three did
+/// not.** `totp_disable`, `totp_regenerate_backup_codes` and `delete_account` each
+/// verified a code and returned 401 with *nothing counting the failures* — so six
+/// digits was a million unhurried guesses for someone already holding a session,
+/// which is precisely the case a second factor exists for. Two of the three hand
+/// back something durable on success: disabling strips the factor off the account
+/// altogether, and regenerating mints ten fresh recovery codes.
+///
+/// ⚠️ **One counter, shared across all of them.** The key is
+/// `totp_lockout:{user_id}` — the same one `/auth/totp/verify` and
+/// `/auth/reauth/verify` use — because it is the *same six digits* being guessed.
+/// A counter per endpoint would let an attacker spend three guesses here, three at
+/// `/totp/disable`, three at `/totp/backup-codes` and three at `DELETE /account`,
+/// turning a 3-strike bound into a 12-strike one for nothing.
+///
+/// A recovery code is accepted wherever a TOTP code is, matching the login path.
+/// A correct proof clears the counter: someone who mistypes twice and then gets it
+/// right should not be left carrying failures toward a lockout they did not earn.
+///
+/// `totp_confirm` deliberately does **not** call this — see the note there.
+pub(crate) async fn verify_second_factor(
+    state: &AppState,
+    user_id: Uuid,
+    secret: &str,
+    code: &str,
+) -> Result<(), AppError> {
+    let key = format!("totp_lockout:{user_id}");
+    let failures: u64 = state.cache.get_json::<u64>(&key).await?.unwrap_or(0);
+    if failures >= TOTP_MAX_FAILURES {
+        return Err(AppError::AccountLocked);
+    }
+
+    let ok = verify_totp_code(secret, code).is_ok()
+        || db_totp::redeem(&state.db, user_id, &hash_token(code)).await?;
+    if !ok {
+        state
+            .cache
+            .incr_with_ttl(&key, TOTP_LOCKOUT_SECONDS)
+            .await?;
+        return Err(AppError::Unauthorized);
+    }
+
+    state.cache.del(&key).await?;
+    Ok(())
+}
+
 /// SRP Step 1 — exchange ephemeral public keys.
 ///
 /// SECURITY CRITICAL: This endpoint must respond identically (same shape, similar timing)
@@ -981,7 +1039,12 @@ pub async fn totp_confirm(
         AppError::Validation("No pending TOTP setup. Call /auth/totp/setup first.".into())
     })?;
 
-    // Verify the submitted code
+    // ⚠️ Deliberately NOT bounded by `verify_second_factor`, and this is the one
+    // place that is right. The secret being proved here came from
+    // `totp_setup:{user_id}`, which this same caller created moments ago and was
+    // shown as a QR code — so guessing the code reveals nothing they do not
+    // already hold, and there is no established second factor to bypass. A counter
+    // here would only let someone lock themselves out of finishing enrolment.
     verify_totp_code(&secret_base32, code)?;
 
     // Write secret to DB (encrypt with pgcrypto — server-managed key)
@@ -1182,11 +1245,10 @@ pub async fn totp_disable(
         .totp_secret_enc
         .ok_or_else(|| AppError::Internal("TOTP enabled but no secret".into()))?;
 
-    let authorised = verify_totp_code(&secret, code).is_ok()
-        || db_totp::redeem(&state.db, user_id, &hash_token(code)).await?;
-    if !authorised {
-        return Err(AppError::Unauthorized);
-    }
+    // Bounded — see `verify_second_factor`. Succeeding here removes the second
+    // factor from the account, so an unbounded guess loop was a way to strip 2FA
+    // off a stolen session given enough time.
+    verify_second_factor(&state, user_id, &secret, code).await?;
 
     // Clear the secret and every recovery code together — leaving codes behind
     // for a disabled factor would let them re-authorise a later re-enable.
@@ -1235,11 +1297,10 @@ pub async fn totp_regenerate_backup_codes(
         .totp_secret_enc
         .ok_or_else(|| AppError::Internal("TOTP enabled but no secret".into()))?;
 
-    let authorised = verify_totp_code(&secret, code).is_ok()
-        || db_totp::redeem(&state.db, user_id, &hash_token(code)).await?;
-    if !authorised {
-        return Err(AppError::Unauthorized);
-    }
+    // Bounded — see `verify_second_factor`. Succeeding here mints ten fresh
+    // recovery codes, each of which is itself a second factor, so guessing once
+    // buys a durable bypass rather than a single act.
+    verify_second_factor(&state, user_id, &secret, code).await?;
 
     let codes = generate_backup_codes();
     let hashes: Vec<String> = codes.iter().map(|c| hash_token(c)).collect();
@@ -1392,11 +1453,10 @@ pub async fn delete_account(
             .totp_secret_enc
             .clone()
             .ok_or_else(|| AppError::Internal("TOTP enabled but no secret".into()))?;
-        let authorised = verify_totp_code(&secret, code).is_ok()
-            || db_totp::redeem(&state.db, user_id, &hash_token(code)).await?;
-        if !authorised {
-            return Err(AppError::Unauthorized);
-        }
+        // Bounded — see `verify_second_factor`. This one is irreversible, and the
+        // server cannot undo it: the vaults it deletes hold the only wrapped copies
+        // of their keys.
+        verify_second_factor(&state, user_id, &secret, code).await?;
     }
 
     // ── Vaults that are not only theirs ─────────────────────────────────────
