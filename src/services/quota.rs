@@ -35,6 +35,15 @@ pub enum Plan {
 }
 
 impl Plan {
+    /// Every plan, in the order a pricing page lists them.
+    ///
+    /// ⚠️ A plan that exists in this enum but not in migration 008's
+    /// `CHECK (plan IN (...))` is a plan no account can actually hold, and one
+    /// that exists in the CHECK but not here is a plan nothing can read back.
+    /// They have to move together; `GET /api/v1/plans` publishes this array, so
+    /// a tier missing from it is a tier nobody can buy.
+    pub const ALL: [Plan; 3] = [Plan::Free, Plan::Team, Plan::Enterprise];
+
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "free" => Some(Self::Free),

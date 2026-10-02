@@ -14,6 +14,7 @@ pub mod devices;
 pub mod export;
 pub mod master_key;
 pub mod members;
+pub mod plans;
 pub mod rekey;
 pub mod sessions;
 pub mod tokens;
@@ -213,6 +214,11 @@ pub fn create_router(state: AppState) -> Router {
         // Readiness, for external uptime monitoring. `/health` answers `ok` with
         // every dependency down, so pointing a monitor at it watches nothing.
         .route("/health/ready", get(crate::readiness_check))
+        // Public and unauthenticated: what each plan allows. The pricing page
+        // reads this at build time instead of keeping its own copy, so a
+        // `QUOTA_*` change in production can no longer leave the website
+        // advertising a limit the server does not enforce.
+        .route("/api/v1/plans", get(plans::plans))
         .nest("/api/v1/auth", auth_routes)
         .nest("/api/v1/vaults", vault_routes)
         .nest(
