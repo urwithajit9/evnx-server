@@ -10,6 +10,7 @@ use axum::{
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 pub mod auth;
+pub mod billing;
 pub mod devices;
 pub mod export;
 pub mod master_key;
@@ -224,6 +225,12 @@ pub fn create_router(state: AppState) -> Router {
         // administration.
         .route("/:org_id/seats", put(orgs::set_seats))
         .route("/:org_id/members", get(orgs::list_members))
+        // Billing. ⚠️ The CHECKOUT is owner-only (buying is a billing act)
+        // while reading the state is open to any member — whether the
+        // organisation is paid up is not a secret from the people it covers,
+        // and hiding it makes "why did my limits change?" unanswerable.
+        .route("/:org_id/billing", get(billing::billing_state))
+        .route("/:org_id/checkout", post(billing::checkout))
         .route(
             "/:org_id/members/:user_id",
             patch(orgs::patch_member).delete(orgs::remove_member),
@@ -258,6 +265,17 @@ pub fn create_router(state: AppState) -> Router {
         // `QUOTA_*` change in production can no longer leave the website
         // advertising a limit the server does not enforce.
         .route("/api/v1/plans", get(plans::plans))
+        // ⚠️ THE ONLY UNAUTHENTICATED WRITE PATH IN THE SERVER.
+        //
+        // No guard layer, deliberately — Paddle cannot hold a JWT. Its credential
+        // is the HMAC in the `Paddle-Signature` header, verified against
+        // `PADDLE_WEBHOOK_SECRET` before a single byte of the body is parsed.
+        // See `routes::billing` for what a forged event would be worth.
+        //
+        // ⚠️ Outside the `/api/v1/orgs` nest on purpose: nesting it would put it
+        // behind `require_user_session`, which would reject every real webhook
+        // with a 401 that looked like a Paddle misconfiguration.
+        .route("/api/v1/billing/webhook", post(billing::webhook))
         .nest("/api/v1/auth", auth_routes)
         .nest("/api/v1/vaults", vault_routes)
         .nest("/api/v1/orgs", org_routes)

@@ -5,6 +5,67 @@ use std::env;
 /// All configuration loaded from environment variables at startup.
 /// Missing required variables cause `Config::from_env()` to return an error,
 /// which terminates the server before it accepts any requests.
+/// Paddle credentials. Present only when billing is configured.
+#[derive(Clone)]
+pub struct PaddleConfig {
+    /// ⚠️ Secret. Verifies that a webhook genuinely came from Paddle — the only
+    /// thing protecting the one unauthenticated write path in the server.
+    pub webhook_secret: String,
+    /// ⚠️ Secret. Can read and change the Paddle account.
+    pub api_key: String,
+    /// `sandbox` or `live`. Decides which API host is called.
+    pub environment: String,
+
+    /// Price id → plan. ⚠️ **This is an allow-list, not a convenience.**
+    ///
+    /// Without it, `POST /orgs/:id/checkout` would accept any `pri_…` in the
+    /// Paddle account — including one priced at zero, or one belonging to a
+    /// different product — and the webhook would then apply whatever plan came
+    /// back. A price the deployment did not configure is refused.
+    ///
+    /// ⚠️ Sandbox and live have entirely separate catalogues, so these ids change
+    /// completely at launch. That is why they are configuration rather than
+    /// constants.
+    pub prices: Vec<(String, &'static str)>,
+}
+
+impl PaddleConfig {
+    /// The API base for this environment.
+    ///
+    /// ⚠️ Matched explicitly rather than defaulting to live. A typo in
+    /// `PADDLE_ENVIRONMENT` that silently pointed sandbox credentials at the live
+    /// API would fail confusingly; pointing live credentials at sandbox would be
+    /// worse. `Config::from_env` refuses anything that is not one of the two.
+    /// Which plan a price buys, or `None` if it is not one of ours.
+    pub fn plan_for_price(&self, price_id: &str) -> Option<&'static str> {
+        self.prices
+            .iter()
+            .find(|(id, _)| id == price_id)
+            .map(|(_, plan)| *plan)
+    }
+
+    pub fn api_base(&self) -> &'static str {
+        match self.environment.as_str() {
+            "live" => "https://api.paddle.com",
+            _ => "https://sandbox-api.paddle.com",
+        }
+    }
+}
+
+/// ⚠️ **Hand-written, and it redacts.** `Config` derives `Debug`, so a derived
+/// `Debug` here would print the API key and the webhook secret into any log line
+/// that formatted the config — including the startup dump. Two secrets, in
+/// plaintext, in a log aggregator.
+impl std::fmt::Debug for PaddleConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaddleConfig")
+            .field("environment", &self.environment)
+            .field("webhook_secret", &"<redacted>")
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     // Server
@@ -35,6 +96,15 @@ pub struct Config {
     /// Configuration rather than constants so a tier's numbers change without a
     /// release. See `services::quota`.
     pub quotas: crate::services::quota::Quotas,
+
+    /// Paddle, or `None` when billing is not configured.
+    ///
+    /// ⚠️ **Optional on purpose.** evnx-server is open source and self-hostable,
+    /// and a self-hoster has no Paddle account and no interest in one. Making
+    /// these required would mean the server refuses to boot for everyone running
+    /// it for themselves — so billing is a capability the deployment either has
+    /// or does not, and the routes answer 503 rather than 500 when it does not.
+    pub paddle: Option<PaddleConfig>,
 
     /// Read the client address from `X-Forwarded-For` rather than the socket.
     ///
@@ -171,6 +241,12 @@ impl Environment {
 }
 
 impl Config {
+    /// Which plan a Paddle price buys. `None` when billing is unconfigured or the
+    /// price is not one of this deployment's.
+    pub fn plan_for_price(&self, price_id: &str) -> Option<&'static str> {
+        self.paddle.as_ref()?.plan_for_price(price_id)
+    }
+
     /// Load all configuration from environment variables.
     ///
     /// Call this ONCE at startup in `main()` — before creating any services.
@@ -324,6 +400,76 @@ impl Config {
             )));
         }
 
+        // ── Paddle ──────────────────────────────────────────────────────
+        //
+        // All three or none. ⚠️ A partial configuration is refused rather than
+        // half-enabled: a webhook secret with no API key gives a server that
+        // accepts subscription events and cannot create a checkout, which looks
+        // like billing working until somebody tries to pay.
+        let paddle = match (
+            env::var("PADDLE_WEBHOOK_SECRET")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            env::var("PADDLE_API_KEY")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+        ) {
+            (Some(webhook_secret), Some(api_key)) => {
+                let environment = optional!("PADDLE_ENVIRONMENT", "sandbox");
+                if environment != "sandbox" && environment != "live" {
+                    return Err(ConfigError::Invalid(format!(
+                        "PADDLE_ENVIRONMENT must be `sandbox` or `live`, got {environment:?}"
+                    )));
+                }
+                // ⚠️ A price id set but empty is dropped rather than stored as
+                // "", which would otherwise match an empty `price_id` in a
+                // crafted checkout request.
+                let price = |key: &str, plan: &'static str| {
+                    env::var(key)
+                        .ok()
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty())
+                        .map(|v| (v, plan))
+                };
+                let prices: Vec<(String, &'static str)> = [
+                    price("PADDLE_PRICE_TEAM_MONTHLY", "team"),
+                    price("PADDLE_PRICE_TEAM_YEARLY", "team"),
+                    price("PADDLE_PRICE_ENTERPRISE_MONTHLY", "enterprise"),
+                    price("PADDLE_PRICE_ENTERPRISE_YEARLY", "enterprise"),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+
+                // ⚠️ Billing configured with no prices is a deployment that can
+                // receive subscription events but can never start a checkout —
+                // which looks like billing working until somebody tries to pay.
+                if prices.is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "Paddle is configured but no PADDLE_PRICE_* ids are set, so no \
+                         checkout could ever be started. Set at least one."
+                            .into(),
+                    ));
+                }
+
+                Some(PaddleConfig {
+                    webhook_secret,
+                    api_key,
+                    environment,
+                    prices,
+                })
+            }
+            (None, None) => None,
+            _ => {
+                return Err(ConfigError::Invalid(
+                    "PADDLE_WEBHOOK_SECRET and PADDLE_API_KEY must be set together, or neither. \
+                     A webhook secret with no API key accepts subscription events but cannot \
+                     create a checkout — which looks like billing working until somebody pays."
+                        .into(),
+                ));
+            }
+        };
+
         Ok(Config {
             host: optional!("SERVER_HOST", "0.0.0.0"),
             port,
@@ -377,6 +523,7 @@ impl Config {
                 }
             },
             quotas,
+            paddle,
         })
     }
 
@@ -604,5 +751,73 @@ mod frontend_origin_tests {
             &Environment::Production
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod paddle_config_tests {
+    use super::*;
+
+    /// ⚠️ `Config` derives `Debug`. A derived `Debug` on `PaddleConfig` would put
+    /// the API key and the webhook secret into any log line that formatted the
+    /// config — including the startup dump. This asserts they cannot.
+    #[test]
+    fn debug_never_prints_a_paddle_secret() {
+        let p = PaddleConfig {
+            webhook_secret: "pdl_ntfset_SUPERSECRET".into(),
+            api_key: "pdl_sdbx_apikey_SUPERSECRET".into(),
+            environment: "sandbox".into(),
+            prices: vec![("pri_test".into(), "team")],
+        };
+        let rendered = format!("{p:?}");
+        assert!(!rendered.contains("SUPERSECRET"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        // The environment is not a secret and is useful in a log.
+        assert!(rendered.contains("sandbox"), "{rendered}");
+    }
+
+    /// ⚠️ The allow-list is what stops a caller checking out at a price we never
+    /// configured — one priced at zero, or belonging to another product entirely.
+    #[test]
+    fn only_configured_prices_map_to_a_plan() {
+        let p = PaddleConfig {
+            webhook_secret: "s".into(),
+            api_key: "k".into(),
+            environment: "sandbox".into(),
+            prices: vec![
+                ("pri_team_m".into(), "team"),
+                ("pri_ent_m".into(), "enterprise"),
+            ],
+        };
+        assert_eq!(p.plan_for_price("pri_team_m"), Some("team"));
+        assert_eq!(p.plan_for_price("pri_ent_m"), Some("enterprise"));
+
+        // Anything else — including a real Paddle price from the same account.
+        assert_eq!(p.plan_for_price("pri_somebody_elses"), None);
+        assert_eq!(p.plan_for_price(""), None);
+        assert_eq!(
+            p.plan_for_price("pri_team_m "),
+            None,
+            "no trimming at lookup"
+        );
+    }
+
+    /// Sandbox and live must not be confused, and an unknown value never silently
+    /// becomes live.
+    #[test]
+    fn the_api_base_follows_the_environment() {
+        let p = |e: &str| PaddleConfig {
+            webhook_secret: "s".into(),
+            api_key: "k".into(),
+            environment: e.into(),
+            prices: vec![("pri_test".into(), "team")],
+        };
+        assert_eq!(p("live").api_base(), "https://api.paddle.com");
+        assert_eq!(p("sandbox").api_base(), "https://sandbox-api.paddle.com");
+        assert_eq!(
+            p("typo").api_base(),
+            "https://sandbox-api.paddle.com",
+            "an unrecognised environment must fall to sandbox, never live"
+        );
     }
 }

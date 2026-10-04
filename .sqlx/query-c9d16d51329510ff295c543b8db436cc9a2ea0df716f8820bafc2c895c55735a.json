@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT plan, seats, subscription_status, current_period_ends_at,\n                  (paddle_subscription_id IS NOT NULL) AS \"has_subscription!\",\n                  (SELECT COUNT(*) FROM organization_members m\n                    WHERE m.org_id = $1 AND m.seat_assigned_at IS NOT NULL) AS \"seats_used!\"\n           FROM organizations WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "plan",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "seats",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "subscription_status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "current_period_ends_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "has_subscription!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "seats_used!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true,
+      null,
+      null
+    ]
+  },
+  "hash": "c9d16d51329510ff295c543b8db436cc9a2ea0df716f8820bafc2c895c55735a"
+}

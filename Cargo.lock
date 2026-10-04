@@ -922,6 +922,7 @@ dependencies = [
  "evnx-crypto",
  "headers",
  "hex",
+ "hmac",
  "jsonwebtoken",
  "num-bigint",
  "object_store",
