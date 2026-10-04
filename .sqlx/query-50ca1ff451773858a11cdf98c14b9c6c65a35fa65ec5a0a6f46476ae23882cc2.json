@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE organization_members SET role = $1 WHERE org_id = $2 AND user_id = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "50ca1ff451773858a11cdf98c14b9c6c65a35fa65ec5a0a6f46476ae23882cc2"
+}

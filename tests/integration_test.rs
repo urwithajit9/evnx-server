@@ -6362,3 +6362,783 @@ async fn deleting_an_account_that_owns_an_organisation_is_refused_not_a_500() {
         .unwrap();
     assert_eq!(alive, 1, "the account must survive a refused deletion");
 }
+
+// ─── Organisations: endpoints (Chain 3 · 3.2b) ────────────────────────────────
+
+/// Create an organisation through the API. Returns its id and slug.
+async fn api_create_org(server: &TestServer, jwt: &str) -> (Uuid, String) {
+    let slug = format!("o{}", Uuid::new_v4().simple());
+    let resp = bearer(server.post("/api/v1/orgs"), jwt)
+        .json(&serde_json::json!({ "name": format!("Org {slug}"), "slug": slug }))
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        StatusCode::CREATED,
+        "create org: {}",
+        resp.text()
+    );
+    let id = resp.json::<serde_json::Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    (Uuid::parse_str(&id).unwrap(), slug)
+}
+
+/// Invite an address. Returns the raw token.
+async fn api_invite(server: &TestServer, jwt: &str, org: Uuid, email: &str, role: &str) -> String {
+    let resp = bearer(server.post(&format!("/api/v1/orgs/{org}/invites")), jwt)
+        .json(&serde_json::json!({ "email": email, "role": role }))
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        StatusCode::CREATED,
+        "invite: {}",
+        resp.text()
+    );
+    resp.json::<serde_json::Value>()["token"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn email_of(db: &sqlx::PgPool, user: Uuid) -> String {
+    sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+        .bind(user)
+        .fetch_one(db)
+        .await
+        .unwrap()
+}
+
+/// ⚠️ The creator gets `owner` and **no seat**, and the response says what the
+/// organisation does not do.
+#[tokio::test]
+async fn creating_an_organisation_makes_you_owner_with_no_seat() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (user, jwt) = verified_user(&server).await;
+    let (org, _slug) = api_create_org(&server, &jwt).await;
+
+    let row = sqlx::query_as::<_, (String, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT role, seat_assigned_at FROM organization_members WHERE org_id = $1 AND user_id = $2",
+    )
+    .bind(org)
+    .bind(user)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+
+    assert_eq!(row.0, "owner");
+    assert!(
+        row.1.is_none(),
+        "creation must not assign a seat — it would fail for anyone already holding one"
+    );
+
+    // The plan is unchanged, which is the point of not assigning a seat.
+    assert_eq!(
+        evnx_server::services::quota::plan_for(&db, user)
+            .await
+            .unwrap(),
+        evnx_server::services::quota::Plan::Free
+    );
+
+    let listed = bearer(server.get("/api/v1/orgs"), &jwt).await;
+    assert_eq!(listed.status_code(), StatusCode::OK);
+    let body = listed.json::<serde_json::Value>();
+    assert_eq!(body["organizations"][0]["your_role"], "owner");
+    assert_eq!(body["organizations"][0]["you_hold_a_seat"], false);
+}
+
+#[tokio::test]
+async fn a_taken_slug_is_a_409_and_a_malformed_one_is_a_422() {
+    let server = test_app().await;
+    let (_u, jwt) = verified_user(&server).await;
+    let (_org, slug) = api_create_org(&server, &jwt).await;
+
+    let dup = bearer(server.post("/api/v1/orgs"), &jwt)
+        .json(&serde_json::json!({ "name": "Other", "slug": slug }))
+        .await;
+    assert_eq!(dup.status_code(), StatusCode::CONFLICT, "{}", dup.text());
+    assert!(dup.text().contains("already taken"), "{}", dup.text());
+
+    // ⚠️ `..` is the shape that escaped an output directory in `cloud export`.
+    for bad in ["..", "UPPER", "-lead", "trail-", "a/b", ""] {
+        let resp = bearer(server.post("/api/v1/orgs"), &jwt)
+            .json(&serde_json::json!({ "name": "X", "slug": bad }))
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "slug {bad:?} must be a 422 naming the rule, not a 500 from the CHECK: {}",
+            resp.text()
+        );
+    }
+}
+
+/// The invite → accept happy path, and that joining assigns no seat.
+#[tokio::test]
+async fn an_invitation_can_be_redeemed_by_the_address_it_was_sent_to() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let (invitee, invitee_jwt) = verified_user(&server).await;
+    let (org, _) = api_create_org(&server, &owner_jwt).await;
+    let invitee_email = email_of(&db, invitee).await;
+
+    let token = api_invite(&server, &owner_jwt, org, &invitee_email, "member").await;
+
+    let accepted = bearer(server.post("/api/v1/orgs/invites/accept"), &invitee_jwt)
+        .json(&serde_json::json!({ "token": token }))
+        .await;
+    assert_eq!(
+        accepted.status_code(),
+        StatusCode::OK,
+        "accept: {}",
+        accepted.text()
+    );
+    let body = accepted.json::<serde_json::Value>();
+    assert_eq!(body["role"], "member");
+    assert_eq!(body["seat"], false, "redemption must not assign a seat");
+
+    // In the directory, and the plan has not moved.
+    let listed = bearer(
+        server.get(&format!("/api/v1/orgs/{org}/members")),
+        &owner_jwt,
+    )
+    .await;
+    assert!(
+        listed.text().contains(&invitee_email),
+        "the invitee must appear in the directory: {}",
+        listed.text()
+    );
+    assert_eq!(
+        evnx_server::services::quota::plan_for(&db, invitee)
+            .await
+            .unwrap(),
+        evnx_server::services::quota::Plan::Free
+    );
+}
+
+/// ⚠️ **The check the token alone must not be enough to pass.**
+///
+/// Without it, anyone the invitation link is forwarded to could join a paid
+/// organisation — and the token is returned to the inviter in the response, so a
+/// forwarded link is the expected case rather than an exotic one.
+#[tokio::test]
+async fn an_invitation_cannot_be_redeemed_by_a_different_account() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let (invitee, _invitee_jwt) = verified_user(&server).await;
+    let (_bystander, bystander_jwt) = verified_user(&server).await;
+    let (org, _) = api_create_org(&server, &owner_jwt).await;
+
+    let token = api_invite(
+        &server,
+        &owner_jwt,
+        org,
+        &email_of(&db, invitee).await,
+        "member",
+    )
+    .await;
+
+    let stolen = bearer(server.post("/api/v1/orgs/invites/accept"), &bystander_jwt)
+        .json(&serde_json::json!({ "token": token }))
+        .await;
+    assert_eq!(
+        stolen.status_code(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a forwarded invitation must not admit the wrong account: {}",
+        stolen.text()
+    );
+}
+
+/// ⚠️ Single-use, and every failure mode answers identically.
+///
+/// A distinct message for "already used" versus "no such token" would turn this
+/// endpoint into an oracle for which invitations exist.
+#[tokio::test]
+async fn a_redeemed_invitation_and_a_bogus_one_are_indistinguishable() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let (invitee, invitee_jwt) = verified_user(&server).await;
+    let (org, _) = api_create_org(&server, &owner_jwt).await;
+
+    let token = api_invite(
+        &server,
+        &owner_jwt,
+        org,
+        &email_of(&db, invitee).await,
+        "member",
+    )
+    .await;
+
+    let first = bearer(server.post("/api/v1/orgs/invites/accept"), &invitee_jwt)
+        .json(&serde_json::json!({ "token": token.clone() }))
+        .await;
+    assert_eq!(first.status_code(), StatusCode::OK);
+
+    let again = bearer(server.post("/api/v1/orgs/invites/accept"), &invitee_jwt)
+        .json(&serde_json::json!({ "token": token }))
+        .await;
+    let bogus = bearer(server.post("/api/v1/orgs/invites/accept"), &invitee_jwt)
+        .json(&serde_json::json!({ "token": "evnx_inv_deadbeef" }))
+        .await;
+
+    assert_eq!(again.status_code(), bogus.status_code());
+    assert_eq!(
+        again.text(),
+        bogus.text(),
+        "a spent invitation and a bogus one must be indistinguishable"
+    );
+}
+
+/// ⚠️ No peers, and no promotion to owner. An admin inviting or promoting another
+/// admin would create a pair neither can manage; `owner` is refused by the role
+/// ladder here and by migration 010's CHECK underneath.
+#[tokio::test]
+async fn an_admin_cannot_create_a_peer_or_hand_out_ownership() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let (admin, admin_jwt) = verified_user(&server).await;
+    let (third, _third_jwt) = verified_user(&server).await;
+    let (org, _) = api_create_org(&server, &owner_jwt).await;
+
+    // Owner invites an admin — allowed, owner outranks admin.
+    let t = api_invite(
+        &server,
+        &owner_jwt,
+        org,
+        &email_of(&db, admin).await,
+        "admin",
+    )
+    .await;
+    let ok = bearer(server.post("/api/v1/orgs/invites/accept"), &admin_jwt)
+        .json(&serde_json::json!({ "token": t }))
+        .await;
+    assert_eq!(ok.status_code(), StatusCode::OK, "{}", ok.text());
+
+    // That admin inviting another admin is refused — it would be a peer.
+    let peer = bearer(
+        server.post(&format!("/api/v1/orgs/{org}/invites")),
+        &admin_jwt,
+    )
+    .json(&serde_json::json!({ "email": email_of(&db, third).await, "role": "admin" }))
+    .await;
+    assert_eq!(peer.status_code(), StatusCode::FORBIDDEN, "{}", peer.text());
+
+    // And `owner` is not an assignable role at all.
+    let owner_invite = bearer(
+        server.post(&format!("/api/v1/orgs/{org}/invites")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({ "email": email_of(&db, third).await, "role": "owner" }))
+    .await;
+    assert_eq!(
+        owner_invite.status_code(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        owner_invite.text()
+    );
+}
+
+/// An organisation with an owner and an admin who has accepted an invitation.
+async fn org_with_an_admin(
+    server: &TestServer,
+    db: &sqlx::PgPool,
+) -> (Uuid, String, Uuid, String, Uuid) {
+    let (owner, owner_jwt) = verified_user(server).await;
+    let (admin, admin_jwt) = verified_user(server).await;
+    let (org, _) = api_create_org(server, &owner_jwt).await;
+
+    let t = api_invite(server, &owner_jwt, org, &email_of(db, admin).await, "admin").await;
+    let resp = bearer(server.post("/api/v1/orgs/invites/accept"), &admin_jwt)
+        .json(&serde_json::json!({ "token": t }))
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::OK, "{}", resp.text());
+
+    (owner, owner_jwt, admin, admin_jwt, org)
+}
+
+/// ⚠️ The seat *count* is what an invoice is computed from, so an admin who could
+/// raise it could raise the bill. Owner-only, enforced by the route's signature
+/// taking `OrgAccess<OrgOwnerOnly>` rather than by a check inside the handler.
+#[tokio::test]
+async fn setting_the_seat_count_is_owner_only() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (_owner, owner_jwt, _admin, admin_jwt, org) = org_with_an_admin(&server, &db).await;
+
+    let refused = bearer(server.put(&format!("/api/v1/orgs/{org}/seats")), &admin_jwt)
+        .json(&serde_json::json!({ "seats": 10 }))
+        .await;
+    assert_eq!(
+        refused.status_code(),
+        StatusCode::FORBIDDEN,
+        "an admin must not change what the organisation is billed for: {}",
+        refused.text()
+    );
+
+    let allowed = bearer(server.put(&format!("/api/v1/orgs/{org}/seats")), &owner_jwt)
+        .json(&serde_json::json!({ "seats": 10 }))
+        .await;
+    assert_eq!(allowed.status_code(), StatusCode::OK, "{}", allowed.text());
+}
+
+/// ⚠️ **The bug a single rank check caused.**
+///
+/// The first version of `patch_member` required `outranks(target)` before doing
+/// anything, so an admin could not seat themselves — `Admin > Admin` is false.
+/// Assigning a seat is not a privilege question: the seat is already purchased,
+/// and assigning seats is what an admin is for.
+#[tokio::test]
+async fn an_admin_can_assign_a_seat_to_themselves() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (_owner, owner_jwt, admin, admin_jwt, org) = org_with_an_admin(&server, &db).await;
+
+    bearer(server.put(&format!("/api/v1/orgs/{org}/seats")), &owner_jwt)
+        .json(&serde_json::json!({ "seats": 5 }))
+        .await;
+
+    let resp = bearer(
+        server.patch(&format!("/api/v1/orgs/{org}/members/{admin}")),
+        &admin_jwt,
+    )
+    .json(&serde_json::json!({ "seat": true }))
+    .await;
+    assert_eq!(
+        resp.status_code(),
+        StatusCode::OK,
+        "an admin assigning a purchased seat to themselves is the normal case: {}",
+        resp.text()
+    );
+}
+
+/// ⚠️ Releasing someone else's seat LOWERS THEIR PLAN, so it needs rank — an
+/// admin releasing the owner's seat would be a hostile act against the person
+/// paying for the organisation. Releasing your own needs none.
+#[tokio::test]
+async fn an_admin_cannot_release_the_owners_seat_but_can_release_their_own() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (owner, owner_jwt, admin, admin_jwt, org) = org_with_an_admin(&server, &db).await;
+
+    bearer(server.put(&format!("/api/v1/orgs/{org}/seats")), &owner_jwt)
+        .json(&serde_json::json!({ "seats": 5 }))
+        .await;
+    for (who, jwt) in [(owner, &owner_jwt), (admin, &admin_jwt)] {
+        bearer(
+            server.patch(&format!("/api/v1/orgs/{org}/members/{who}")),
+            jwt,
+        )
+        .json(&serde_json::json!({ "seat": true }))
+        .await;
+    }
+
+    let hostile = bearer(
+        server.patch(&format!("/api/v1/orgs/{org}/members/{owner}")),
+        &admin_jwt,
+    )
+    .json(&serde_json::json!({ "seat": false }))
+    .await;
+    assert_eq!(
+        hostile.status_code(),
+        StatusCode::FORBIDDEN,
+        "an admin must not drop the owner's plan: {}",
+        hostile.text()
+    );
+
+    let own = bearer(
+        server.patch(&format!("/api/v1/orgs/{org}/members/{admin}")),
+        &admin_jwt,
+    )
+    .json(&serde_json::json!({ "seat": false }))
+    .await;
+    assert_eq!(
+        own.status_code(),
+        StatusCode::OK,
+        "releasing your own seat needs no rank: {}",
+        own.text()
+    );
+}
+
+/// ⚠️ Capacity is a real refusal, not a warning. Asserted against a *different*
+/// member — an earlier version re-seated the member who already held the seat,
+/// which told us nothing about capacity and accepted either OK or CONFLICT.
+#[tokio::test]
+async fn seats_are_capped_by_the_purchased_count() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (_owner, owner_jwt, admin, _admin_jwt, org) = org_with_an_admin(&server, &db).await;
+    let (third, third_jwt) = verified_user(&server).await;
+
+    let t = api_invite(
+        &server,
+        &owner_jwt,
+        org,
+        &email_of(&db, third).await,
+        "member",
+    )
+    .await;
+    bearer(server.post("/api/v1/orgs/invites/accept"), &third_jwt)
+        .json(&serde_json::json!({ "token": t }))
+        .await;
+
+    bearer(server.put(&format!("/api/v1/orgs/{org}/seats")), &owner_jwt)
+        .json(&serde_json::json!({ "seats": 1 }))
+        .await;
+
+    let first = bearer(
+        server.patch(&format!("/api/v1/orgs/{org}/members/{admin}")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({ "seat": true }))
+    .await;
+    assert_eq!(first.status_code(), StatusCode::OK, "{}", first.text());
+
+    let second = bearer(
+        server.patch(&format!("/api/v1/orgs/{org}/members/{third}")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({ "seat": true }))
+    .await;
+    assert_eq!(
+        second.status_code(),
+        StatusCode::CONFLICT,
+        "one seat purchased and taken, so the next must be refused: {}",
+        second.text()
+    );
+    assert!(
+        second.text().contains("seats are assigned"),
+        "the refusal must say why: {}",
+        second.text()
+    );
+}
+
+/// ⚠️ Taking a seat that another organisation is paying for must be a named
+/// conflict, not a 500 and not a silent transfer of a charge between customers.
+#[tokio::test]
+async fn a_seat_held_by_another_organisation_is_a_named_conflict() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (_a_owner, a_jwt) = verified_user(&server).await;
+    let (_b_owner, b_jwt) = verified_user(&server).await;
+    let (person, person_jwt) = verified_user(&server).await;
+
+    let (org_a, _) = api_create_org(&server, &a_jwt).await;
+    let (org_b, _) = api_create_org(&server, &b_jwt).await;
+    let person_email = email_of(&db, person).await;
+
+    for (org, jwt) in [(org_a, &a_jwt), (org_b, &b_jwt)] {
+        let t = api_invite(&server, jwt, org, &person_email, "member").await;
+        bearer(server.post("/api/v1/orgs/invites/accept"), &person_jwt)
+            .json(&serde_json::json!({ "token": t }))
+            .await;
+    }
+
+    let first = bearer(
+        server.patch(&format!("/api/v1/orgs/{org_a}/members/{person}")),
+        &a_jwt,
+    )
+    .json(&serde_json::json!({ "seat": true }))
+    .await;
+    assert_eq!(first.status_code(), StatusCode::OK, "{}", first.text());
+
+    let second = bearer(
+        server.patch(&format!("/api/v1/orgs/{org_b}/members/{person}")),
+        &b_jwt,
+    )
+    .json(&serde_json::json!({ "seat": true }))
+    .await;
+    assert_eq!(
+        second.status_code(),
+        StatusCode::CONFLICT,
+        "the second organisation must be told, not 500'd: {}",
+        second.text()
+    );
+    assert!(
+        second.text().contains("only one"),
+        "the message must explain why: {}",
+        second.text()
+    );
+}
+
+/// ⚠️ A plain member may leave, but may not act on anyone else. Leaving should
+/// not require asking an admin; managing others should.
+#[tokio::test]
+async fn a_member_can_leave_but_cannot_act_on_others() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let (m1, m1_jwt) = verified_user(&server).await;
+    let (m2, m2_jwt) = verified_user(&server).await;
+    let (org, _) = api_create_org(&server, &owner_jwt).await;
+
+    // Both join as plain members, each redeeming with their own session.
+    for (user, jwt) in [(m1, &m1_jwt), (m2, &m2_jwt)] {
+        let token = api_invite(
+            &server,
+            &owner_jwt,
+            org,
+            &email_of(&db, user).await,
+            "member",
+        )
+        .await;
+        let resp = bearer(server.post("/api/v1/orgs/invites/accept"), jwt)
+            .json(&serde_json::json!({ "token": token }))
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::OK, "{}", resp.text());
+    }
+
+    // m1 cannot promote m2 — a member does not manage anyone.
+    let promote = bearer(
+        server.patch(&format!("/api/v1/orgs/{org}/members/{m2}")),
+        &m1_jwt,
+    )
+    .json(&serde_json::json!({ "role": "admin" }))
+    .await;
+    assert_eq!(
+        promote.status_code(),
+        StatusCode::FORBIDDEN,
+        "a member must not manage another member: {}",
+        promote.text()
+    );
+
+    // Nor remove them.
+    let evict = bearer(
+        server.delete(&format!("/api/v1/orgs/{org}/members/{m2}")),
+        &m1_jwt,
+    )
+    .await;
+    assert_eq!(
+        evict.status_code(),
+        StatusCode::FORBIDDEN,
+        "a member must not remove another member: {}",
+        evict.text()
+    );
+
+    // But m1 can leave. ⚠️ The route therefore requires only membership, with the
+    // rank check inside — an `AtLeastOrgAdmin` route would have made leaving
+    // something you need permission for.
+    let leave = bearer(
+        server.delete(&format!("/api/v1/orgs/{org}/members/{m1}")),
+        &m1_jwt,
+    )
+    .await;
+    assert_eq!(
+        leave.status_code(),
+        StatusCode::NO_CONTENT,
+        "leaving must not require an admin: {}",
+        leave.text()
+    );
+
+    // And is gone from the directory.
+    let listed = bearer(
+        server.get(&format!("/api/v1/orgs/{org}/members")),
+        &owner_jwt,
+    )
+    .await;
+    assert!(
+        !listed.text().contains(&email_of(&db, m1).await),
+        "a member who left must not still be listed: {}",
+        listed.text()
+    );
+}
+
+/// ⚠️ The owner cannot be removed, by anyone including themselves. An
+/// organisation with no owner has nobody who can change its billing or delete it.
+#[tokio::test]
+async fn the_owner_cannot_be_removed() {
+    let server = test_app().await;
+    let (owner, owner_jwt) = verified_user(&server).await;
+    let (org, _) = api_create_org(&server, &owner_jwt).await;
+
+    let resp = bearer(
+        server.delete(&format!("/api/v1/orgs/{org}/members/{owner}")),
+        &owner_jwt,
+    )
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::CONFLICT, "{}", resp.text());
+    assert!(
+        resp.text().contains("owner cannot be removed"),
+        "{}",
+        resp.text()
+    );
+}
+
+/// ⚠️ A non-member gets 404, not 403 — otherwise organisation ids are probeable.
+#[tokio::test]
+async fn a_non_member_cannot_tell_an_organisation_exists() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let (_outsider, outsider_jwt) = verified_user(&server).await;
+    let (org, _) = api_create_org(&server, &owner_jwt).await;
+
+    let resp = bearer(
+        server.get(&format!("/api/v1/orgs/{org}/members")),
+        &outsider_jwt,
+    )
+    .await;
+    assert_eq!(
+        resp.status_code(),
+        StatusCode::NOT_FOUND,
+        "a non-member must not learn that this org exists: {}",
+        resp.text()
+    );
+}
+
+/// ⛔ **The guarantee, again at the endpoint layer.**
+///
+/// An org admin — the most privileged role short of owner — gets nothing on a
+/// vault they were never shared.
+#[tokio::test]
+async fn an_org_admin_still_cannot_reach_a_vault() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let (admin, admin_jwt) = verified_user(&server).await;
+    let (org, _) = api_create_org(&server, &owner_jwt).await;
+
+    let vault = create_vault(&server, &owner_jwt).await;
+
+    let t = api_invite(
+        &server,
+        &owner_jwt,
+        org,
+        &email_of(&db, admin).await,
+        "admin",
+    )
+    .await;
+    bearer(server.post("/api/v1/orgs/invites/accept"), &admin_jwt)
+        .json(&serde_json::json!({ "token": t }))
+        .await;
+
+    let resp = bearer(
+        server.get(&format!("/api/v1/vaults/{vault}/my-key")),
+        &admin_jwt,
+    )
+    .await;
+    assert!(
+        resp.status_code() == StatusCode::FORBIDDEN || resp.status_code() == StatusCode::NOT_FOUND,
+        "an org admin must not collect a vault key: {} {}",
+        resp.status_code(),
+        resp.text()
+    );
+}
+
+/// ⚠️ Audit events for organisation acts, asserted rather than assumed.
+///
+/// A seat **is** a plan change, so "when did my limits move, and who moved them"
+/// has to be answerable — that is what a billing dispute asks. These writes are
+/// `tokio::spawn`ed fire-and-forget like every other audit write, so the
+/// assertion polls briefly rather than reading immediately.
+///
+/// ⚠️ Also asserts `vault_id IS NULL` on every one. An org id in a column named
+/// `vault_id` would make every existing query that joins on it silently wrong,
+/// and this is a feature whose entire point is that the two are separate.
+#[tokio::test]
+async fn organisation_acts_are_audited_without_a_vault_id_or_a_token() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (owner, owner_jwt) = verified_user(&server).await;
+    let (member, member_jwt) = verified_user(&server).await;
+    let (org, _) = api_create_org(&server, &owner_jwt).await;
+
+    let token = api_invite(
+        &server,
+        &owner_jwt,
+        org,
+        &email_of(&db, member).await,
+        "member",
+    )
+    .await;
+    bearer(server.post("/api/v1/orgs/invites/accept"), &member_jwt)
+        .json(&serde_json::json!({ "token": token.clone() }))
+        .await;
+    bearer(
+        server.patch(&format!("/api/v1/orgs/{org}/members/{member}")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({ "seat": true }))
+    .await;
+
+    // Fire-and-forget: poll for the set rather than reading once.
+    let want = [
+        "org_created",
+        "org_invited",
+        "org_joined",
+        "org_seat_assigned",
+    ];
+    let mut rows: Vec<(String, Option<Uuid>, Option<serde_json::Value>)> = Vec::new();
+    for _ in 0..40 {
+        rows = sqlx::query_as(
+            "SELECT event_type, vault_id, metadata FROM audit_events \
+             WHERE metadata->>'org_id' = $1",
+        )
+        .bind(org.to_string())
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        if want.iter().all(|w| rows.iter().any(|r| r.0 == *w)) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    for w in want {
+        assert!(
+            rows.iter().any(|r| r.0 == w),
+            "missing audit event {w}; got {:?}",
+            rows.iter().map(|r| &r.0).collect::<Vec<_>>()
+        );
+    }
+
+    for r in &rows {
+        assert!(
+            r.1.is_none(),
+            "an organisation event must leave vault_id NULL, got {:?} on {}",
+            r.1,
+            r.0
+        );
+        let meta = r.2.as_ref().map(|m| m.to_string()).unwrap_or_default();
+        assert!(
+            !meta.contains(&token),
+            "an invitation token must never reach an audit row: {} {meta}",
+            r.0
+        );
+        assert!(
+            !meta.contains("evnx_inv_"),
+            "no token-shaped value in audit metadata: {} {meta}",
+            r.0
+        );
+    }
+
+    // Owner-only seat count, and that it is audited too.
+    bearer(server.put(&format!("/api/v1/orgs/{org}/seats")), &owner_jwt)
+        .json(&serde_json::json!({ "seats": 3 }))
+        .await;
+    let mut seen = false;
+    for _ in 0..40 {
+        seen = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_events \
+             WHERE metadata->>'org_id' = $1 AND event_type = 'org_seats_changed'",
+        )
+        .bind(org.to_string())
+        .fetch_one(&db)
+        .await
+        .unwrap()
+            > 0;
+        if seen {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        seen,
+        "a seat-count change must be audited — it is a billing fact"
+    );
+
+    let _ = owner;
+}

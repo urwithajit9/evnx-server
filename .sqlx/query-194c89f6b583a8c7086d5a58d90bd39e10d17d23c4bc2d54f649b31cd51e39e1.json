@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT u.id, u.email, m.role AS \"role!\",\n               m.seat_assigned_at, m.created_at AS \"joined_at!\"\n        FROM organization_members m\n        JOIN users u ON u.id = m.user_id\n        WHERE m.org_id = $1\n        ORDER BY m.role DESC, u.email\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "email",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "role!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "seat_assigned_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "joined_at!",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "194c89f6b583a8c7086d5a58d90bd39e10d17d23c4bc2d54f649b31cd51e39e1"
+}

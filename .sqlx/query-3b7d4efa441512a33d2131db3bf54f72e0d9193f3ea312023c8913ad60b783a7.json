@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE organization_invites SET used_at = NOW() WHERE id = $1 AND org_id = $2 AND used_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3b7d4efa441512a33d2131db3bf54f72e0d9193f3ea312023c8913ad60b783a7"
+}

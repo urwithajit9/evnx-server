@@ -14,6 +14,7 @@ pub mod devices;
 pub mod export;
 pub mod master_key;
 pub mod members;
+pub mod orgs;
 pub mod plans;
 pub mod rekey;
 pub mod sessions;
@@ -199,6 +200,44 @@ pub fn create_router(state: AppState) -> Router {
             require_user_session,
         ));
 
+    // ── Organisations ───────────────────────────────────────────────────────
+    //
+    // ⛔ None of these grants access to a vault. An organisation is billing plus a
+    // directory; the server cannot wrap a vault key. See migration 010 and
+    // `middleware::org_role`.
+    //
+    // `require_user_session`, not `require_verified`: an `evnx_tok_` CI token
+    // reaching these could invite people, assign seats and change what the
+    // account is billed. Same reasoning as `/auth/tokens` and `/auth/account`.
+    let org_routes = Router::new()
+        .route("/", get(orgs::list_orgs).post(orgs::create_org))
+        // ⚠️ Static before dynamic. `/invites/accept` and `/:org_id/invites` are
+        // both three segments, and matchit prefers the literal — the same shape as
+        // `/sessions/others` beside `/sessions/:session_id` above. Redemption
+        // cannot sit under `/:org_id` because the caller is not a member yet, so
+        // there is no org role for `OrgAccess` to extract.
+        .route("/invites/accept", post(orgs::accept_invite))
+        .route("/:org_id", patch(orgs::patch_org))
+        // ⚠️ Owner-only, and a separate route rather than a field on the PATCH
+        // above, so the requirement sits in the handler signature where it
+        // cannot be skipped. Seat *count* is billing; seat *assignment* is
+        // administration.
+        .route("/:org_id/seats", put(orgs::set_seats))
+        .route("/:org_id/members", get(orgs::list_members))
+        .route(
+            "/:org_id/members/:user_id",
+            patch(orgs::patch_member).delete(orgs::remove_member),
+        )
+        .route(
+            "/:org_id/invites",
+            get(orgs::list_invites).post(orgs::create_invite),
+        )
+        .route("/:org_id/invites/:invite_id", delete(orgs::revoke_invite))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_user_session,
+        ));
+
     // `require_auth`, not `require_verified`: the CLI calls GET /auth/me
     // immediately after registration to fetch `encrypted_private_key` and
     // `argon2_salt`, before the user has clicked the verification email.
@@ -221,6 +260,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/plans", get(plans::plans))
         .nest("/api/v1/auth", auth_routes)
         .nest("/api/v1/vaults", vault_routes)
+        .nest("/api/v1/orgs", org_routes)
         .nest(
             "/api/v1/users",
             Router::new()

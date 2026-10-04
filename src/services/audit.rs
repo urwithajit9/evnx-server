@@ -33,6 +33,63 @@ pub async fn record(pool: &PgPool, event: AuditEvent) -> Result<(), sqlx::Error>
     Ok(())
 }
 
+/// Record an organisation event, fire-and-forget.
+///
+/// ─── Why `vault_id` is NULL and the org id lives in metadata ─────────────────
+///
+/// `audit_events` has no `org_id` column and deliberately does not gain one here.
+/// ⚠️ The table is **append-only by trigger** since migration 006 and nothing
+/// prunes it — so a column added speculatively is a column that can never be
+/// cleaned up, and the retention shape for organisation events has not been
+/// settled. `metadata` is JSONB and already exists; `metadata->>'org_id'` is a
+/// perfectly good index target when something needs to query by organisation.
+///
+/// ⚠️ **`vault_id` is NULL and must stay NULL.** Putting an org id in a column
+/// named `vault_id` would make every existing query that joins on it silently
+/// wrong, and this is a feature whose whole point is that organisations and
+/// vaults are separate.
+///
+/// ─── What is deliberately not recorded ──────────────────────────────────────
+///
+/// No invitation token, ever — it is a bearer credential. The invited *address*
+/// is recorded, because who was invited is the fact a billing dispute turns on,
+/// and the organisation's own admins can already list it.
+pub fn record_org_event(
+    pool: &PgPool,
+    org_id: Uuid,
+    actor_id: Uuid,
+    event_type: &'static str,
+    client: &crate::middleware::client_ip::ClientContext,
+    mut metadata: serde_json::Value,
+) {
+    // The org id goes in metadata rather than a column — see above. Merged in here
+    // so no call site can forget it and leave an event nobody can attribute.
+    if let Some(map) = metadata.as_object_mut() {
+        map.insert("org_id".into(), serde_json::json!(org_id));
+    }
+
+    let pool = pool.clone();
+    let ip_hash = client.ip_hash.clone();
+    let user_agent_hash = client.user_agent_hash.clone();
+    tokio::spawn(async move {
+        if let Err(e) = record(
+            &pool,
+            AuditEvent {
+                vault_id: None,
+                user_id: Some(actor_id),
+                event_type: event_type.into(),
+                ip_hash,
+                user_agent_hash,
+                metadata: Some(metadata),
+            },
+        )
+        .await
+        {
+            tracing::warn!(%org_id, event_type, "failed to record org audit event: {e}");
+        }
+    });
+}
+
 /// Record a membership change, fire-and-forget.
 ///
 /// ─── Why these events exist ──────────────────────────────────────────────────

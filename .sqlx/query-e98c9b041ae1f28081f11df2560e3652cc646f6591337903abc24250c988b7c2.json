@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT m.user_id FROM organization_members m\n           JOIN users u ON u.id = m.user_id\n           WHERE m.org_id = $1 AND lower(u.email) = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "e98c9b041ae1f28081f11df2560e3652cc646f6591337903abc24250c988b7c2"
+}

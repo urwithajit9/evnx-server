@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT o.name FROM organization_members m\n                           JOIN organizations o ON o.id = m.org_id AND o.deleted_at IS NULL\n                           WHERE m.user_id = $1 AND m.seat_assigned_at IS NOT NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "49a7288d62dc51748e2d00a158fea84e83f1224dd183558857eb947ae0a918da"
+}

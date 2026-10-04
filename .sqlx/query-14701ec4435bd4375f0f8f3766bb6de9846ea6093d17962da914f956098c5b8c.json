@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE organization_members SET seat_assigned_at = NULL WHERE org_id = $1 AND user_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "14701ec4435bd4375f0f8f3766bb6de9846ea6093d17962da914f956098c5b8c"
+}

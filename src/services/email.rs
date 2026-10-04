@@ -306,6 +306,73 @@ impl EmailService {
 
     /// `dev_link` is surfaced by the log transport so a local developer can click
     /// through. It is never logged by the Resend transport.
+    /// Invite someone into an organisation.
+    ///
+    /// ⚠️ **The body says what joining does not do.** An invitation into something
+    /// called an organisation reads as an invitation to shared secrets, and it is
+    /// not one — the server cannot wrap a vault key, so membership decides which
+    /// plan's limits apply and nothing else. Stating it here, where the belief is
+    /// formed, is cheaper than correcting it in support.
+    ///
+    /// ⚠️ The token is a bearer credential, so it appears only in the link and is
+    /// never logged. A send failure is reported by status alone — see `send`.
+    pub async fn send_org_invite(
+        &self,
+        to: &str,
+        org_name: &str,
+        token: &str,
+    ) -> Result<(), EmailError> {
+        // Trailing slash for the same reason the verification link carries one:
+        // the dashboard is a static export with `trailingSlash: true`, and the
+        // unslashed form costs a redirect some mail clients will not follow.
+        let link = self.public_app_url.as_deref().map(|base| {
+            format!(
+                "{}/organizations/accept/?token={token}",
+                base.trim_end_matches('/')
+            )
+        });
+
+        // No dashboard configured: name the command instead of linking nowhere.
+        // Same fallback the login alert uses.
+        let action = match &link {
+            Some(href) => format!(
+                r#"<a href="{href}" style="display:inline-block;background:#e94560;color:white;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:bold">Accept invitation</a>"#
+            ),
+            None => format!(
+                r#"<p style="color:#a0a0b8">Run <code style="color:#e6e6e6">evnx org accept {token}</code> to join.</p>"#
+            ),
+        };
+
+        let safe_org = org_name
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+
+        let html = format!(
+            r#"
+            <div style="font-family:monospace;max-width:560px;margin:40px auto;padding:32px;background:#0f0f1a;color:#e6e6e6;border-radius:12px;border:1px solid #2a2a3e">
+              <h1 style="color:#e94560;font-size:22px;margin-bottom:8px">evnx Cloud</h1>
+              <p style="color:#a0a0b8;margin-bottom:24px">You have been invited to join <strong style="color:#e6e6e6">{safe_org}</strong>.</p>
+              {action}
+              <p style="margin-top:24px;color:#a0a0b8;font-size:13px;line-height:1.6">
+                Joining decides which plan's limits apply to your account.
+                <strong style="color:#e6e6e6">It does not give you access to anyone's secrets</strong> —
+                a vault is shared separately, and only by someone who holds its key.
+              </p>
+              <p style="margin-top:20px;color:#666;font-size:12px">Expires in 7 days. If you were not expecting this, ignore it.</p>
+            </div>
+        "#
+        );
+
+        self.send(
+            to,
+            &format!("You have been invited to {org_name} on evnx"),
+            &html,
+            link.as_deref(),
+        )
+        .await
+    }
+
     async fn send(
         &self,
         to: &str,
