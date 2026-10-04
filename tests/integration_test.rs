@@ -8,7 +8,10 @@
 //! `test-register@example.com`, which passed once and then failed forever on the
 //! duplicate-email 409.
 
-use axum::http::{header::AUTHORIZATION, HeaderValue, StatusCode};
+use axum::http::{
+    header::{AUTHORIZATION, CONTENT_TYPE},
+    HeaderName, HeaderValue, StatusCode,
+};
 use axum_test::{TestRequest, TestServer};
 use evnx_server::config::Config;
 use evnx_server::services::jwt::JwtService;
@@ -7251,4 +7254,460 @@ async fn only_the_owner_can_delete_an_organisation() {
         .json(&serde_json::json!({}))
         .await;
     assert_eq!(resp.status_code(), StatusCode::FORBIDDEN, "{}", resp.text());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Billing — Paddle
+//
+// ⚠️ **No test here calls Paddle.** Every one of them asserts a refusal, a
+// database write, or a webhook that arrives already signed. A test that reached
+// the real sandbox would create live transactions in someone's account, fail in
+// CI with no network credentials, and be slower than the thing it tested.
+//
+// What that means in practice: each test exercises the path up to the point
+// just before the outbound call, and the webhook tests exercise everything
+// after it. The one gap left — that Paddle's own bytes verify — cannot be
+// closed by a unit test and was closed instead by a real delivery from Paddle's
+// simulator on 2026-10-05.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Make `user` the owner of `org` in the directory, which is where `OrgAccess`
+/// reads the role from. `make_org` sets `organizations.owner_id` and nothing
+/// else, so an owner with no member row is a 404 to every org route.
+async fn add_org_owner(db: &sqlx::PgPool, org: Uuid, user: Uuid) {
+    sqlx::query(
+        "INSERT INTO organization_members (org_id, user_id, role, seat_assigned_at) \
+         VALUES ($1, $2, 'owner', NOW())",
+    )
+    .bind(org)
+    .bind(user)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+async fn add_org_admin(db: &sqlx::PgPool, org: Uuid, user: Uuid) {
+    sqlx::query(
+        "INSERT INTO organization_members (org_id, user_id, role, seat_assigned_at) \
+         VALUES ($1, $2, 'admin', NULL)",
+    )
+    .bind(org)
+    .bind(user)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// Pretend Paddle has already sold this organisation a subscription.
+async fn attach_subscription(db: &sqlx::PgPool, org: Uuid, sub: &str, price: &str) {
+    sqlx::query(
+        "UPDATE organizations SET paddle_subscription_id = $2, paddle_customer_id = $3, \
+         paddle_price_id = $4, subscription_status = 'active', seats = 4 WHERE id = $1",
+    )
+    .bind(org)
+    .bind(sub)
+    .bind(format!("ctm_{}", Uuid::new_v4().simple()))
+    .bind(price)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// Build a `Paddle-Signature` header for `body`, from Paddle's documented
+/// formula: `HMAC-SHA256(secret, "{ts}:{raw_body}")`, lowercase hex.
+fn paddle_signature(body: &str, secret: &str, ts: i64) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(format!("{ts}:{body}").as_bytes());
+    format!("ts={ts};h1={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+/// The webhook secret this deployment is configured with, or `None` when billing
+/// is not configured. ⚠️ Never printed.
+async fn webhook_secret() -> Option<String> {
+    Config::from_env()
+        .ok()
+        .and_then(|c| c.paddle.map(|p| p.webhook_secret))
+}
+
+/// A `subscription.updated` body for `org`, with an optional scheduled change.
+fn subscription_event(
+    org: Uuid,
+    sub: &str,
+    price: &str,
+    scheduled: Option<(&str, &str)>,
+) -> String {
+    let sc = match scheduled {
+        Some((action, at)) => {
+            serde_json::json!({ "action": action, "effective_at": at, "resume_at": null })
+        }
+        None => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "event_id": format!("evt_{}", Uuid::new_v4().simple()),
+        "event_type": "subscription.updated",
+        "occurred_at": "2026-10-05T12:00:00.000000Z",
+        "data": {
+            "id": sub,
+            "status": "active",
+            "customer_id": format!("ctm_{}", Uuid::new_v4().simple()),
+            "custom_data": { "org_id": org.to_string() },
+            "current_billing_period": { "ends_at": "2026-11-03T12:00:00.000000Z" },
+            "scheduled_change": sc,
+            "items": [{ "quantity": 4, "price": { "id": price } }],
+        }
+    })
+    .to_string()
+}
+
+/// ⚠️ **The state everyone forgets, and the one this feature got wrong.**
+///
+/// Paddle does not set `status = canceled` when a customer cancels. The status
+/// stays `active` and a `scheduled_change` appears. Migration 011 had nowhere to
+/// put that, so the billing screen would have told someone who had just
+/// cancelled that their plan **renews** on the exact date it ends — and the
+/// natural response to that is to cancel again through their bank.
+///
+/// This asserts the whole path: a signed webhook → migration 012's columns →
+/// what `GET /billing` reports.
+#[tokio::test]
+async fn a_scheduled_cancellation_is_reported_as_an_ending_not_a_renewal() {
+    let Some(secret) = webhook_secret().await else {
+        eprintln!("skipped: billing is not configured in this environment");
+        return;
+    };
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (owner, jwt) = verified_user(&server).await;
+    let org = make_org(&db, owner, "team").await;
+    add_org_owner(&db, org, owner).await;
+
+    let sub = format!("sub_{}", Uuid::new_v4().simple());
+    let body = subscription_event(
+        org,
+        &sub,
+        "pri_whatever",
+        Some(("cancel", "2026-11-03T12:00:00.000000Z")),
+    );
+    let ts = chrono::Utc::now().timestamp();
+
+    let hook = server
+        .post("/api/v1/billing/webhook")
+        .add_header(
+            HeaderName::from_static("paddle-signature"),
+            HeaderValue::from_str(&paddle_signature(&body, &secret, ts)).unwrap(),
+        )
+        .add_header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        .text(body)
+        .await;
+    assert_eq!(hook.status_code(), StatusCode::OK, "{}", hook.text());
+
+    let state = bearer(server.get(&format!("/api/v1/orgs/{org}/billing")), &jwt).await;
+    assert_eq!(state.status_code(), StatusCode::OK, "{}", state.text());
+    let body: serde_json::Value = state.json();
+
+    assert_eq!(
+        body["subscription"]["status"], "active",
+        "a cancelled-but-running subscription is still active in Paddle — if this \
+         ever reads `canceled`, the screen below it is describing the wrong thing"
+    );
+    assert_eq!(
+        body["subscription"]["scheduled_change"]["action"], "cancel",
+        "the pending cancellation must survive to the screen: {body}"
+    );
+    assert!(
+        body["subscription"]["scheduled_change"]["effective_at"].is_string(),
+        "an action with no date renders as \"your plan ends on —\": {body}"
+    );
+}
+
+/// ⚠️ The COALESCE trap, asserted.
+///
+/// Every other column the webhook writes is coalesced, so an event that omits it
+/// cannot blank it. `scheduled_change` **must not be**: absent means "nothing is
+/// scheduled", which is exactly what undoing a cancellation produces. Coalescing
+/// it would make every cancellation permanent, and resuming would appear to work
+/// while the screen kept saying the plan ends.
+#[tokio::test]
+async fn undoing_a_cancellation_is_not_overwritten_by_the_next_event() {
+    let Some(secret) = webhook_secret().await else {
+        eprintln!("skipped: billing is not configured in this environment");
+        return;
+    };
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (owner, jwt) = verified_user(&server).await;
+    let org = make_org(&db, owner, "team").await;
+    add_org_owner(&db, org, owner).await;
+    let sub = format!("sub_{}", Uuid::new_v4().simple());
+
+    let send = |body: String| {
+        let ts = chrono::Utc::now().timestamp();
+        let sig = paddle_signature(&body, &secret, ts);
+        server
+            .post("/api/v1/billing/webhook")
+            .add_header(
+                HeaderName::from_static("paddle-signature"),
+                HeaderValue::from_str(&sig).unwrap(),
+            )
+            .add_header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .text(body)
+    };
+
+    send(subscription_event(
+        org,
+        &sub,
+        "pri_whatever",
+        Some(("cancel", "2026-11-03T12:00:00.000000Z")),
+    ))
+    .await;
+
+    // The same subscription, later, with nothing scheduled — what Paddle sends
+    // after a successful resume.
+    let mut later: serde_json::Value =
+        serde_json::from_str(&subscription_event(org, &sub, "pri_whatever", None)).unwrap();
+    later["occurred_at"] = serde_json::json!("2026-10-05T13:00:00.000000Z");
+    send(later.to_string()).await;
+
+    let body: serde_json::Value = bearer(server.get(&format!("/api/v1/orgs/{org}/billing")), &jwt)
+        .await
+        .json();
+    assert!(
+        body["subscription"]["scheduled_change"].is_null(),
+        "a resume must clear the scheduled cancellation, not be coalesced away: {body}"
+    );
+}
+
+/// ⚠️ Two writers, one column, no reconciliation.
+///
+/// `PUT /orgs/:id/seats` writes `organizations.seats` directly. Once Paddle is
+/// paying, that number is what the invoice is computed from — so a local edit
+/// either grants seats nobody is billed for or bills for seats nobody has, and
+/// the next `subscription.updated` silently reverts it either way.
+#[tokio::test]
+async fn the_seat_count_cannot_be_edited_behind_paddles_back() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (owner, jwt) = verified_user(&server).await;
+    let org = make_org(&db, owner, "team").await;
+    add_org_owner(&db, org, owner).await;
+
+    // The positive control: without a subscription this route is the right one.
+    let before = bearer(server.put(&format!("/api/v1/orgs/{org}/seats")), &jwt)
+        .json(&serde_json::json!({ "seats": 5 }))
+        .await;
+    assert_eq!(
+        before.status_code(),
+        StatusCode::OK,
+        "a self-hosted organisation with no Paddle must still set its own seats: {}",
+        before.text()
+    );
+
+    attach_subscription(
+        &db,
+        org,
+        &format!("sub_{}", Uuid::new_v4().simple()),
+        "pri_whatever",
+    )
+    .await;
+
+    let after = bearer(server.put(&format!("/api/v1/orgs/{org}/seats")), &jwt)
+        .json(&serde_json::json!({ "seats": 9 }))
+        .await;
+    assert_eq!(
+        after.status_code(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a subscribed organisation must not edit its seat count locally: {}",
+        after.text()
+    );
+    // ⚠️ Asserts the refusal explains itself without naming a route. The message
+    // reaches a CLI user as plainly as a browser one, and each surface points at
+    // its own next step — so a route name here would be server-speak in a
+    // terminal, which is exactly what the first version of this shipped.
+    let msg = after.text();
+    assert!(
+        msg.contains("subscription"),
+        "the refusal has to say WHY, or it is a dead end: {msg}"
+    );
+    assert!(
+        !msg.contains("POST /") && !msg.contains("/orgs/{"),
+        "no raw route in a message that reaches a terminal: {msg}"
+    );
+
+    // And nothing was written.
+    let seats: Option<i32> = sqlx::query_scalar("SELECT seats FROM organizations WHERE id = $1")
+        .bind(org)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(seats, Some(4), "the refused write must not have landed");
+}
+
+/// Two subscriptions for one organisation means two invoices, and whichever
+/// webhook lands last wins. `paddle_subscription_id` is UNIQUE, so the second
+/// would also orphan the first — leaving a live, billing subscription attached
+/// to nothing.
+#[tokio::test]
+async fn an_organisation_cannot_start_a_second_subscription() {
+    let Some(price) = Config::from_env().ok().and_then(|c| {
+        c.paddle
+            .and_then(|p| p.prices.first().map(|(id, _)| id.clone()))
+    }) else {
+        eprintln!("skipped: billing is not configured in this environment");
+        return;
+    };
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (owner, jwt) = verified_user(&server).await;
+    let org = make_org(&db, owner, "team").await;
+    add_org_owner(&db, org, owner).await;
+    attach_subscription(
+        &db,
+        org,
+        &format!("sub_{}", Uuid::new_v4().simple()),
+        &price,
+    )
+    .await;
+
+    // ⚠️ Refused BEFORE any outbound call, which is why this test can assert it
+    // without reaching Paddle. If the guard ever moves below the API call, this
+    // test starts making real sandbox transactions and will say so by hanging.
+    let resp = bearer(server.post(&format!("/api/v1/orgs/{org}/checkout")), &jwt)
+        .json(&serde_json::json!({ "price_id": price, "quantity": 2 }))
+        .await;
+    assert_eq!(
+        resp.status_code(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a second checkout must be refused while one subscription is live: {}",
+        resp.text()
+    );
+}
+
+/// An admin assigns seats. Only the owner changes what the organisation is
+/// **billed** — the seat count is what the invoice is computed from, and the
+/// portal links open cancellation and payment-method forms.
+///
+/// ⚠️ Four routes, asserted separately. A single loop would let three of them
+/// regress behind one that still refuses.
+#[tokio::test]
+async fn an_admin_cannot_change_what_the_organisation_is_billed() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (owner, _) = verified_user(&server).await;
+    let (admin, admin_jwt) = verified_user(&server).await;
+    let org = make_org(&db, owner, "team").await;
+    add_org_owner(&db, org, owner).await;
+    add_org_admin(&db, org, admin).await;
+    attach_subscription(
+        &db,
+        org,
+        &format!("sub_{}", Uuid::new_v4().simple()),
+        "pri_whatever",
+    )
+    .await;
+
+    for route in ["portal", "seats", "resume"] {
+        let resp = bearer(
+            server.post(&format!("/api/v1/orgs/{org}/billing/{route}")),
+            &admin_jwt,
+        )
+        .json(&serde_json::json!({ "quantity": 9 }))
+        .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::FORBIDDEN,
+            "billing/{route} must be owner-only, got {} {}",
+            resp.status_code(),
+            resp.text()
+        );
+    }
+
+    // The positive control, on the one axis an admin DOES hold: reading the
+    // state. Without this the assertions above would pass equally well if the
+    // admin simply had no access to the organisation at all.
+    let read = bearer(
+        server.get(&format!("/api/v1/orgs/{org}/billing")),
+        &admin_jwt,
+    )
+    .await;
+    assert_eq!(
+        read.status_code(),
+        StatusCode::OK,
+        "an admin must still be able to see whether the organisation is paid up: {}",
+        read.text()
+    );
+    assert_eq!(read.json::<serde_json::Value>()["your_role"], "admin");
+}
+
+/// ⚠️ Asserted because the refusal is what keeps the test suite off Paddle's
+/// API: `resume` checks the database before it calls out, so "nothing is
+/// scheduled" is answered locally.
+#[tokio::test]
+async fn resuming_a_subscription_with_nothing_scheduled_is_refused() {
+    let Some(_) = webhook_secret().await else {
+        eprintln!("skipped: billing is not configured in this environment");
+        return;
+    };
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (owner, jwt) = verified_user(&server).await;
+    let org = make_org(&db, owner, "team").await;
+    add_org_owner(&db, org, owner).await;
+    attach_subscription(
+        &db,
+        org,
+        &format!("sub_{}", Uuid::new_v4().simple()),
+        "pri_whatever",
+    )
+    .await;
+
+    let resp = bearer(
+        server.post(&format!("/api/v1/orgs/{org}/billing/resume")),
+        &jwt,
+    )
+    .await;
+    assert_eq!(
+        resp.status_code(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        resp.text()
+    );
+}
+
+/// An organisation with no subscription answers 422 and a sentence, not 404 and
+/// not a 500 from Paddle being handed the literal string "null" in a URL path.
+#[tokio::test]
+async fn billing_actions_on_an_unsubscribed_organisation_say_so() {
+    let Some(_) = webhook_secret().await else {
+        eprintln!("skipped: billing is not configured in this environment");
+        return;
+    };
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (owner, jwt) = verified_user(&server).await;
+    let org = make_org(&db, owner, "free").await;
+    add_org_owner(&db, org, owner).await;
+
+    for route in ["portal", "resume"] {
+        let resp = bearer(
+            server.post(&format!("/api/v1/orgs/{org}/billing/{route}")),
+            &jwt,
+        )
+        .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "billing/{route} on an unsubscribed org: got {} {}",
+            resp.status_code(),
+            resp.text()
+        );
+    }
+
+    // Reading the state still works, and says there is nothing.
+    let body: serde_json::Value = bearer(server.get(&format!("/api/v1/orgs/{org}/billing")), &jwt)
+        .await
+        .json();
+    assert_eq!(body["subscription"]["exists"], false);
+    assert!(body["subscription"]["status"].is_null());
 }

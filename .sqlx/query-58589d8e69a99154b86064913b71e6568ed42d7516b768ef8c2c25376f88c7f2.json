@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT plan, seats, subscription_status, current_period_ends_at,\n                  (paddle_subscription_id IS NOT NULL) AS \"has_subscription!\",\n                  (SELECT COUNT(*) FROM organization_members m\n                    WHERE m.org_id = $1 AND m.seat_assigned_at IS NOT NULL) AS \"seats_used!\"\n           FROM organizations WHERE id = $1",
+  "query": "SELECT plan, seats, subscription_status, current_period_ends_at,\n                  scheduled_change_action, scheduled_change_at,\n                  (paddle_subscription_id IS NOT NULL) AS \"has_subscription!\",\n                  (SELECT COUNT(*) FROM organization_members m\n                    WHERE m.org_id = $1 AND m.seat_assigned_at IS NOT NULL) AS \"seats_used!\"\n           FROM organizations WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -25,11 +25,21 @@
       },
       {
         "ordinal": 4,
+        "name": "scheduled_change_action",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "scheduled_change_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
         "name": "has_subscription!",
         "type_info": "Bool"
       },
       {
-        "ordinal": 5,
+        "ordinal": 7,
         "name": "seats_used!",
         "type_info": "Int8"
       }
@@ -44,9 +54,11 @@
       true,
       true,
       true,
+      true,
+      true,
       null,
       null
     ]
   },
-  "hash": "c9d16d51329510ff295c543b8db436cc9a2ea0df716f8820bafc2c895c55735a"
+  "hash": "58589d8e69a99154b86064913b71e6568ed42d7516b768ef8c2c25376f88c7f2"
 }

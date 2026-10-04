@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT paddle_subscription_id, paddle_customer_id FROM organizations WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "paddle_subscription_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "paddle_customer_id",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "a4377b71f9396205b4da661030e2a9a768940a5a225df9ad60470b0fe6770c97"
+}

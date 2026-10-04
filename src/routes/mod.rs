@@ -230,6 +230,16 @@ pub fn create_router(state: AppState) -> Router {
         // organisation is paid up is not a secret from the people it covers,
         // and hiding it makes "why did my limits change?" unanswerable.
         .route("/:org_id/billing", get(billing::billing_state))
+        .route("/:org_id/billing/catalog", get(billing::catalog))
+        .route("/:org_id/billing/invoices", get(billing::invoices))
+        // ⚠️ All three below are owner-only, in the handler signature rather
+        // than in a comment: they change what the organisation is billed.
+        // `billing/seats` is deliberately NOT the same route as
+        // `PUT /:org_id/seats` — that one writes the column directly and is
+        // refused once Paddle is the authority on it.
+        .route("/:org_id/billing/portal", post(billing::portal))
+        .route("/:org_id/billing/seats", post(billing::change_seats))
+        .route("/:org_id/billing/resume", post(billing::resume))
         .route("/:org_id/checkout", post(billing::checkout))
         .route(
             "/:org_id/members/:user_id",

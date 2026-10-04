@@ -27,6 +27,24 @@ pub struct PaddleConfig {
     /// completely at launch. That is why they are configuration rather than
     /// constants.
     pub prices: Vec<(String, &'static str)>,
+
+    /// Where Paddle Checkout actually renders. **Not a secret.**
+    ///
+    /// ⚠️ Paddle Billing has no Paddle-hosted checkout page for the web. A
+    /// transaction's payment link is *this URL* with `?_ptxn=txn_…` appended,
+    /// and the page it points at must load Paddle.js itself.
+    ///
+    /// ⛔ **It must not be `app.evnx.dev`.** That origin holds the master key in
+    /// a Web Worker and the access token in memory; a third-party script there
+    /// could render a convincing "re-enter your master password" prompt, which
+    /// is a plaintext compromise rather than a ciphertext one. `pay.evnx.dev`
+    /// exists for exactly this and holds nothing.
+    ///
+    /// `None` falls back to the default payment link set in the Paddle
+    /// dashboard. ⚠️ If neither is set, Paddle returns a transaction with no
+    /// `checkout.url` and the checkout endpoint says so rather than handing the
+    /// browser a null.
+    pub checkout_url: Option<String>,
 }
 
 impl PaddleConfig {
@@ -62,6 +80,9 @@ impl std::fmt::Debug for PaddleConfig {
             .field("environment", &self.environment)
             .field("webhook_secret", &"<redacted>")
             .field("api_key", &"<redacted>")
+            // ⚠️ Printed, deliberately. It is a public URL, and "no checkout
+            // page configured" is the failure this field exists to make visible.
+            .field("checkout_url", &self.checkout_url)
             .finish()
     }
 }
@@ -452,11 +473,27 @@ impl Config {
                     ));
                 }
 
+                // ⚠️ Validated as absolute https here rather than at the call
+                // site. A relative or http URL is accepted by Paddle and
+                // produces a payment link that silently 404s or downgrades.
+                let checkout_url = env::var("PADDLE_CHECKOUT_URL")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+                if let Some(url) = checkout_url.as_deref() {
+                    if !url.starts_with("https://") {
+                        return Err(ConfigError::Invalid(format!(
+                            "PADDLE_CHECKOUT_URL must be an absolute https URL, got {url:?}"
+                        )));
+                    }
+                }
+
                 Some(PaddleConfig {
                     webhook_secret,
                     api_key,
                     environment,
                     prices,
+                    checkout_url,
                 })
             }
             (None, None) => None,
@@ -767,6 +804,7 @@ mod paddle_config_tests {
             webhook_secret: "pdl_ntfset_SUPERSECRET".into(),
             api_key: "pdl_sdbx_apikey_SUPERSECRET".into(),
             environment: "sandbox".into(),
+            checkout_url: None,
             prices: vec![("pri_test".into(), "team")],
         };
         let rendered = format!("{p:?}");
@@ -784,6 +822,7 @@ mod paddle_config_tests {
             webhook_secret: "s".into(),
             api_key: "k".into(),
             environment: "sandbox".into(),
+            checkout_url: None,
             prices: vec![
                 ("pri_team_m".into(), "team"),
                 ("pri_ent_m".into(), "enterprise"),
@@ -810,6 +849,7 @@ mod paddle_config_tests {
             webhook_secret: "s".into(),
             api_key: "k".into(),
             environment: e.into(),
+            checkout_url: None,
             prices: vec![("pri_test".into(), "team")],
         };
         assert_eq!(p("live").api_base(), "https://api.paddle.com");

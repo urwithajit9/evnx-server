@@ -105,3 +105,10 @@ base32 = "0.5.1"
 [dev-dependencies]
 # Testing HTTP endpoints without running a real server
 axum-test = "14"
+# ⚠️ The billing tests sign their own webhooks. Using the same primitives the
+# verifier uses would make a test that passes because both sides share a bug —
+# so these are listed here deliberately and the test constructs the signed
+# payload from Paddle's documented formula, not from our verifier's internals.
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"

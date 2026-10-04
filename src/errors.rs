@@ -72,6 +72,25 @@ pub enum AppError {
 
     #[error("Internal server error")]
     Internal(String),
+
+    /// ⚠️ **The one error whose message is passed through to the client.**
+    ///
+    /// For a dependency that is unavailable, or a part of this deployment that
+    /// is not configured. 503 rather than 500, because nothing is broken — the
+    /// request was well-formed and the server simply cannot serve it here.
+    ///
+    /// ⛔ **Every construction site owes the same promise: the string is written
+    /// for whoever is reading the screen, and contains no internal detail.** No
+    /// upstream error text, no identifiers, no hostnames, no configuration
+    /// values. It exists because the alternative — `Internal` — renders
+    /// "An internal error occurred" for things like *"billing is not set up on
+    /// this deployment"*, which sends people hunting for a fault that is not
+    /// there.
+    ///
+    /// ⚠️ It is NOT a general-purpose message channel. If the detail would help
+    /// an attacker distinguish two states, it belongs in `tracing`, not here.
+    #[error("{0}")]
+    ServiceUnavailable(String),
 }
 
 /// Map AppError → HTTP Response.
@@ -88,6 +107,11 @@ impl IntoResponse for AppError {
             }
             AppError::Internal(msg) => {
                 tracing::error!(error = %msg, "Internal error");
+            }
+            // Logged at warn: it is a real condition someone has to fix, but it
+            // is not a fault in this process and should not page anyone.
+            AppError::ServiceUnavailable(msg) => {
+                tracing::warn!(reason = %msg, "Service unavailable");
             }
             _ => {} // Auth/validation errors are not server errors
         }
@@ -140,6 +164,11 @@ impl IntoResponse for AppError {
                 "INTERNAL_ERROR",
                 "An internal error occurred".to_string(),
             ),
+            // ⚠️ The message goes through. See the variant's own note for the
+            // promise every construction site has to keep.
+            AppError::ServiceUnavailable(msg) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE", msg)
+            }
         };
 
         (status, Json(json!({ "error": message, "code": code }))).into_response()

@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE organizations SET\n            paddle_subscription_id = $2,\n            paddle_customer_id     = COALESCE($3, paddle_customer_id),\n            subscription_status    = COALESCE($4, subscription_status),\n            current_period_ends_at = COALESCE($5, current_period_ends_at),\n            seats                  = COALESCE($6, seats),\n            plan                   = COALESCE($7, plan),\n            scheduled_change_action = $9,\n            scheduled_change_at     = $10,\n            -- ⚠️ COALESCE, unlike the scheduled change above: an event without\n            -- items must not blank the price, or the next seat change has\n            -- nothing to send Paddle. Same reasoning as `plan`.\n            paddle_price_id        = COALESCE($11, paddle_price_id),\n            billing_updated_at     = $8,\n            updated_at             = NOW()\n        WHERE id = $1\n          AND (billing_updated_at IS NULL OR billing_updated_at <= $8)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Int4",
+        "Text",
+        "Timestamptz",
+        "Text",
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "42bf2b761d7daf4b265e6544ef0df487ec26ffa5917e5130170a7276104d299d"
+}

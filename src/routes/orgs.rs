@@ -349,6 +349,35 @@ pub async fn set_seats(
         }
     }
 
+    // ⚠️ Refused once Paddle is paying for the seats.
+    //
+    // This route writes `organizations.seats` directly, which is correct for a
+    // deployment with no Paddle — and wrong the moment there is one. Paddle's
+    // quantity is what the invoice is computed from, so a local edit would
+    // either grant seats nobody is billed for or bill for seats nobody has, and
+    // the next `subscription.updated` webhook would silently revert it. Two
+    // writers, one column, no reconciliation.
+    //
+    // 422 and a route name, rather than a 403: the caller is the owner and is
+    // allowed to do this — just not here.
+    let subscribed: Option<String> = sqlx::query_scalar!(
+        "SELECT paddle_subscription_id FROM organizations WHERE id = $1",
+        access.org_id
+    )
+    .fetch_one(&state.db)
+    .await?;
+    if subscribed.is_some() {
+        // ⚠️ No route name in the message. It reaches a CLI user as plainly as a
+        // browser one, and "Use POST /orgs/{org_id}/billing/seats" is server-speak
+        // in a terminal. Each surface points at its own next step; this says only
+        // what is true everywhere.
+        return Err(AppError::Validation(
+            "this organisation's seat count is set by its subscription, so it cannot \
+             be changed here. Change it where the subscription is managed."
+                .into(),
+        ));
+    }
+
     sqlx::query!(
         "UPDATE organizations SET seats = $1, updated_at = NOW() WHERE id = $2",
         req.seats,

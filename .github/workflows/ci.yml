@@ -79,6 +79,16 @@ jobs:
           # Tests use the local filesystem backend — no cloud account needed.
           STORAGE_BACKEND: local
           STORAGE_LOCAL_PATH: ./target/test-blobs
+          # ⚠️ Dummies, and they matter. Without them `config.paddle` is None in
+          # CI, every billing test takes its "billing is not configured" early
+          # return, and the suite reports green while testing nothing at all.
+          # No test calls Paddle — each asserts a refusal that happens before
+          # the outbound call, or signs its own webhook with the secret below.
+          PADDLE_WEBHOOK_SECRET: pdl_ntfset_ci_only_not_a_real_secret
+          PADDLE_API_KEY: pdl_sdbx_apikey_ci_only_not_a_real_key
+          PADDLE_ENVIRONMENT: sandbox
+          PADDLE_PRICE_TEAM_MONTHLY: pri_ci000000000000000000000001
+          PADDLE_CHECKOUT_URL: https://pay.evnx.dev/
         # Serial: the suite shares one Postgres database and one Valkey instance.
         run: cargo test --all -- --test-threads=1
 
