@@ -1644,6 +1644,43 @@ pub async fn delete_account(
         )));
     }
 
+    // ── Soft-deleted organisations this account owns ────────────────────────
+    //
+    // ⚠️ Without this the deletion 500s, and the check above does not catch it.
+    // `organizations.owner_id` is `ON DELETE RESTRICT`, and a SOFT delete leaves
+    // the row — so an owner who tidied up by deleting their organisation passes
+    // the live-org check above and then meets a foreign-key violation on the
+    // `DELETE FROM users` below. Found by
+    // `deleting_an_organisation_unblocks_account_deletion`, which is exactly the
+    // sequence a real person follows.
+    //
+    // RESTRICT is kept rather than loosened to CASCADE: the check above is what
+    // protects a LIVE organisation from being deleted as a side effect of one
+    // person leaving, and a constraint that still refuses is worth having behind
+    // it. What is removed here is only what the owner already discarded.
+    //
+    // ⚠️ Hard delete, and the cascade is intended. `organization_members` and
+    // `organization_invites` are both `ON DELETE CASCADE` from `organizations`,
+    // so they go too — which is right, since erasing an account should not leave
+    // its organisation's directory behind. The audit trail SURVIVES: org events
+    // carry their org id in `metadata`, not in a foreign key, so nothing cascades
+    // to `audit_events`.
+    let discarded = sqlx::query!(
+        "DELETE FROM organizations WHERE owner_id = $1 AND deleted_at IS NOT NULL",
+        user_id
+    )
+    .execute(&state.db)
+    .await?
+    .rows_affected();
+
+    if discarded > 0 {
+        tracing::info!(
+            %user_id,
+            discarded,
+            "removed soft-deleted organisations before deleting their owner"
+        );
+    }
+
     // ── The blobs of vaults that die with the account ───────────────────────
     //
     // Collected before the delete, because afterwards the rows naming them are

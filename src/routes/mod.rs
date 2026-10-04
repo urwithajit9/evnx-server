@@ -217,7 +217,7 @@ pub fn create_router(state: AppState) -> Router {
         // cannot sit under `/:org_id` because the caller is not a member yet, so
         // there is no org role for `OrgAccess` to extract.
         .route("/invites/accept", post(orgs::accept_invite))
-        .route("/:org_id", patch(orgs::patch_org))
+        .route("/:org_id", patch(orgs::patch_org).delete(orgs::delete_org))
         // ⚠️ Owner-only, and a separate route rather than a field on the PATCH
         // above, so the requirement sits in the handler signature where it
         // cannot be skipped. Seat *count* is billing; seat *assignment* is

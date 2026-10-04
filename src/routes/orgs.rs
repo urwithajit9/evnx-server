@@ -403,6 +403,79 @@ pub async fn set_seats(
     })))
 }
 
+/// `DELETE /api/v1/orgs/:org_id` — soft-delete an organisation.
+///
+/// ⚠️ **This endpoint exists because leaving it out was a trap.** Owning an
+/// organisation blocks account deletion (see `auth::delete_account`), and
+/// `MAX_OWNED_ORGS` caps creation at five — so without a way to delete one, five
+/// organisations would permanently remove the ability to close the account. A
+/// limit with no release valve is worse than no limit.
+///
+/// Owner-only, by signature.
+///
+/// ⚠️ **Soft delete, and `quota::resolve_plan` already honours it**: the join
+/// carries `o.deleted_at IS NULL`, so every seat holder drops back to their own
+/// plan the moment this returns. That is the intended behaviour and the reason
+/// the confirmation below spells it out — it is a plan change for everybody at
+/// once.
+///
+/// Membership rows are left in place rather than deleted. They are unreachable
+/// through every query (all of which join a live organisation), and keeping them
+/// means an accidental deletion can be undone by clearing one column.
+///
+/// # Errors
+/// * `403` — not the owner.
+/// * `409` — seats are still assigned, unless `force` is set.
+pub async fn delete_org(
+    State(state): State<AppState>,
+    access: OrgAccess<OrgOwnerOnly>,
+    client: ClientContext,
+    Json(req): Json<DeleteOrgRequest>,
+) -> Result<axum::http::StatusCode, AppError> {
+    let assigned: i64 = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) AS "n!" FROM organization_members
+           WHERE org_id = $1 AND seat_assigned_at IS NOT NULL"#,
+        access.org_id
+    )
+    .fetch_one(&state.db)
+    .await?;
+
+    // ⚠️ Refused by default when seats are assigned, because deleting is a plan
+    // change for every holder at once and they are not the one running this. The
+    // owner's own seat counts: it is still somebody losing limits.
+    if assigned > 0 && !req.force {
+        return Err(AppError::Conflict(format!(
+            "{assigned} seat(s) are still assigned, and deleting this organisation              drops every holder back to their own plan. Release the seats first, or              send force = true to accept that."
+        )));
+    }
+
+    sqlx::query!(
+        "UPDATE organizations SET deleted_at = NOW(), updated_at = NOW()          WHERE id = $1 AND deleted_at IS NULL",
+        access.org_id
+    )
+    .execute(&state.db)
+    .await?;
+
+    record_org_event(
+        &state.db,
+        access.org_id,
+        access.user_id,
+        "org_deleted",
+        &client,
+        json!({ "seats_assigned_at_deletion": assigned, "forced": req.force }),
+    );
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize, Default)]
+pub struct DeleteOrgRequest {
+    /// Delete even though seats are assigned, accepting that every holder's plan
+    /// drops back to their own.
+    #[serde(default)]
+    pub force: bool,
+}
+
 // ─── Members ──────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]

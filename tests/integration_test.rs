@@ -7142,3 +7142,113 @@ async fn organisation_acts_are_audited_without_a_vault_id_or_a_token() {
 
     let _ = owner;
 }
+
+/// ⚠️ **The release valve, and why its absence was a trap.**
+///
+/// Owning an organisation blocks account deletion, and `MAX_OWNED_ORGS` caps
+/// creation at five — so without a way to delete one, five organisations would
+/// permanently remove the ability to close the account. A limit with no release
+/// valve is worse than no limit.
+#[tokio::test]
+async fn deleting_an_organisation_unblocks_account_deletion() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (user, jwt) = verified_user(&server).await;
+    let (org, _) = api_create_org(&server, &jwt).await;
+    let email = email_of(&db, user).await;
+
+    // Blocked while it exists.
+    let blocked = bearer(server.delete("/api/v1/auth/account"), &jwt)
+        .json(&serde_json::json!({ "confirm_email": email.clone() }))
+        .await;
+    assert_eq!(
+        blocked.status_code(),
+        StatusCode::CONFLICT,
+        "{}",
+        blocked.text()
+    );
+
+    let gone = bearer(server.delete(&format!("/api/v1/orgs/{org}")), &jwt)
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(
+        gone.status_code(),
+        StatusCode::NO_CONTENT,
+        "an owner with no seats assigned may delete: {}",
+        gone.text()
+    );
+
+    // ⚠️ And the account can now actually be closed — the point of the valve.
+    let closed = bearer(server.delete("/api/v1/auth/account"), &jwt)
+        .json(&serde_json::json!({ "confirm_email": email }))
+        .await;
+    assert_eq!(
+        closed.status_code(),
+        StatusCode::NO_CONTENT,
+        "deleting the organisation must unblock the account: {}",
+        closed.text()
+    );
+}
+
+/// ⚠️ Deleting with seats assigned is a plan change for every holder at once, and
+/// they are not the one running the command — so it is refused unless forced.
+#[tokio::test]
+async fn deleting_an_organisation_with_seats_assigned_needs_force() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (owner, owner_jwt, _admin, _admin_jwt, org) = org_with_an_admin(&server, &db).await;
+
+    bearer(server.put(&format!("/api/v1/orgs/{org}/seats")), &owner_jwt)
+        .json(&serde_json::json!({ "seats": 5 }))
+        .await;
+    bearer(
+        server.patch(&format!("/api/v1/orgs/{org}/members/{owner}")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({ "seat": true }))
+    .await;
+
+    let refused = bearer(server.delete(&format!("/api/v1/orgs/{org}")), &owner_jwt)
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(
+        refused.status_code(),
+        StatusCode::CONFLICT,
+        "{}",
+        refused.text()
+    );
+    assert!(refused.text().contains("seat"), "{}", refused.text());
+
+    let forced = bearer(server.delete(&format!("/api/v1/orgs/{org}")), &owner_jwt)
+        .json(&serde_json::json!({ "force": true }))
+        .await;
+    assert_eq!(
+        forced.status_code(),
+        StatusCode::NO_CONTENT,
+        "{}",
+        forced.text()
+    );
+
+    // ⚠️ And the seat holder's plan drops immediately, because `resolve_plan`
+    // already honours `deleted_at`. That is the behaviour the refusal warns about.
+    assert_eq!(
+        evnx_server::services::quota::plan_for(&db, owner)
+            .await
+            .unwrap(),
+        evnx_server::services::quota::Plan::Free,
+        "a deleted organisation must stop granting its plan"
+    );
+}
+
+/// An admin is not the owner, and deletion is a billing act.
+#[tokio::test]
+async fn only_the_owner_can_delete_an_organisation() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (_owner, _owner_jwt, _admin, admin_jwt, org) = org_with_an_admin(&server, &db).await;
+
+    let resp = bearer(server.delete(&format!("/api/v1/orgs/{org}")), &admin_jwt)
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN, "{}", resp.text());
+}
