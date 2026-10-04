@@ -150,21 +150,100 @@ pub fn exceeded(what: &str, limit: u32, plan: Plan, remedy: &str) -> AppError {
     ))
 }
 
-/// Look up an account's plan.
+/// Where an account's plan came from.
 ///
-/// ⚠️ An unrecognised value is an **internal error**, not a fallback. Migration 008's
-/// CHECK makes it unreachable through normal writes, so seeing one means the column
-/// was changed out of band — and guessing at that point either locks out a paying
-/// customer or gives the product away.
-pub async fn plan_for(db: &sqlx::PgPool, user_id: uuid::Uuid) -> Result<Plan, AppError> {
-    let row: Option<String> = sqlx::query_scalar("SELECT plan FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(db)
-        .await?;
+/// Kept alongside the plan because "you are on team" and "you are on team because
+/// Acme pays for your seat" are different sentences, and only the second tells
+/// someone who to ask when the limit is wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanSource {
+    /// The account's own `users.plan`. Every account before organisations existed.
+    Own,
+    /// An organisation that has assigned this account a seat.
+    Organization {
+        id: uuid::Uuid,
+        name: String,
+        slug: String,
+    },
+}
 
-    let raw = row.ok_or(AppError::Unauthorized)?;
-    Plan::parse(&raw)
-        .ok_or_else(|| AppError::Internal(format!("unrecognised plan for user: {raw:?}")))
+/// An account's plan, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPlan {
+    pub plan: Plan,
+    pub source: PlanSource,
+}
+
+/// Resolve which plan applies to an account, and where it came from.
+///
+/// # The rule
+///
+/// **An assigned seat's organisation plan wins; otherwise the account's own
+/// `users.plan`.** Nothing else participates.
+///
+/// ⚠️ **`users.plan` is not replaced and must not be.** Solo accounts are the
+/// majority and are not going away, so it stays authoritative for anyone holding no
+/// seat. An organisation *overrides* it for the duration of a seat — which is why
+/// removing a seat is a plan change rather than a deletion.
+///
+/// ⚠️ **A soft-deleted organisation grants nothing.** The join carries
+/// `o.deleted_at IS NULL`, without which deleting an organisation would silently go
+/// on paying for everyone's limits — the kind of failure that shows up as a billing
+/// discrepancy months later rather than as an error.
+///
+/// ⚠️ **This returns at most one row because the database makes a second seat
+/// unstorable** — `organization_members_one_seat_per_user`, a unique partial index
+/// from migration 010. Without it the `LEFT JOIN` could multiply and this function
+/// would answer differently depending on row order. The index is not an
+/// optimisation; it is what makes the question well-posed.
+///
+/// ⚠️ An unrecognised plan string is an **internal error**, not a fallback. Both
+/// CHECK constraints make it unreachable through normal writes, so seeing one means
+/// a column was changed out of band — and guessing then either locks out a paying
+/// customer or gives the product away.
+pub async fn resolve_plan(
+    db: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+) -> Result<ResolvedPlan, AppError> {
+    type Row = (String, Option<uuid::Uuid>, Option<String>, Option<String>);
+
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT COALESCE(o.plan, u.plan), o.id, o.name, o.slug \
+         FROM users u \
+         LEFT JOIN organization_members m \
+                ON m.user_id = u.id AND m.seat_assigned_at IS NOT NULL \
+         LEFT JOIN organizations o \
+                ON o.id = m.org_id AND o.deleted_at IS NULL \
+         WHERE u.id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?;
+
+    let (raw, org_id, org_name, org_slug) = row.ok_or(AppError::Unauthorized)?;
+
+    let plan = Plan::parse(&raw)
+        .ok_or_else(|| AppError::Internal(format!("unrecognised plan for user: {raw:?}")))?;
+
+    // All three org columns come from the same joined row, so they are either all
+    // present or all absent. Matching on the triple rather than on `org_id` alone
+    // means a future schema change that makes one nullable cannot produce a
+    // half-built `Organization` here.
+    let source = match (org_id, org_name, org_slug) {
+        (Some(id), Some(name), Some(slug)) => PlanSource::Organization { id, name, slug },
+        _ => PlanSource::Own,
+    };
+
+    Ok(ResolvedPlan { plan, source })
+}
+
+/// An account's plan, without the provenance.
+///
+/// Thin wrapper over [`resolve_plan`] — kept so the quota checks and the handlers
+/// that only need the tier are unaffected by organisations existing. Reach for
+/// `resolve_plan` when the answer has to say *why*.
+pub async fn plan_for(db: &sqlx::PgPool, user_id: uuid::Uuid) -> Result<Plan, AppError> {
+    Ok(resolve_plan(db, user_id).await?.plan)
 }
 
 /// Refuse when the account already holds its plan's maximum number of vaults.
@@ -176,7 +255,13 @@ pub async fn check_vault_limit(
     quotas: &Quotas,
     user_id: uuid::Uuid,
 ) -> Result<(), AppError> {
-    let Some(limit) = quotas.for_plan(plan_for(db, user_id).await?).vaults else {
+    // ⚠️ Resolved once. This called `plan_for` twice — once for the limit and again
+    // to name the plan in the error — which was two round trips for one fact. With
+    // organisations that lookup is a three-table join, so the duplicate stopped
+    // being merely wasteful: the two calls could straddle a seat change and report a
+    // limit from one plan under the name of another.
+    let plan = plan_for(db, user_id).await?;
+    let Some(limit) = quotas.for_plan(plan).vaults else {
         return Ok(());
     };
     let count: i64 = sqlx::query_scalar(
@@ -190,7 +275,7 @@ pub async fn check_vault_limit(
         return Err(exceeded(
             "vaults",
             limit,
-            plan_for(db, user_id).await?,
+            plan,
             "Delete one you no longer need, and it frees a slot immediately.",
         ));
     }

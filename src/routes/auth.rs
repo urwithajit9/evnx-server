@@ -1507,7 +1507,8 @@ pub struct DeleteAccountRequest {
 /// * `400` — `confirm_email` does not match the account.
 /// * `401` — no session, or a wrong/absent TOTP code while TOTP is enabled.
 /// * `403` — an API token tried this; the route sits behind `require_user_session`.
-/// * `409` — the account owns vaults other people are members of, which are named.
+/// * `409` — the account owns vaults other people are members of, **or owns an
+///   organisation**; either way the blockers are named and nothing is deleted.
 pub async fn delete_account(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<Claims>,
@@ -1582,6 +1583,63 @@ pub async fn delete_account(
              the vaults, then try again.",
             blocking.len(),
             if blocking.len() == 1 { "" } else { "s" },
+            named
+        )));
+    }
+
+    // ── Organisations this account owns ─────────────────────────────────────
+    //
+    // ⚠️ Migration 010 made this check necessary, and without it the symptom is a
+    // 500 rather than a refusal. `organizations.owner_id` is `ON DELETE RESTRICT`,
+    // so the `DELETE FROM users` below would come back as a foreign-key violation —
+    // a database error surfaced to someone who typed their own address to confirm
+    // an irreversible act, telling them nothing about what to do.
+    //
+    // RESTRICT is the right constraint: an organisation may be paying for seats,
+    // and cascading would delete it along with every member's seat as a side effect
+    // of one person closing their account. So the fix is to say so here, where the
+    // other blocking case is already handled, rather than to weaken the constraint.
+    //
+    // ⚠️ Deliberately NOT offering to transfer ownership. Ownership transfer is its
+    // own deliberate act with its own authorisation, and inventing one inside a
+    // deletion path — where the actor is on their way out — is how an organisation
+    // ends up owned by whoever happened to be listed first.
+    let owned_orgs = sqlx::query!(
+        r#"
+        SELECT o.name, o.slug,
+               (SELECT COUNT(*) FROM organization_members m
+                 WHERE m.org_id = o.id AND m.seat_assigned_at IS NOT NULL) AS "seats!"
+        FROM organizations o
+        WHERE o.owner_id = $1 AND o.deleted_at IS NULL
+        ORDER BY o.slug
+        "#,
+        user_id
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(AppError::Database)?;
+
+    if !owned_orgs.is_empty() {
+        let named = owned_orgs
+            .iter()
+            .map(|o| {
+                format!(
+                    "{} ({}, {} seat{} assigned)",
+                    o.name,
+                    o.slug,
+                    o.seats,
+                    if o.seats == 1 { "" } else { "s" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(AppError::Conflict(format!(
+            "this account owns {} organisation{}: {}. An organisation may be paying \
+             for other people's seats, so deleting its owner is refused and nothing \
+             has been deleted. Transfer ownership, or delete the organisation, then \
+             try again.",
+            owned_orgs.len(),
+            if owned_orgs.len() == 1 { "" } else { "s" },
             named
         )));
     }

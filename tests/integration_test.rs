@@ -5998,3 +5998,367 @@ async fn a_recent_lockout_is_carried_into_the_next_login() {
         "someone signing in right after an attack on their account should be told"
     );
 }
+
+// ─── Organisations: plan resolution (migration 010, Chain 3 · 3.2a) ───────────
+//
+// There are no org endpoints yet — that is 3.2b — so these drive the database
+// directly and assert the one function every quota check routes through:
+// `quota::resolve_plan`.
+//
+// ⚠️ The reason this is worth its own block: an organisation is not primarily a
+// new table, it is a change to *where the authority for a plan lives*. Before
+// migration 010 the answer was always `users.plan`. Now it is "an assigned seat's
+// organisation, else `users.plan`", and every limit in the server inherits that
+// from one place. These tests are what pins the resolution rule.
+
+use evnx_server::services::quota::{self, Plan, PlanSource};
+
+async fn raw_db() -> sqlx::PgPool {
+    let config = test_config().await;
+    sqlx::PgPool::connect(&config.database_url)
+        .await
+        .expect("test: Postgres unreachable")
+}
+
+/// An organisation on `plan`, owned by `owner`. Returns its id.
+async fn make_org(db: &sqlx::PgPool, owner: Uuid, plan: &str) -> Uuid {
+    // Slug has to satisfy migration 010's CHECK: lowercase alphanumeric and
+    // hyphens, not starting or ending with one.
+    let slug = format!("o{}", Uuid::new_v4().simple());
+    sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO organizations (name, slug, owner_id, plan) \
+         VALUES ($1, $2, $3, $4) RETURNING id",
+    )
+    .bind(format!("Org {slug}"))
+    .bind(&slug)
+    .bind(owner)
+    .bind(plan)
+    .fetch_one(db)
+    .await
+    .unwrap()
+}
+
+/// Add `user` to `org`'s directory. `seat` decides whether they hold a seat.
+async fn add_org_member(db: &sqlx::PgPool, org: Uuid, user: Uuid, seat: bool) {
+    sqlx::query(
+        "INSERT INTO organization_members (org_id, user_id, role, seat_assigned_at) \
+         VALUES ($1, $2, 'member', CASE WHEN $3 THEN NOW() ELSE NULL END)",
+    )
+    .bind(org)
+    .bind(user)
+    .bind(seat)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// The baseline: every account that existed before organisations did.
+#[tokio::test]
+async fn an_account_with_no_seat_resolves_to_its_own_plan() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (user, _jwt) = verified_user(&server).await;
+
+    let r = quota::resolve_plan(&db, user).await.unwrap();
+    assert_eq!(r.plan, Plan::Free, "a new account is on free");
+    assert_eq!(
+        r.source,
+        PlanSource::Own,
+        "with no seat the plan is the account's own"
+    );
+}
+
+/// The override, and that it says where it came from.
+#[tokio::test]
+async fn an_assigned_seat_resolves_to_the_organisations_plan() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (user, _jwt) = verified_user(&server).await;
+    let org = make_org(&db, user, "team").await;
+    add_org_member(&db, org, user, true).await;
+
+    let r = quota::resolve_plan(&db, user).await.unwrap();
+    assert_eq!(r.plan, Plan::Team, "the seat's org is on team");
+    match r.source {
+        PlanSource::Organization { id, .. } => assert_eq!(id, org),
+        PlanSource::Own => panic!("the plan came from the org, and must say so"),
+    }
+}
+
+/// ⚠️ Being listed in an organisation is not the same as being paid for.
+///
+/// `seat_assigned_at IS NULL` is a real state — a directory entry nobody is billed
+/// for. If it granted the plan, an admin could hand out limits without buying
+/// seats, which is the whole thing billing is supposed to count.
+#[tokio::test]
+async fn directory_membership_without_a_seat_grants_nothing() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (user, _jwt) = verified_user(&server).await;
+    let org = make_org(&db, user, "enterprise").await;
+    add_org_member(&db, org, user, false).await;
+
+    let r = quota::resolve_plan(&db, user).await.unwrap();
+    assert_eq!(r.plan, Plan::Free, "no seat, no override");
+    assert_eq!(r.source, PlanSource::Own);
+}
+
+/// Removing a seat is a plan change, and it has to take effect.
+#[tokio::test]
+async fn removing_a_seat_drops_the_account_back_to_its_own_plan() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (user, _jwt) = verified_user(&server).await;
+    let org = make_org(&db, user, "team").await;
+    add_org_member(&db, org, user, true).await;
+    assert_eq!(quota::plan_for(&db, user).await.unwrap(), Plan::Team);
+
+    sqlx::query("UPDATE organization_members SET seat_assigned_at = NULL WHERE user_id = $1")
+        .bind(user)
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let r = quota::resolve_plan(&db, user).await.unwrap();
+    assert_eq!(
+        r.plan,
+        Plan::Free,
+        "the seat is gone, so the override is too"
+    );
+    assert_eq!(r.source, PlanSource::Own);
+}
+
+/// ⚠️ The failure that would never show up as an error.
+///
+/// A soft-deleted organisation that kept granting its plan would go on paying for
+/// everybody's limits silently — discovered as a billing discrepancy months later,
+/// if at all. The join carries `o.deleted_at IS NULL` for exactly this.
+#[tokio::test]
+async fn a_soft_deleted_organisation_grants_nothing() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (user, _jwt) = verified_user(&server).await;
+    let org = make_org(&db, user, "enterprise").await;
+    add_org_member(&db, org, user, true).await;
+    assert_eq!(quota::plan_for(&db, user).await.unwrap(), Plan::Enterprise);
+
+    sqlx::query("UPDATE organizations SET deleted_at = NOW() WHERE id = $1")
+        .bind(org)
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let r = quota::resolve_plan(&db, user).await.unwrap();
+    assert_eq!(
+        r.plan,
+        Plan::Free,
+        "a deleted organisation must not keep granting enterprise"
+    );
+    assert_eq!(r.source, PlanSource::Own);
+}
+
+/// ⚠️ The contractor case, and why the seat index is shaped the way it is.
+///
+/// Directory membership is unconstrained; a seat is unique. That makes "works for
+/// two companies, billed by one" representable, and makes the resolver's answer
+/// well-posed rather than order-dependent.
+#[tokio::test]
+async fn two_directories_one_seat_is_representable_and_a_second_seat_is_not() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (user, _jwt) = verified_user(&server).await;
+    let paying = make_org(&db, user, "team").await;
+    let other = make_org(&db, user, "enterprise").await;
+
+    add_org_member(&db, paying, user, true).await;
+    add_org_member(&db, other, user, false).await;
+
+    let r = quota::resolve_plan(&db, user).await.unwrap();
+    assert_eq!(
+        r.plan,
+        Plan::Team,
+        "the org holding the seat is the one that counts"
+    );
+
+    // A second seat is refused by the database, not by a handler remembering to check.
+    let second = sqlx::query("UPDATE organization_members SET seat_assigned_at = NOW() WHERE org_id = $1 AND user_id = $2")
+        .bind(other)
+        .bind(user)
+        .execute(&db)
+        .await;
+    assert!(
+        second.is_err(),
+        "organization_members_one_seat_per_user must make a second seat unstorable"
+    );
+}
+
+/// ⚠️ **The test that proves 3.2a did anything.**
+///
+/// Everything above asserts the resolver in isolation. This asserts the point of
+/// it: a quota the account was up against moves because a seat was assigned, with
+/// no change to the quota code at all. If `plan_for` were ever bypassed by a check
+/// reading `users.plan` directly, this is what would fail.
+#[tokio::test]
+async fn an_organisation_seat_raises_a_quota_the_account_was_up_against() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let config = test_config().await;
+    let (user, jwt) = verified_user(&server).await;
+
+    let Some(free_vaults) = config.quotas.free.vaults else {
+        eprintln!("free vaults are unlimited in this config — nothing to be up against");
+        return;
+    };
+    // `team` must actually be more generous, or the test asserts nothing.
+    let team_is_roomier = config.quotas.team.vaults.is_none_or(|t| t > free_vaults);
+    assert!(
+        team_is_roomier,
+        "this test needs team to allow more vaults than free"
+    );
+
+    for n in 0..free_vaults {
+        let _ = create_vault(&server, &jwt).await;
+        let _ = n;
+    }
+
+    // At the free limit, the next one is refused.
+    let refused = bearer(server.post("/api/v1/vaults"), &jwt)
+        .json(&serde_json::json!({
+            "name": format!("v{}", Uuid::new_v4().simple()),
+            "environment": "development",
+            "encrypted_vault_key": "Zm9v",
+        }))
+        .await;
+    assert_eq!(
+        refused.status_code(),
+        StatusCode::FORBIDDEN,
+        "at the free limit the create must be refused, got: {}",
+        refused.text()
+    );
+
+    // Give them a seat in a team organisation. Nothing else changes.
+    let org = make_org(&db, user, "team").await;
+    add_org_member(&db, org, user, true).await;
+
+    let allowed = bearer(server.post("/api/v1/vaults"), &jwt)
+        .json(&serde_json::json!({
+            "name": format!("v{}", Uuid::new_v4().simple()),
+            "environment": "development",
+            "encrypted_vault_key": "Zm9v",
+        }))
+        .await;
+    assert_eq!(
+        allowed.status_code(),
+        StatusCode::CREATED,
+        "a team seat must raise the vault limit, got: {}",
+        allowed.text()
+    );
+}
+
+/// ⛔ **The guarantee, asserted rather than trusted.**
+///
+/// An organisation is billing and a directory. It cannot grant access to a vault,
+/// because the server cannot wrap a vault key — that is the product's central
+/// claim. Migration 010 has no column that could express it, and this is what
+/// would fail if someone later added one.
+#[tokio::test]
+async fn an_organisation_cannot_grant_access_to_a_vault() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (owner, owner_jwt) = verified_user(&server).await;
+    let (colleague, colleague_jwt) = verified_user(&server).await;
+
+    let vault = create_vault(&server, &owner_jwt).await;
+
+    // Same organisation, both holding seats is impossible (one seat per user), so
+    // the owner holds the seat and the colleague is in the directory — the
+    // arrangement an admin would actually create.
+    let org = make_org(&db, owner, "enterprise").await;
+    add_org_member(&db, org, owner, true).await;
+    add_org_member(&db, org, colleague, false).await;
+
+    // ⚠️ Probed at `/my-key`, which is the guarantee stated as an endpoint: it is
+    // where a member collects the wrapped vault key. The first version of this
+    // test asked for `GET /api/v1/vaults/{id}`, which is not a route — it
+    // answered **405 Method Not Allowed**. A 405 is not an access decision, so
+    // the assertion held while proving nothing about authorisation.
+    let resp = bearer(
+        server.get(&format!("/api/v1/vaults/{vault}/my-key")),
+        &colleague_jwt,
+    )
+    .await;
+    assert!(
+        resp.status_code() == StatusCode::FORBIDDEN || resp.status_code() == StatusCode::NOT_FOUND,
+        "an org colleague must not collect the key for a vault they were never shared: got {} {}",
+        resp.status_code(),
+        resp.text()
+    );
+
+    // The positive control. The owner *was* shared it by construction, so if this
+    // were also refused the test above would only be proving the endpoint is
+    // broken for everyone.
+    let owners = bearer(
+        server.get(&format!("/api/v1/vaults/{vault}/my-key")),
+        &owner_jwt,
+    )
+    .await;
+    assert_eq!(
+        owners.status_code(),
+        StatusCode::OK,
+        "the owner must still reach their own key: {}",
+        owners.text()
+    );
+
+    let _ = colleague;
+}
+
+/// ⚠️ Migration 010 made this possible, and without the check the symptom is a 500.
+///
+/// `organizations.owner_id` is `ON DELETE RESTRICT`, so `DELETE FROM users` comes
+/// back as a foreign-key violation — a raw database error handed to someone who
+/// just typed their own address to confirm an irreversible act. RESTRICT is the
+/// right constraint (an organisation may be paying for other people's seats, and
+/// cascading would delete it as a side effect of one person leaving), so the
+/// refusal belongs in the handler beside the vault case.
+#[tokio::test]
+async fn deleting_an_account_that_owns_an_organisation_is_refused_not_a_500() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (user, jwt) = verified_user(&server).await;
+    let org = make_org(&db, user, "team").await;
+    add_org_member(&db, org, user, true).await;
+
+    let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+        .bind(user)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+
+    let resp = bearer(server.delete("/api/v1/auth/account"), &jwt)
+        .json(&serde_json::json!({ "confirm_email": email }))
+        .await;
+
+    assert_eq!(
+        resp.status_code(),
+        StatusCode::CONFLICT,
+        "owning an organisation must be a named refusal, not a database error: {}",
+        resp.text()
+    );
+    let body = resp.text();
+    assert!(
+        body.contains("organisation"),
+        "the refusal must say what is blocking it: {body}"
+    );
+    assert!(
+        body.contains("nothing has been deleted"),
+        "and that nothing happened: {body}"
+    );
+
+    // Still there — the refusal has to be true.
+    let alive: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = $1")
+        .bind(user)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(alive, 1, "the account must survive a refused deletion");
+}
