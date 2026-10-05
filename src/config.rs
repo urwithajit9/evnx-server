@@ -473,6 +473,39 @@ impl Config {
                     ));
                 }
 
+                // ⚠️ A SANDBOX KEY IN A LIVE DEPLOYMENT, REFUSED AT STARTUP.
+                //
+                // Paddle's sandbox API keys contain `_sdbx` and live ones do
+                // not, and using one against the other API returns `forbidden`.
+                // Caught here, that is a startup failure naming the problem;
+                // missed, it is a checkout that fails for every customer with a
+                // generic "could not reach the payment provider" — on the day
+                // the deployment went live, which is the worst possible day to
+                // be debugging credentials.
+                //
+                // Same shape of guard as `pay/build.mjs`, which refuses a
+                // `test_…` client-side token in a live build.
+                if environment == "live" && api_key.contains("_sdbx") {
+                    return Err(ConfigError::Invalid(
+                        "PADDLE_ENVIRONMENT=live but PADDLE_API_KEY is a sandbox key \
+                         (it contains `_sdbx`). Create a live key under \
+                         Paddle > My account > Settings > Authentication."
+                            .into(),
+                    ));
+                }
+                // ⚠️ And the reverse. A LIVE key pointed at the sandbox API is
+                // the less dangerous direction but still fails confusingly, and
+                // it means a live credential is sitting in a non-production
+                // environment file.
+                if environment == "sandbox" && !api_key.contains("_sdbx") {
+                    return Err(ConfigError::Invalid(
+                        "PADDLE_ENVIRONMENT=sandbox but PADDLE_API_KEY does not look \
+                         like a sandbox key (it has no `_sdbx`). Using a live key here \
+                         would put a production credential in a test deployment."
+                            .into(),
+                    ));
+                }
+
                 // ⚠️ Validated as absolute https here rather than at the call
                 // site. A relative or http URL is accepted by Paddle and
                 // produces a payment link that silently 404s or downgrades.
@@ -812,6 +845,35 @@ mod paddle_config_tests {
         assert!(rendered.contains("<redacted>"), "{rendered}");
         // The environment is not a secret and is useful in a log.
         assert!(rendered.contains("sandbox"), "{rendered}");
+    }
+
+    /// ⚠️ The guard that would otherwise fail on the worst possible day.
+    ///
+    /// Paddle's sandbox API keys contain `_sdbx`; live ones do not. A sandbox
+    /// key against the live API returns `forbidden`, which reaches a customer as
+    /// "could not reach the payment provider" — on the day the deployment went
+    /// live. Refused at startup instead, where it names itself.
+    #[test]
+    fn a_sandbox_key_in_a_live_deployment_is_refused() {
+        // The check as `Config::from_env` applies it, stated here so the rule is
+        // pinned even though the surrounding function reads many variables.
+        let mismatched = |env: &str, key: &str| -> bool {
+            (env == "live" && key.contains("_sdbx")) || (env == "sandbox" && !key.contains("_sdbx"))
+        };
+
+        assert!(
+            mismatched("live", "pdl_sdbx_apikey_01abc"),
+            "a sandbox key in a live deployment must be refused"
+        );
+        assert!(
+            mismatched("sandbox", "pdl_live_apikey_01abc"),
+            "a live key in a sandbox deployment must be refused — it means a \
+             production credential is sitting in a test environment file"
+        );
+
+        // And the two correct pairings are accepted.
+        assert!(!mismatched("live", "pdl_live_apikey_01abc"));
+        assert!(!mismatched("sandbox", "pdl_sdbx_apikey_01abc"));
     }
 
     /// ⚠️ The allow-list is what stops a caller checking out at a price we never
