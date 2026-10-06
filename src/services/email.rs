@@ -25,6 +25,8 @@ enum Transport {
 pub struct EmailService {
     transport: Transport,
     from: String,
+    /// Where a human reply lands. `None` sends no header.
+    reply_to: Option<String>,
     /// Public base URL of this API — the verification link is built from it.
     public_api_url: String,
     public_app_url: Option<String>,
@@ -36,6 +38,17 @@ struct ResendRequest<'a> {
     to: Vec<&'a str>,
     subject: &'a str,
     html: String,
+    /// ⚠️ Omitted entirely when unset, not sent as null.
+    ///
+    /// `From` stays a no-reply address, which is correct for automated mail. But
+    /// people reply to it anyway — `app.evnx.dev/verify-email` names the sender
+    /// twice, and somebody who cannot verify their account will answer the only
+    /// address in front of them. Without this header that reply hard-bounces and
+    /// the person is left with a mailer-daemon.
+    ///
+    /// This is why the no-reply address does NOT need a mailbox of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_to: Option<&'a str>,
 }
 
 impl EmailService {
@@ -51,6 +64,7 @@ impl EmailService {
         Self {
             transport,
             from: config.email_from.clone(),
+            reply_to: config.email_reply_to.clone(),
             public_api_url: config.public_api_url.trim_end_matches('/').to_string(),
             public_app_url: config.public_app_url.clone(),
         }
@@ -405,6 +419,7 @@ impl EmailService {
                         to: vec![to],
                         subject,
                         html: html.to_string(),
+                        reply_to: self.reply_to.as_deref(),
                     })
                     .send()
                     .await

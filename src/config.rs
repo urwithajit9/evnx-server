@@ -163,6 +163,17 @@ pub struct Config {
     // Email (Resend)
     pub resend_api_key: String,
     pub email_from: String,
+    /// Where a human reply to an automated email should land.
+    ///
+    /// ⚠️ **`From` is a no-reply address and should stay one** — automated mail
+    /// is correctly sent from an address nobody monitors. But people DO reply to
+    /// it: `app.evnx.dev/verify-email` names the sender twice, and someone who
+    /// cannot verify their account will answer the only address in front of
+    /// them. Without this header that reply hard-bounces and is lost.
+    ///
+    /// Setting `Reply-To` is the fix, not giving the no-reply address a mailbox.
+    /// Optional: unset means no header, which is the previous behaviour.
+    pub email_reply_to: Option<String>,
     /// How mail is delivered. `Log` is a development-only transport.
     pub email_transport: EmailTransport,
     /// Public base URL of this API, used to build the email verification link.
@@ -303,6 +314,12 @@ impl Config {
         let frontend_url = require!("FRONTEND_URL");
         let resend_api_key = require!("RESEND_API_KEY");
         let email_from = require!("EMAIL_FROM");
+        // Optional, and absent simply means no header — a deployment that never
+        // sets it behaves exactly as before.
+        let email_reply_to = env::var("EMAIL_REPLY_TO")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         // Resolved here rather than in the struct literal below, which moves
         // `jwt_secret`. Falls back to it, so digests written before this setting
@@ -558,6 +575,7 @@ impl Config {
             frontend_origins,
             resend_api_key,
             email_from,
+            email_reply_to,
             email_transport,
             public_api_url: optional!("PUBLIC_API_URL", format!("http://localhost:{port}")),
             public_app_url,
