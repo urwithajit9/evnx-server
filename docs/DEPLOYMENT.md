@@ -193,6 +193,31 @@ In GitHub: **Actions → Publish image → Run workflow**. It builds from
 
 ## 6. Deploy
 
+⚠️ **WHAT THE RUNNING SERVER ACTUALLY LOOKS LIKE** (recorded 2026-10-06, after
+two commands were handed over against a path that does not exist):
+
+| | |
+|---|---|
+| User | **`ubuntu`**, not the `deploy` user created above |
+| Checkout | **`/home/ubuntu/evnx-server`** |
+| Every compose command | **must carry `--env-file .env.prod`** |
+
+The `deploy` user below was the plan and was not what got used. The section is
+kept because it is the right thing for a fresh build; it is **not** a description
+of `85.137.30.221`. Run things from `/home/ubuntu/evnx-server` as `ubuntu`.
+
+⛔ **`--env-file .env.prod` is not optional on any of them.** Compose reads `.env`
+by default, which does not exist here, so without the flag `POSTGRES_PASSWORD`
+and friends are unset — and the postgres service declares
+`${POSTGRES_PASSWORD:?…}`, so it fails loudly rather than starting insecurely.
+A command that omits it has not been run against this host.
+
+```bash
+cd /home/ubuntu/evnx-server
+```
+
+---
+
 As `deploy`:
 
 ```bash
@@ -214,6 +239,21 @@ docker compose -f docker/docker-compose.prod.yml --env-file .env.prod up -d
 ```
 
 Migrations apply automatically — `main.rs` runs `sqlx::migrate!` at startup.
+
+### Querying the database
+
+Postgres is not published — only Caddy binds a port — so queries go through the
+container:
+
+```bash
+cd /home/ubuntu/evnx-server && docker compose -f docker/docker-compose.prod.yml --env-file .env.prod exec postgres psql -U evnx -d evnx -c "SELECT slug, plan, subscription_status, paddle_subscription_id FROM organizations WHERE paddle_subscription_id IS NOT NULL;"
+```
+
+ⓘ `-U evnx -d evnx` are the compose defaults (`POSTGRES_USER`/`POSTGRES_DB`);
+substitute if `.env.prod` overrides them.
+
+⚠️ Prefer the CLI over SQL for anything that changes state — `evnx org delete`
+runs the server's own cleanup, where a `DELETE` leaves orphaned blobs in R2.
 There is no separate migrator step and no `migrate` subcommand.
 
 ---
