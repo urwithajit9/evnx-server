@@ -533,15 +533,44 @@ first night.
 ## 9. Updating
 
 ```bash
+./scripts/deploy.sh <commit-sha>        # or `latest`
+./scripts/deploy.sh <commit-sha> --dry-run
+```
+
+The published tags are short commit SHAs, plus `latest` on `main` — so a deploy
+can name the commit it means.
+
+⚠️ **The script exists because the three obvious commands cannot tell you
+whether the deploy took.** They are still correct and still here:
+
+```bash
 docker compose -f docker/docker-compose.prod.yml --env-file .env.prod pull server
 docker compose -f docker/docker-compose.prod.yml --env-file .env.prod up -d server
 curl -sf https://api.evnx.dev/health
 ```
 
+Two things they leave open:
+
+* `pull server` fetches **`:latest`**, which is whatever was pushed most
+  recently. A merge landing while you deploy hands you a different binary and
+  nothing says so. The script pins `EVNX_IMAGE` to the tag you named — the
+  compose file has always supported it
+  (`image: ${EVNX_IMAGE:-…:latest}`).
+* ⛔ **`curl -sf /health` proves something is serving, not that it is the new
+  build.** A container that fails at startup leaves the previous one in front
+  of you, and `restart: unless-stopped` keeps it there — so the health check
+  passes while the deploy did not happen. The script asserts `/health`'s
+  `build` field equals the commit it deployed, and fails if it does not.
+
+ⓘ `--env-file .env.prod` is on every command for a reason worth restating:
+without it Compose falls back to `.env`, which on this host is the
+**development** file. Every value would be wrong, and most of them silently.
+
 Migrations run on startup, so a schema change ships with the image. That also
 means **a rollback is not always safe**: an image that predates a migration will
-meet a database that has already applied it. Check `migrations/` before rolling
-back across one.
+meet a database that has already applied it. The script diffs `migrations/`
+between the running build and the target and says so, but it will not decide
+for you — check before rolling back across one.
 
 ---
 
