@@ -69,6 +69,18 @@ pub struct PlanLimits {
     pub versions_per_vault: Option<u32>,
     pub api_tokens: Option<u32>,
     pub audit_retention_days: Option<u32>,
+    /// How many live organisations one account may **own**.
+    ///
+    /// ⚠️ Owning is not membership. Being in a directory, or holding a seat,
+    /// costs nothing against this — only being the `owner_id` of a row in
+    /// `organizations` that is not soft-deleted.
+    ///
+    /// ⓘ It is a quota rather than a constant because **owning one blocks
+    /// account deletion**, so unbounded creation means unbounded blockers on a
+    /// path somebody eventually needs to walk. That is a footgun rather than a
+    /// thing to sell, which is why the free number is the one that matters and
+    /// the paid plans are unlimited like every other limit here.
+    pub owned_orgs: Option<u32>,
 }
 
 /// Limits for every plan.
@@ -102,18 +114,24 @@ impl Default for Quotas {
                 versions_per_vault: Some(5),
                 api_tokens: Some(2),
                 audit_retention_days: Some(7),
+                // ⚠️ 5, which is exactly what the hard-coded constant allowed
+                // every account before this became configuration. Nobody's
+                // limit changes on upgrade; only the ability to change it does.
+                owned_orgs: Some(5),
             },
             team: PlanLimits {
                 vaults: None,
                 versions_per_vault: None,
                 api_tokens: None,
                 audit_retention_days: Some(90),
+                owned_orgs: None,
             },
             enterprise: PlanLimits {
                 vaults: None,
                 versions_per_vault: None,
                 api_tokens: None,
                 audit_retention_days: None,
+                owned_orgs: None,
             },
         }
     }
@@ -244,6 +262,51 @@ pub async fn resolve_plan(
 /// `resolve_plan` when the answer has to say *why*.
 pub async fn plan_for(db: &sqlx::PgPool, user_id: uuid::Uuid) -> Result<Plan, AppError> {
     Ok(resolve_plan(db, user_id).await?.plan)
+}
+
+/// Refuse when the account already **owns** its plan's maximum number of
+/// organisations.
+///
+/// ⚠️ **Returns `Conflict` (409), not `QuotaExceeded` (403), and that is
+/// deliberate.** Every other limit here answers 403. This one has answered 409
+/// since organisations shipped, the handler's own docs say so, and `POST /orgs`
+/// also answers 409 for a taken slug — so a client that distinguishes them does
+/// it by message, not by code. Making it consistent would be a nicer API and a
+/// silent contract change to a public endpoint, which is not what making a
+/// constant configurable is for. ⓘ Worth deciding on purpose later; it is
+/// tracked rather than done here.
+///
+/// ⓘ Counts **owned, live** organisations: `owner_id` matching and
+/// `deleted_at IS NULL`. Membership and seats are not ownership and cost
+/// nothing against this.
+pub async fn check_org_limit(
+    db: &sqlx::PgPool,
+    quotas: &Quotas,
+    user_id: uuid::Uuid,
+) -> Result<(), AppError> {
+    // Resolved once, for the same reason as `check_vault_limit`: two lookups
+    // could straddle a seat change and report one plan's limit under another
+    // plan's name.
+    let plan = plan_for(db, user_id).await?;
+    let Some(limit) = quotas.for_plan(plan).owned_orgs else {
+        return Ok(());
+    };
+
+    let owned: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM organizations WHERE owner_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(user_id)
+    .fetch_one(db)
+    .await?;
+
+    if owned >= i64::from(limit) {
+        return Err(AppError::Conflict(format!(
+            "this account already owns {limit} organisations, which is the limit for the \
+             {} plan. Delete one you no longer need.",
+            plan.as_str()
+        )));
+    }
+    Ok(())
 }
 
 /// Refuse when the account already holds its plan's maximum number of vaults.

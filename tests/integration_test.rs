@@ -596,6 +596,59 @@ async fn registration_no_longer_logs_the_verification_token() {
     );
 }
 
+/// ⛔ **The point of T12, asserted.** `MAX_OWNED_ORGS` was a constant, so the
+/// only way to change it was a release. It is a quota now, which means an
+/// operator can set it — and this is what proves that sentence true rather than
+/// merely intended.
+///
+/// ⓘ Env access is process-global, so this is serial-safe only because the
+/// suite runs with `--test-threads=1`, same as the transport test below.
+#[tokio::test]
+async fn the_organisation_limit_is_configurable() {
+    use evnx_server::config::Config;
+
+    let previous = std::env::var("QUOTA_FREE_ORGS").ok();
+
+    // Unset: the default, which is the number the constant used to hard-code.
+    std::env::remove_var("QUOTA_FREE_ORGS");
+    let d = Config::from_env().expect("config loads").quotas;
+    assert_eq!(
+        d.free.owned_orgs,
+        Some(5),
+        "the default must match what MAX_OWNED_ORGS allowed, or upgrading changes behaviour"
+    );
+    assert_eq!(
+        d.team.owned_orgs, None,
+        "a paid plan is unlimited, like its other limits"
+    );
+
+    // Set: it takes effect.
+    std::env::set_var("QUOTA_FREE_ORGS", "2");
+    let narrowed = Config::from_env().expect("config loads").quotas;
+    assert_eq!(narrowed.free.owned_orgs, Some(2));
+
+    // `unlimited` is a word, not a sentinel number.
+    std::env::set_var("QUOTA_FREE_ORGS", "unlimited");
+    let open = Config::from_env().expect("config loads").quotas;
+    assert_eq!(open.free.owned_orgs, None);
+
+    // ⚠️ A typo fails startup rather than silently becoming unlimited. Every
+    // other quota behaves this way, and the reason is the same: a mistyped
+    // limit that quietly meant "no limit" would hand the product away on the
+    // free tier, and nothing outside the process would show it.
+    std::env::set_var("QUOTA_FREE_ORGS", "five");
+    let err = Config::from_env().expect_err("a non-number must be refused");
+    assert!(
+        err.to_string().contains("QUOTA_FREE_ORGS"),
+        "the error must name the variable: {err}"
+    );
+
+    match previous {
+        Some(v) => std::env::set_var("QUOTA_FREE_ORGS", v),
+        None => std::env::remove_var("QUOTA_FREE_ORGS"),
+    }
+}
+
 #[tokio::test]
 async fn log_email_transport_is_refused_outside_development() {
     // This is the guard that keeps a live verification token out of staging and
@@ -7208,12 +7261,131 @@ async fn organisation_acts_are_audited_without_a_vault_id_or_a_token() {
     let _ = owner;
 }
 
+/// ⛔ **The free limit is still five**, which is the whole safety property of
+/// turning a constant into configuration: an operator gains the ability to
+/// change it, and nobody's deployment changes behaviour by upgrading.
+///
+/// ⓘ Counted through the API rather than the database, so it exercises the
+/// handler, the quota lookup and the 409 together.
+#[tokio::test]
+async fn the_free_plan_still_allows_exactly_five_organisations() {
+    let server = test_app().await;
+    let (_user, jwt) = verified_user(&server).await;
+
+    for n in 1..=5 {
+        let slug = format!("o{}", Uuid::new_v4().simple());
+        let resp = bearer(server.post("/api/v1/orgs"), &jwt)
+            .json(&serde_json::json!({ "name": format!("Org {n}"), "slug": slug }))
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::CREATED,
+            "org {n} of 5 must be allowed: {}",
+            resp.text()
+        );
+    }
+
+    let slug = format!("o{}", Uuid::new_v4().simple());
+    let sixth = bearer(server.post("/api/v1/orgs"), &jwt)
+        .json(&serde_json::json!({ "name": "Org 6", "slug": slug }))
+        .await;
+    assert_eq!(
+        sixth.status_code(),
+        StatusCode::CONFLICT,
+        "the sixth must be refused: {}",
+        sixth.text()
+    );
+    // ⚠️ 409, not 403. Every other quota answers 403, and this one has answered
+    // 409 since organisations shipped — the same code `POST /orgs` uses for a
+    // taken slug. Making a constant configurable must not quietly change a
+    // public endpoint's status code; that is its own decision.
+    assert!(
+        sixth.text().contains("already owns"),
+        "the refusal must say why, not just conflict: {}",
+        sixth.text()
+    );
+}
+
+/// A soft-deleted organisation does not occupy a slot.
+///
+/// ⓘ Same predicate as the quota check (`deleted_at IS NULL`), asserted
+/// end to end — this is the answer to "I deleted one and still cannot create
+/// another", which is the exact complaint `check_vault_limit` carries a comment
+/// about.
+#[tokio::test]
+async fn deleting_an_organisation_frees_a_slot_immediately() {
+    let server = test_app().await;
+    let (_user, jwt) = verified_user(&server).await;
+
+    let mut first: Option<Uuid> = None;
+    for n in 1..=5 {
+        let slug = format!("o{}", Uuid::new_v4().simple());
+        let resp = bearer(server.post("/api/v1/orgs"), &jwt)
+            .json(&serde_json::json!({ "name": format!("Org {n}"), "slug": slug }))
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        if first.is_none() {
+            let body: serde_json::Value = resp.json();
+            first = body["id"].as_str().and_then(|s| Uuid::parse_str(s).ok());
+        }
+    }
+
+    let doomed = first.expect("the first org's id");
+    // ⚠️ `.json({})` is not decoration — without a body the extractor answers
+    // 415 before the handler runs. And the success code is 204, not 200.
+    let gone = bearer(server.delete(&format!("/api/v1/orgs/{doomed}")), &jwt)
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(
+        gone.status_code(),
+        StatusCode::NO_CONTENT,
+        "delete the org: {}",
+        gone.text()
+    );
+
+    let slug = format!("o{}", Uuid::new_v4().simple());
+    let replacement = bearer(server.post("/api/v1/orgs"), &jwt)
+        .json(&serde_json::json!({ "name": "Replacement", "slug": slug }))
+        .await;
+    assert_eq!(
+        replacement.status_code(),
+        StatusCode::CREATED,
+        "a deleted organisation must free its slot at once: {}",
+        replacement.text()
+    );
+}
+
+/// `GET /api/v1/plans` must publish the new limit, or a pricing page cannot
+/// learn it without reading the source.
+///
+/// ⚠️ `limits_json` hand-lists its fields, so a field added to `PlanLimits` is
+/// **not** published automatically. That is exactly how a limit comes to exist
+/// in the server and nowhere a client can see it.
+#[tokio::test]
+async fn the_plans_endpoint_publishes_the_organisation_limit() {
+    let server = test_app().await;
+    let resp = server.get("/api/v1/plans").await;
+    resp.assert_status_ok();
+    let body: serde_json::Value = resp.json();
+
+    assert_eq!(
+        body["plans"]["free"]["owned_orgs"], 5,
+        "the free limit must be visible to a client: {body}"
+    );
+    // `null` is unlimited, spelled as absence — the convention the rest of this
+    // response uses.
+    assert!(
+        body["plans"]["team"]["owned_orgs"].is_null(),
+        "a paid plan is unlimited here, like every other limit: {body}"
+    );
+}
+
 /// ⚠️ **The release valve, and why its absence was a trap.**
 ///
-/// Owning an organisation blocks account deletion, and `MAX_OWNED_ORGS` caps
-/// creation at five — so without a way to delete one, five organisations would
-/// permanently remove the ability to close the account. A limit with no release
-/// valve is worse than no limit.
+/// Owning an organisation blocks account deletion, and the `owned_orgs` quota
+/// caps creation — so without a way to delete one, reaching that cap would
+/// permanently remove the ability to close the account. A limit with no
+/// release valve is worse than no limit.
 #[tokio::test]
 async fn deleting_an_organisation_unblocks_account_deletion() {
     let server = test_app().await;

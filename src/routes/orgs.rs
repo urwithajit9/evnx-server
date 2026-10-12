@@ -37,18 +37,6 @@ use crate::{
     state::AppState,
 };
 
-/// How many live organisations one account may own.
-///
-/// ⚠️ A hard constant, and it should not stay one. Every other limit in the server
-/// is configuration (`quota::Quotas`) precisely so a tier's numbers change without
-/// a release — but organisations are not yet a billable thing, so there is no tier
-/// for this to belong to. It exists because creating one is free and owning one
-/// now *blocks account deletion*: unbounded creation means unbounded blockers on a
-/// path someone needs to work.
-///
-/// Move it into `Quotas` when billing lands (3.3), where it can differ per plan.
-const MAX_OWNED_ORGS: i64 = 5;
-
 /// Slug rules, mirrored from migration 010's CHECK.
 ///
 /// ⚠️ Validated here as well as there, so a bad slug is a 422 naming the rule
@@ -106,7 +94,8 @@ pub struct CreateOrgRequest {
 /// money.
 ///
 /// # Errors
-/// * `409` — the slug is taken, or the account already owns [`MAX_OWNED_ORGS`].
+/// * `409` — the slug is taken, or the account already owns its plan's
+///   maximum number of organisations (`QUOTA_<PLAN>_ORGS`, free: 5).
 /// * `422` — the name or slug is malformed.
 pub async fn create_org(
     State(state): State<AppState>,
@@ -119,20 +108,11 @@ pub async fn create_org(
     validate_name(&req.name)?;
     validate_slug(&req.slug)?;
 
-    let owned: i64 = sqlx::query_scalar!(
-        r#"SELECT COUNT(*) AS "n!" FROM organizations
-           WHERE owner_id = $1 AND deleted_at IS NULL"#,
-        user_id
-    )
-    .fetch_one(&state.db)
-    .await?;
-
-    if owned >= MAX_OWNED_ORGS {
-        return Err(AppError::Conflict(format!(
-            "this account already owns {MAX_OWNED_ORGS} organisations, which is the limit. \
-             Delete one you no longer need."
-        )));
-    }
+    // ⚠️ Was a hard-coded `MAX_OWNED_ORGS = 5` counted inline here. It is now a
+    // per-plan quota like every other limit, resolved through the same
+    // `plan_for` the rest of them use — so a seat changes it, and an operator
+    // can change it with `QUOTA_FREE_ORGS` instead of a release.
+    crate::services::quota::check_org_limit(&state.db, &state.config.quotas, user_id).await?;
 
     // One transaction: an organisation with no owner row would be invisible to
     // `list_orgs` (which joins through `organization_members`) while still holding
@@ -436,9 +416,14 @@ pub async fn set_seats(
 ///
 /// ⚠️ **This endpoint exists because leaving it out was a trap.** Owning an
 /// organisation blocks account deletion (see `auth::delete_account`), and
-/// `MAX_OWNED_ORGS` caps creation at five — so without a way to delete one, five
-/// organisations would permanently remove the ability to close the account. A
-/// limit with no release valve is worse than no limit.
+/// the `owned_orgs` quota caps creation — so without a way to delete one,
+/// reaching that cap would permanently remove the ability to close the account.
+/// A limit with no release valve is worse than no limit.
+///
+/// ⚠️ **That reasoning is why the quota exists at all**, and why it is still
+/// finite on the free plan rather than being dropped when it became
+/// configuration: the cap is a guard against unbounded deletion-blockers, not
+/// something to sell.
 ///
 /// Owner-only, by signature.
 ///

@@ -65,6 +65,10 @@ fn limits_json(limits: PlanLimits) -> serde_json::Value {
         "versions_per_vault": limits.versions_per_vault,
         "api_tokens": limits.api_tokens,
         "audit_retention_days": limits.audit_retention_days,
+        // ⓘ Additive. `evnx-web`'s sync maps named fields, so it ignores this
+        // until someone adds it there — the pricing page does not advertise an
+        // organisation limit and does not need to.
+        "owned_orgs": limits.owned_orgs,
     })
 }
 
@@ -75,9 +79,9 @@ fn limits_json(limits: PlanLimits) -> serde_json::Value {
 /// ```json
 /// {
 ///   "plans": {
-///     "free":       { "vaults": 3, "versions_per_vault": 5, "api_tokens": 2, "audit_retention_days": 7 },
-///     "team":       { "vaults": null, "versions_per_vault": null, "api_tokens": null, "audit_retention_days": 90 },
-///     "enterprise": { "vaults": null, "versions_per_vault": null, "api_tokens": null, "audit_retention_days": null }
+///     "free":       { "vaults": 3, "versions_per_vault": 5, "api_tokens": 2, "audit_retention_days": 7, "owned_orgs": 5 },
+///     "team":       { "vaults": null, "versions_per_vault": null, "api_tokens": null, "audit_retention_days": 90, "owned_orgs": null },
+///     "enterprise": { "vaults": null, "versions_per_vault": null, "api_tokens": null, "audit_retention_days": null, "owned_orgs": null }
 ///   }
 /// }
 /// ```

@@ -400,6 +400,12 @@ impl Config {
                             "AUDIT_DAYS",
                             $defaults.audit_retention_days
                         ),
+                        // ⚠️ Was a hard constant (`MAX_OWNED_ORGS = 5`) whose own
+                        // doc comment said to move it here "when billing lands".
+                        // It has, so it did. The free default is still 5, so no
+                        // deployment's behaviour changes — only its ability to
+                        // change it without a release.
+                        owned_orgs: limit!($plan, "ORGS", $defaults.owned_orgs),
                     }
                 };
             }
