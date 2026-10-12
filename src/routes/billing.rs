@@ -313,9 +313,107 @@ pub async fn webhook(
             status = ?status,
             "applied a billing event"
         );
+
+        maybe_prompt_for_a_seat(&state, org_id, &event.data.id, status).await;
     }
 
     Ok(StatusCode::OK)
+}
+
+/// Email the owner that a plan is paid for and nobody is holding a seat.
+///
+/// ⛔ **Why this is needed at all.** `quota::resolve_plan` joins the member row
+/// with `AND m.seat_assigned_at IS NOT NULL` *in the JOIN condition*, so an
+/// unassigned member does not join and the account falls back to `users.plan`.
+/// And `routes::orgs::create` inserts the owner with `seat_assigned_at = NULL`
+/// explicitly — so the person who just paid is, by default, not holding a seat.
+/// They see `free`, `1 / 3`, which is indistinguishable from the payment having
+/// failed.
+///
+/// ⚠️ **Never returns an error, by design.** The billing state is already
+/// written and correct by the time this runs. Propagating a failure here would
+/// answer Paddle with a 500 for something that has nothing to do with billing,
+/// and Paddle retries a 500 **sixty times over three days**. Same reasoning as
+/// the unattributable-subscription branch above: logged so it is visible,
+/// acknowledged so it stops.
+async fn maybe_prompt_for_a_seat(
+    state: &AppState,
+    org_id: uuid::Uuid,
+    subscription_id: &str,
+    status: Option<&str>,
+) {
+    // Only a subscription that is actually live. A `past_due` or `canceled`
+    // event is not the moment to tell someone to claim a seat.
+    if !matches!(status, Some("active") | Some("trialing")) {
+        return;
+    }
+
+    // ⚠️ One statement, and it is the claim — not a check. Two deliveries race
+    // each other: the first real purchase sent `subscription.created` and
+    // `subscription.activated` **three milliseconds apart** and both applied,
+    // because the ordering guard is `<=`. Whoever updates the row sends; the
+    // loser gets zero rows and sends nothing.
+    //
+    // ⚠️ `IS DISTINCT FROM`, never `<>`. The column starts NULL and
+    // `NULL <> 'sub_…'` is NULL, not true — measured, and with `<>` the first
+    // send never fires at all.
+    //
+    // The `NOT EXISTS` is not an optimisation: it stops the email telling
+    // somebody to do a thing they have already done.
+    let claimed = sqlx::query!(
+        r#"UPDATE organizations
+              SET seat_prompt_sent_for = $2
+            WHERE id = $1
+              AND seat_prompt_sent_for IS DISTINCT FROM $2
+              AND NOT EXISTS (
+                    SELECT 1 FROM organization_members
+                     WHERE org_id = $1 AND seat_assigned_at IS NOT NULL)
+          RETURNING owner_id, name, plan"#,
+        org_id,
+        subscription_id
+    )
+    .fetch_optional(&state.db)
+    .await;
+
+    let row = match claimed {
+        Ok(Some(row)) => row,
+        // Nothing claimed: already sent for this subscription, or somebody
+        // already holds a seat. Both are the correct outcome and neither is
+        // worth a log line on every renewal.
+        Ok(None) => return,
+        Err(e) => {
+            tracing::error!(error = %e, org_id = %org_id, "could not claim the seat prompt");
+            return;
+        }
+    };
+
+    // ⛔ The OWNER's evnx address, never the one Paddle holds. This handler
+    // deliberately never reads billing detail out of the payload — it is the
+    // one category of data evnx has so far never held — and the Paddle address
+    // may belong to nobody with an account. The person who has to act is
+    // whoever can assign a seat.
+    let owner = sqlx::query_scalar!("SELECT email FROM users WHERE id = $1", row.owner_id)
+        .fetch_optional(&state.db)
+        .await;
+
+    let Ok(Some(to)) = owner else {
+        tracing::error!(org_id = %org_id, "the organisation's owner has no readable address");
+        return;
+    };
+
+    // ⚠️ Spawned, never awaited. This handler's whole contract is to be fast:
+    // a slow one means Paddle retries, sixty times. Same shape as the
+    // verification email on registration.
+    tokio::spawn({
+        let email = state.email.clone();
+        let org_name = row.name;
+        let plan = row.plan;
+        async move {
+            if let Err(e) = email.send_seat_prompt(&to, &org_name, &plan).await {
+                tracing::error!(error = %e, "could not send the seat prompt");
+            }
+        }
+    });
 }
 
 // ─── Everything below needs a configured Paddle ───────────────────────────────

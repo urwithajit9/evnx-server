@@ -63,7 +63,14 @@ pub async fn usage(
     axum::Extension(claims): axum::Extension<Claims>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
-    let plan = crate::services::quota::plan_for(&state.db, user_id).await?;
+
+    // ⚠️ `resolve_plan`, not `plan_for`. They differ only in that `plan_for`
+    // discards the provenance — and "you are on team" and "you are on team
+    // because Acme pays for your seat" are different sentences. Only the second
+    // tells someone who to ask when a limit is wrong, and it was being computed
+    // and thrown away on every call.
+    let resolved = crate::services::quota::resolve_plan(&state.db, user_id).await?;
+    let plan = resolved.plan;
     let limits = state.config.quotas.for_plan(plan);
 
     // Same predicate as `check_vault_limit`: owned, not deleted.
@@ -104,8 +111,19 @@ pub async fn usage(
     .await
     .map_err(AppError::Database)?;
 
+    // ⓘ Additive and nullable: `null` means the plan is the account's own
+    // `users.plan`, which is every account that holds no seat. A client that
+    // does not know this field behaves exactly as before.
+    let plan_via = match &resolved.source {
+        crate::services::quota::PlanSource::Own => serde_json::Value::Null,
+        crate::services::quota::PlanSource::Organization { id, name, slug } => json!({
+            "id": id, "name": name, "slug": slug,
+        }),
+    };
+
     Ok(Json(json!({
         "plan": plan.as_str(),
+        "plan_via": plan_via,
         "vaults": {
             "used":  vaults_used,
             "limit": limits.vaults,

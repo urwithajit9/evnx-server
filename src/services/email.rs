@@ -387,6 +387,97 @@ impl EmailService {
         .await
     }
 
+    /// "You paid, and one step is left."
+    ///
+    /// ⛔ **Sent to the organisation's OWNER at their evnx address**, never to
+    /// the address Paddle holds. The webhook deliberately never reads billing
+    /// detail out of the payload — it is the one category of data evnx has so
+    /// far never held — and the Paddle address may belong to nobody with an
+    /// account. The person who has to act is whoever can assign a seat.
+    ///
+    /// ⚠️ **The caller is responsible for sending this once.** A single
+    /// purchase delivers more than one applied event — the first real one
+    /// delivered `subscription.created` and `subscription.activated` three
+    /// milliseconds apart and both applied — so the send is claimed by a
+    /// conditional UPDATE on `organizations.seat_prompt_sent_for` before this
+    /// is ever called. See migration 013.
+    pub async fn send_seat_prompt(
+        &self,
+        to: &str,
+        org_name: &str,
+        plan: &str,
+    ) -> Result<(), EmailError> {
+        // Trailing slash, as everywhere else: the dashboard is a static export
+        // with `trailingSlash: true` and the unslashed form costs a redirect
+        // some mail clients will not follow.
+        let link = self
+            .public_app_url
+            .as_deref()
+            .map(|base| format!("{}/organizations/", base.trim_end_matches('/')));
+
+        // No dashboard configured: name the command instead of linking nowhere.
+        // Same fallback as the invite and the login alert.
+        let action = match &link {
+            Some(href) => format!(
+                r#"<a href="{href}" style="display:inline-block;background:#e94560;color:white;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:bold">Assign a seat</a>"#
+            ),
+            None => String::new(),
+        };
+
+        // ⚠️ Escaped, and not with a templating engine — an organisation name is
+        // attacker-chosen text arriving in an HTML document. Same three
+        // replacements as `send_org_invite`; `plan` comes from our own enum and
+        // cannot contain markup, but is escaped anyway so that a later change
+        // to its source cannot quietly introduce a hole here.
+        let esc = |v: &str| {
+            v.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        };
+        let safe_org = esc(org_name);
+        let safe_plan = esc(plan);
+
+        let html = format!(
+            r#"
+            <div style="font-family:monospace;max-width:560px;margin:40px auto;padding:32px;background:#0f0f1a;color:#e6e6e6;border-radius:12px;border:1px solid #2a2a3e">
+              <h1 style="color:#e94560;font-size:22px;margin-bottom:8px">evnx Cloud</h1>
+              <p style="color:#a0a0b8;margin-bottom:20px">Payment received. <strong style="color:#e6e6e6">{safe_org}</strong> is on the <strong style="color:#e6e6e6">{safe_plan}</strong> plan.</p>
+
+              <p style="background:#1a1a2e;border-left:3px solid #e94560;padding:14px 16px;margin-bottom:20px;color:#e6e6e6;font-size:14px;line-height:1.6">
+                <strong>Nobody holds a seat yet, so nobody&#39;s limits have changed</strong> — including yours.
+              </p>
+
+              <p style="color:#a0a0b8;font-size:14px;line-height:1.6;margin-bottom:24px">
+                Buying seats and holding one are separate. The plan belongs to the organisation; a seat is what connects it to a person.
+              </p>
+
+              {action}
+
+              <p style="margin-top:24px;color:#a0a0b8;font-size:13px;line-height:1.6">
+                Or from the terminal:<br>
+                <code style="color:#e6e6e6">evnx org assign you@example.com</code>
+              </p>
+
+              <p style="margin-top:24px;color:#a0a0b8;font-size:13px;line-height:1.6">
+                A seat decides which plan&#39;s limits apply to its holder.
+                <strong style="color:#e6e6e6">It does not give anyone access to a vault</strong> —
+                sharing is separate, and only by someone who holds the key.
+              </p>
+
+              <p style="margin-top:20px;color:#666;font-size:12px">Your receipt comes from Paddle, who are the seller for the transaction.</p>
+            </div>
+        "#
+        );
+
+        self.send(
+            to,
+            &format!("Your evnx {plan} plan is active — one step left"),
+            &html,
+            link.as_deref(),
+        )
+        .await
+    }
+
     async fn send(
         &self,
         to: &str,

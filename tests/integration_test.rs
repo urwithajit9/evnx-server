@@ -5213,6 +5213,68 @@ async fn usage_of(server: &TestServer, jwt: &str) -> serde_json::Value {
     resp.json::<serde_json::Value>()
 }
 
+/// ⛔ **"You are on team" and "you are on team because Acme pays for your seat"
+/// are different sentences**, and only the second tells someone who to ask when
+/// a limit is wrong.
+///
+/// `resolve_plan` has always computed the provenance; this endpoint called
+/// `plan_for`, which exists only to throw it away. So `evnx auth status` could
+/// print `plan (team)` and had no way to say where the plan came from — which is
+/// precisely the question somebody has after paying and seeing nothing change.
+#[tokio::test]
+async fn usage_names_the_organisation_that_supplied_the_plan() {
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (user, jwt) = verified_user(&server).await;
+
+    // Holding no seat: the plan is the account's own, and there is nothing to name.
+    let own = usage_of(&server, &jwt).await;
+    assert_eq!(own["plan"], "free");
+    assert!(
+        own["plan_via"].is_null(),
+        "an account on its own plan must report null, not an empty object: {own}"
+    );
+
+    let org = make_org(&db, user, "team").await;
+    add_org_member(&db, org, user, true).await;
+
+    let slug: String =
+        sqlx::query_scalar::<_, String>("SELECT slug FROM organizations WHERE id=$1")
+            .bind(org)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+
+    let via = usage_of(&server, &jwt).await;
+    assert_eq!(via["plan"], "team", "the seat must change the plan: {via}");
+    assert_eq!(
+        via["plan_via"]["slug"], slug,
+        "the plan's source must be named: {via}"
+    );
+    assert!(
+        via["plan_via"]["name"].is_string(),
+        "a slug alone is not what a person reads: {via}"
+    );
+
+    // ⚠️ Releasing the seat must take the provenance with it. A stale
+    // organisation name beside a `free` plan would be worse than none.
+    sqlx::query(
+        "UPDATE organization_members SET seat_assigned_at = NULL WHERE org_id=$1 AND user_id=$2",
+    )
+    .bind(org)
+    .bind(user)
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let after = usage_of(&server, &jwt).await;
+    assert_eq!(after["plan"], "free");
+    assert!(
+        after["plan_via"].is_null(),
+        "releasing the seat must clear the source too: {after}"
+    );
+}
+
 /// ⚠️ **The test this endpoint exists for.** It drives the account to its vault
 /// limit, asserts the display says so, and then asserts the create is actually
 /// refused — so the number and the enforcement are checked against each other
@@ -7359,6 +7421,248 @@ fn subscription_event(
         }
     })
     .to_string()
+}
+
+/// The real default: an owner who holds **no** seat.
+///
+/// ⚠️ Deliberately not `add_org_owner`, which assigns one. `routes::orgs::create`
+/// inserts the owner with `seat_assigned_at = NULL` *explicitly*, so this — not
+/// the seated version — is the state a brand-new paying organisation is in.
+async fn add_org_owner_without_a_seat(db: &sqlx::PgPool, org: Uuid, user: Uuid) {
+    sqlx::query(
+        "INSERT INTO organization_members (org_id, user_id, role, seat_assigned_at) \
+         VALUES ($1, $2, 'owner', NULL)",
+    )
+    .bind(org)
+    .bind(user)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// A subscription event with a chosen type and timestamp.
+///
+/// ⚠️ Both are variables because a single purchase produces **more than one**
+/// applied event: the first real one delivered `subscription.created` and
+/// `subscription.activated` three milliseconds apart.
+fn subscription_event_at(org: Uuid, sub: &str, price: &str, kind: &str, at: &str) -> String {
+    serde_json::json!({
+        "event_id": format!("evt_{}", Uuid::new_v4().simple()),
+        "event_type": kind,
+        "occurred_at": at,
+        "data": {
+            "id": sub,
+            "status": "active",
+            "customer_id": format!("ctm_{}", Uuid::new_v4().simple()),
+            "custom_data": { "org_id": org.to_string() },
+            "current_billing_period": { "ends_at": "2026-11-03T12:00:00.000000Z" },
+            "scheduled_change": serde_json::Value::Null,
+            "items": [{ "quantity": 1, "price": { "id": price } }],
+        }
+    })
+    .to_string()
+}
+
+/// Deliver a signed webhook body and assert Paddle got a 200.
+async fn deliver_webhook(server: &TestServer, body: String, secret: &str) {
+    let ts = chrono::Utc::now().timestamp();
+    let sig = paddle_signature(&body, secret, ts);
+    let res = server
+        .post("/api/v1/billing/webhook")
+        .add_header(
+            HeaderName::from_static("paddle-signature"),
+            HeaderValue::from_str(&sig).unwrap(),
+        )
+        .add_header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        .text(body)
+        .await;
+    assert_eq!(res.status_code(), StatusCode::OK, "{}", res.text());
+}
+
+async fn seat_prompt_sent_for(db: &sqlx::PgPool, org: Uuid) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT seat_prompt_sent_for FROM organizations WHERE id = $1",
+    )
+    .bind(org)
+    .fetch_one(db)
+    .await
+    .unwrap()
+}
+
+/// ⛔ **One purchase, two events, one email.**
+///
+/// The first real purchase delivered `subscription.created` and
+/// `subscription.activated` **three milliseconds apart**, and *both applied* —
+/// the ordering guard is `billing_updated_at <= $n`, newer-**or-equal**, so an
+/// event sharing or advancing the timestamp is not rejected. Sending on "the
+/// update applied" would therefore send two emails for one purchase.
+///
+/// What makes it once is the conditional UPDATE on `seat_prompt_sent_for`
+/// (migration 013). This asserts the claim, because the claim *is* the gate:
+/// nothing can send without winning it.
+#[tokio::test]
+async fn one_purchase_claims_the_seat_prompt_exactly_once() {
+    let Some(secret) = webhook_secret().await else {
+        eprintln!("skipped: billing is not configured in this environment");
+        return;
+    };
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (owner, _jwt) = verified_user(&server).await;
+    let org = make_org(&db, owner, "team").await;
+    add_org_owner_without_a_seat(&db, org, owner).await;
+
+    let sub = format!("sub_{}", Uuid::new_v4().simple());
+
+    assert_eq!(
+        seat_prompt_sent_for(&db, org).await,
+        None,
+        "nothing should be claimed before any event arrives"
+    );
+
+    // The two events a real purchase produces, in order, milliseconds apart.
+    deliver_webhook(
+        &server,
+        subscription_event_at(
+            org,
+            &sub,
+            "pri_whatever",
+            "subscription.created",
+            "2026-10-11T16:08:31.584228Z",
+        ),
+        &secret,
+    )
+    .await;
+
+    assert_eq!(
+        seat_prompt_sent_for(&db, org).await.as_deref(),
+        Some(sub.as_str()),
+        "the first event must claim the prompt"
+    );
+
+    deliver_webhook(
+        &server,
+        subscription_event_at(
+            org,
+            &sub,
+            "pri_whatever",
+            "subscription.activated",
+            "2026-10-11T16:08:31.587165Z",
+        ),
+        &secret,
+    )
+    .await;
+
+    assert_eq!(
+        seat_prompt_sent_for(&db, org).await.as_deref(),
+        Some(sub.as_str()),
+        "the second event must not change the claim"
+    );
+
+    // ⚠️ The assertion above is true whether or not the second event re-claimed,
+    // so it cannot stand alone. Run the claim predicate itself and require that
+    // it now refuses — that is what guarantees no second email.
+    let reclaimed: Option<Uuid> = sqlx::query_scalar(
+        "UPDATE organizations SET seat_prompt_sent_for = $2 \
+          WHERE id = $1 AND seat_prompt_sent_for IS DISTINCT FROM $2 \
+            AND NOT EXISTS (SELECT 1 FROM organization_members \
+                             WHERE org_id = $1 AND seat_assigned_at IS NOT NULL) \
+        RETURNING owner_id",
+    )
+    .bind(org)
+    .bind(&sub)
+    .fetch_optional(&db)
+    .await
+    .unwrap();
+    assert!(
+        reclaimed.is_none(),
+        "the claim must refuse once taken — otherwise every renewal re-sends"
+    );
+}
+
+/// ⚠️ **`IS DISTINCT FROM`, never `<>`** — and this is not a style preference.
+///
+/// `seat_prompt_sent_for` starts NULL, and `NULL <> 'sub_…'` is **NULL**, not
+/// true. A WHERE clause written the obvious way therefore matches nothing, and
+/// the very first email would never be sent — silently, on every account.
+#[tokio::test]
+async fn the_claim_needs_is_distinct_from_or_it_never_fires() {
+    let db = raw_db().await;
+    let server = test_app().await;
+    let (owner, _jwt) = verified_user(&server).await;
+    let org = make_org(&db, owner, "team").await;
+    add_org_owner_without_a_seat(&db, org, owner).await;
+    let sub = format!("sub_{}", Uuid::new_v4().simple());
+
+    // The obvious spelling, against the NULL starting value.
+    let with_neq: Option<Uuid> = sqlx::query_scalar(
+        "UPDATE organizations SET seat_prompt_sent_for = $2 \
+          WHERE id = $1 AND seat_prompt_sent_for <> $2 RETURNING owner_id",
+    )
+    .bind(org)
+    .bind(&sub)
+    .fetch_optional(&db)
+    .await
+    .unwrap();
+    assert!(
+        with_neq.is_none(),
+        "`<>` claims nothing against NULL — if this ever passes, Postgres \
+         changed three-valued logic and the comment in migration 013 is wrong"
+    );
+
+    // The spelling the migration uses.
+    let with_idf: Option<Uuid> = sqlx::query_scalar(
+        "UPDATE organizations SET seat_prompt_sent_for = $2 \
+          WHERE id = $1 AND seat_prompt_sent_for IS DISTINCT FROM $2 RETURNING owner_id",
+    )
+    .bind(org)
+    .bind(&sub)
+    .fetch_optional(&db)
+    .await
+    .unwrap();
+    assert_eq!(
+        with_idf,
+        Some(owner),
+        "`IS DISTINCT FROM` must claim the first send"
+    );
+}
+
+/// Do not tell somebody to do a thing they have already done.
+///
+/// A re-subscribe, or an upgrade on an organisation whose owner already holds a
+/// seat, must not produce an email saying nobody holds one.
+#[tokio::test]
+async fn a_seat_already_held_suppresses_the_prompt() {
+    let Some(secret) = webhook_secret().await else {
+        eprintln!("skipped: billing is not configured in this environment");
+        return;
+    };
+    let server = test_app().await;
+    let db = raw_db().await;
+    let (owner, _jwt) = verified_user(&server).await;
+    let org = make_org(&db, owner, "team").await;
+    // ⚠️ `add_org_owner` — the seated variant — is the point of this test.
+    add_org_owner(&db, org, owner).await;
+
+    let sub = format!("sub_{}", Uuid::new_v4().simple());
+    deliver_webhook(
+        &server,
+        subscription_event_at(
+            org,
+            &sub,
+            "pri_whatever",
+            "subscription.created",
+            "2026-10-11T16:08:31.584228Z",
+        ),
+        &secret,
+    )
+    .await;
+
+    assert_eq!(
+        seat_prompt_sent_for(&db, org).await,
+        None,
+        "a seat is already held, so nothing should have been claimed or sent"
+    );
 }
 
 /// ⚠️ **The state everyone forgets, and the one this feature got wrong.**

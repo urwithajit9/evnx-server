@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE organizations\n              SET seat_prompt_sent_for = $2\n            WHERE id = $1\n              AND seat_prompt_sent_for IS DISTINCT FROM $2\n              AND NOT EXISTS (\n                    SELECT 1 FROM organization_members\n                     WHERE org_id = $1 AND seat_assigned_at IS NOT NULL)\n          RETURNING owner_id, name, plan",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "owner_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "plan",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "1bbf22a525dda7d3adf4131b4658fc23ca8114e27d822ae6c95f589567f03d0c"
+}
