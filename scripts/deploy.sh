@@ -135,19 +135,32 @@ step "3 · Pull $IMAGE"
 # ⛔ Pinned by tag rather than `pull server`, so a push landing mid-deploy
 # cannot change what you get. `:latest` is still allowed, and still a race.
 #
-# ⚠️ Retried, because the failure here is address-selection roulette rather
-# than anything about the image. `pkg-containers.githubusercontent.com` is
-# dual-stack; this host has IPv6 addresses in DNS reach but no working route to
-# them, so a pull that picks an AAAA dies with:
+# ⚠️ Retried, because the first pull attempt fails here and the second succeeds.
+# `pkg-containers.githubusercontent.com` is dual-stack, containerd reaches for
+# an AAAA, and this host cannot use one:
 #
 #     dial tcp [2606:50c0:8001::154]:443: connect: network is unreachable
 #
-# while the same command a minute later picks an A record and succeeds. Seen
-# 2026-10-13 after an identical pull had worked two days earlier.
+# ⚠️ **Not occasional.** The first attempt failed on every deploy of 2026-10-13
+# — 32f1e2f, 0488e8a and 214aa45, three different 2606:50c0:800x::154
+# addresses, all three recovered on the retry. Each deploy pays 20-45s for it.
 #
-# ⓘ A retry is the right shape for that and is NOT the real fix: a host with
-# IPv6 in DNS and no route to it is half-configured, and the durable answers are
-# to give it a route or stop advertising one. `PULL_ATTEMPTS=1` opts out.
+# ⛔ **And there is nothing to fix on the host — measured, after two wrong
+# guesses.** First guess: IPv6 roulette, but three for three is not chance.
+# Second guess: a half-configured stack advertising addresses it cannot route.
+# Also wrong. The host has **no IPv6 at all**:
+#
+#     ip -6 addr show scope global   -> empty
+#     ip -6 route show default       -> empty
+#     curl -6 https://ghcr.io/v2/    -> 000, no connectivity
+#
+# IPv4-only is a complete, valid configuration. What is unusual is containerd
+# attempting an address family this machine does not have — which is its
+# behaviour, not a misconfiguration to repair.
+#
+# ⓘ So the retry is the answer here rather than a workaround for one. If it is
+# ever worth eliminating, the lever is stopping the resolver handing AAAA
+# records to that process, not changing the network. `PULL_ATTEMPTS=1` opts out.
 PULL_ATTEMPTS="${PULL_ATTEMPTS:-3}"
 attempt=1
 until EVNX_IMAGE="$IMAGE" dc pull server; do
