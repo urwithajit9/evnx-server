@@ -63,8 +63,17 @@ local_build() {
   dc exec -T server curl -fsS --max-time 5 http://localhost:8080/health 2>/dev/null | build_of || true
 }
 
-# What the world sees. Worth checking *as well*, because a container serving the
-# new build behind a broken proxy is not a finished deploy.
+# ⚠️ **What this host sees of the public name — which is NOT what the world
+# sees, and on this host is not even close.**
+#
+# Measured 2026-10-13: the VPS cannot curl its own public hostname at all, while
+# `api.evnx.dev` answered correctly from off-box throughout. `api.evnx.dev`
+# resolves to this machine's own public address, and a packet to your own public
+# IP from behind NAT commonly does not come back — nothing to do with Caddy.
+#
+# ⛔ So a failure here proves nothing about reachability and must never be
+# reported as a broken proxy. It did exactly that once and sent somebody to read
+# Caddy logs over a working deploy.
 public_build() {
   curl -fsS --max-time 10 "$HEALTH_URL" 2>/dev/null | build_of || true
 }
@@ -96,7 +105,9 @@ if [ -n "$RUNNING" ]; then
     exit 0
   fi
 else
-  note "could not read /health — treating this as a first deploy or an outage"
+  note "could not read the running build — neither the container nor the public URL"
+  note "answered. On this host the public URL never does; if the container did not"
+  note "either, this is a first deploy or the stack is down."
 fi
 
 step "2 · Migrations between here and there"
@@ -174,12 +185,14 @@ while :; do
     PUBLIC="$(public_build)"
     printf '\n\033[32m✓ container is serving build %s\033[0m\n' "$LOCAL"
     if [ "$PUBLIC" = "$LOCAL" ]; then
-      note "and so is $HEALTH_URL"
+      note "and so does $HEALTH_URL"
     else
-      printf '\033[33m  ⚠ %s reports %s\033[0m\n' "$HEALTH_URL" "${PUBLIC:-nothing}"
-      note "⛔ The deploy itself worked — the container is running the right build."
-      note "What is between it and the world is not: check Caddy, DNS and the firewall."
-      note "  docker logs --tail 30 evnx_caddy"
+      # ⓘ Informational, deliberately not a warning. This host routinely cannot
+      # reach its own public name; that says nothing about whether anyone else
+      # can, and the deploy is already confirmed by the line above.
+      note "($HEALTH_URL reads ${PUBLIC:-nothing} from this machine — expected here,"
+      note " it cannot reach its own public address. Confirm from anywhere else:"
+      note "   curl -s https://api.evnx.dev/health)"
     fi
     [ "$TARGET" = "latest" ] && note "('latest' resolved to $LOCAL — record it; that is what you deployed)"
     exit 0
