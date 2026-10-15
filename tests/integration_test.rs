@@ -4492,7 +4492,27 @@ async fn undo_init_says_nothing_about_who_exists() {
                 .as_object()
                 .unwrap()
                 .iter()
-                .map(|(k, v)| format!("{k}:{}", v.as_str().map(|s| s.len()).unwrap_or(0)))
+                .map(|(k, v)| {
+                    let s = v.as_str().unwrap_or("");
+                    // ⚠️ Not B's exact length. `server_public` is SRP's B, a
+                    // random number below the 2048-bit modulus, sent as hex of
+                    // `to_bytes_be()` — which drops leading zero bytes, so about
+                    // one response in 256 is two hex characters shorter. That is
+                    // chance, not a tell, and it made this test fail about one
+                    // run in 128. B cannot be padded instead: client and server
+                    // both hash exactly these bytes into SRP's `u`. Its shape is
+                    // "hex for at most 256 bytes"; every other field keeps its
+                    // exact length.
+                    if k == "server_public" {
+                        let is_b = !s.is_empty()
+                            && s.len() <= 512
+                            && s.len() % 2 == 0
+                            && s.bytes().all(|c| c.is_ascii_hexdigit());
+                        format!("{k}:hex<=256 bytes:{is_b}")
+                    } else {
+                        format!("{k}:{}", s.len())
+                    }
+                })
                 .collect();
             keys.sort();
             out.push(keys);
