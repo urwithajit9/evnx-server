@@ -572,6 +572,176 @@ async fn vault_scoped_token_cannot_list_all_vaults() {
     assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
 }
 
+// ─── SV-1: changing who holds a vault takes a signed-in user (I-220, DEC-VL1) ──
+//
+// A `read_write` API token reached every vault route, so a leaked CI token could
+// delete the vault, delete versions, add, remove or demote members, and re-key —
+// and re-key can remove a member too (`remove_user_id`) or, fed junk the server
+// cannot check, lock every member out for good. Those routes now refuse API
+// tokens with 403, the code account management uses; push, pull and listing
+// stay open to tokens, which is what CI needs.
+
+/// A vault owned by a new user, shared with a second user as developer.
+/// Returns (owner JWT, vault id, member's user id).
+async fn shared_vault(server: &TestServer) -> (String, Uuid, String) {
+    let (_owner, jwt) = verified_user(server).await;
+    let vault_id = create_vault(server, &jwt).await;
+    let email = unique_email("sv1-member");
+    server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&email))
+        .await
+        .assert_status(StatusCode::CREATED);
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+        &jwt,
+    )
+    .json(&share_payload(&email))
+    .await
+    .assert_status(StatusCode::CREATED);
+    let members = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/members")),
+        &jwt,
+    )
+    .await
+    .json::<serde_json::Value>();
+    let member_id = members["members"][1]["user_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    (jwt, vault_id, member_id)
+}
+
+fn share_payload(email: &str) -> serde_json::Value {
+    serde_json::json!({
+        "user_email": email,
+        "role": "developer",
+        "encrypted_vault_key": "c2hhcmVk",
+        "eph_pub_key": "YmFy",
+        "mlkem_ciphertext": "Y".repeat(1452),
+    })
+}
+
+#[tokio::test]
+async fn sv1_api_token_cannot_delete_or_change_membership() {
+    let server = test_app().await;
+    let (jwt, v, member) = shared_vault(&server).await;
+    // The owner's own unscoped read_write token: the widest a token can be.
+    let raw = create_api_token(&server, &jwt, "read_write", None).await;
+    let another = unique_email("sv1-other");
+
+    let attempts: Vec<(&str, TestRequest)> = vec![
+        (
+            "DELETE vault",
+            server.delete(&format!("/api/v1/vaults/{v}")),
+        ),
+        (
+            "add member",
+            server
+                .post(&format!("/api/v1/vaults/{v}/members"))
+                .json(&share_payload(&another)),
+        ),
+        (
+            "change role",
+            server
+                .patch(&format!("/api/v1/vaults/{v}/members/{member}"))
+                .json(&serde_json::json!({ "role": "viewer" })),
+        ),
+        (
+            "remove member",
+            server.delete(&format!("/api/v1/vaults/{v}/members/{member}")),
+        ),
+        (
+            "delete version",
+            server.delete(&format!("/api/v1/vaults/{v}/versions/1")),
+        ),
+        (
+            "re-key",
+            server
+                .post(&format!("/api/v1/vaults/{v}/rekey"))
+                .json(&serde_json::json!({ "versions": [], "members": [] })),
+        ),
+        (
+            "stage re-key blob",
+            server
+                .post(&format!("/api/v1/vaults/{v}/rekey/blobs"))
+                .json(&serde_json::json!({})),
+        ),
+    ];
+    for (what, req) in attempts {
+        let resp = bearer(req, &raw).await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::FORBIDDEN,
+            "{what} with an API token: {}",
+            resp.text()
+        );
+    }
+
+    // Nothing changed: the vault is there and still has both members.
+    let members = bearer(server.get(&format!("/api/v1/vaults/{v}/members")), &jwt)
+        .await
+        .json::<serde_json::Value>();
+    let members = members["members"].as_array().unwrap();
+    assert_eq!(members.len(), 2, "membership changed");
+    assert_eq!(members[1]["role"], "developer", "role changed");
+}
+
+/// What CI needs stays open to a token: list, read members, list versions.
+/// (Push is covered by `read_write_token_may_mutate`.)
+#[tokio::test]
+async fn sv1_api_token_keeps_ci_reads() {
+    let server = test_app().await;
+    let (jwt, v, _member) = shared_vault(&server).await;
+    let raw = create_api_token(&server, &jwt, "read_write", None).await;
+    for path in [
+        "/api/v1/vaults".to_string(),
+        format!("/api/v1/vaults/{v}/members"),
+        format!("/api/v1/vaults/{v}/versions"),
+        format!("/api/v1/vaults/{v}/my-key"),
+    ] {
+        let resp = bearer(server.get(&path), &raw).await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::OK,
+            "{path}: {}",
+            resp.text()
+        );
+    }
+}
+
+/// A signed-in user still does all of it, exactly as before.
+#[tokio::test]
+async fn sv1_user_session_still_manages_the_vault() {
+    let server = test_app().await;
+    let (jwt, v, member) = shared_vault(&server).await;
+
+    bearer(
+        server.patch(&format!("/api/v1/vaults/{v}/members/{member}")),
+        &jwt,
+    )
+    .json(&serde_json::json!({ "role": "viewer" }))
+    .await
+    .assert_status(StatusCode::NO_CONTENT);
+
+    // Re-key reaches its own validation (not the guard): an empty payload does
+    // not cover the vault's members, so it is refused by the handler, not 403.
+    let resp = bearer(server.post(&format!("/api/v1/vaults/{v}/rekey")), &jwt)
+        .json(&serde_json::json!({ "versions": [], "members": [] }))
+        .await;
+    assert_ne!(resp.status_code(), StatusCode::FORBIDDEN, "{}", resp.text());
+
+    bearer(
+        server.delete(&format!("/api/v1/vaults/{v}/members/{member}")),
+        &jwt,
+    )
+    .await
+    .assert_status(StatusCode::NO_CONTENT);
+    bearer(server.delete(&format!("/api/v1/vaults/{v}")), &jwt)
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+}
+
 // ─── B6 regression: email wiring and the verification-token leak ───────────────
 //
 // EmailService was never constructed or called, and register logged the raw
