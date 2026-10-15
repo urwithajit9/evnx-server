@@ -8207,3 +8207,90 @@ async fn billing_actions_on_an_unsubscribed_organisation_say_so() {
     assert_eq!(body["subscription"]["exists"], false);
     assert!(body["subscription"]["status"].is_null());
 }
+
+// ─── SV-2: token lifetime and name are validated (I-205, I-206, DEC-AU2) ──────
+
+/// How many live tokens `jwt`'s account holds.
+async fn token_count(server: &TestServer, jwt: &str) -> usize {
+    let listed = bearer(server.get("/api/v1/auth/tokens"), jwt).await;
+    listed.assert_status_ok();
+    listed.json::<serde_json::Value>()["tokens"]
+        .as_array()
+        .unwrap()
+        .len()
+}
+
+/// `expires_in_days` was used unchecked: 0 and -5 minted a token that was
+/// already expired, and a huge value overflowed `Duration::days` inside the
+/// request. Now 1–3650, or absent for no expiry; anything else is 422 and no
+/// row is written.
+#[tokio::test]
+async fn sv2_token_lifetime_must_be_1_to_3650_days() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+
+    for days in [0_i64, -5, 3651, i64::MAX, i64::MIN] {
+        let resp = bearer(server.post("/api/v1/auth/tokens"), &jwt)
+            .json(&serde_json::json!({ "name": "ci", "scope": "read", "expires_in_days": days }))
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "expires_in_days = {days}: {}",
+            resp.text()
+        );
+    }
+    assert_eq!(
+        token_count(&server, &jwt).await,
+        0,
+        "a refused token was stored"
+    );
+
+    for days in [1_i64, 3650] {
+        bearer(server.post("/api/v1/auth/tokens"), &jwt)
+            .json(&serde_json::json!({ "name": "ci", "scope": "read", "expires_in_days": days }))
+            .await
+            .assert_status(StatusCode::CREATED);
+    }
+}
+
+/// The name was stored exactly as sent: blank, or any length. Now trimmed,
+/// 1–64 characters.
+#[tokio::test]
+async fn sv2_token_name_must_be_1_to_64_characters() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+
+    for name in ["".to_string(), "   ".to_string(), "x".repeat(65)] {
+        let resp = bearer(server.post("/api/v1/auth/tokens"), &jwt)
+            .json(&serde_json::json!({ "name": name, "scope": "read" }))
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "name {name:?}: {}",
+            resp.text()
+        );
+    }
+    assert_eq!(
+        token_count(&server, &jwt).await,
+        0,
+        "a refused token was stored"
+    );
+
+    let resp = bearer(server.post("/api/v1/auth/tokens"), &jwt)
+        .json(&serde_json::json!({ "name": "  ci-deploy  ", "scope": "read" }))
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+    assert_eq!(
+        resp.json::<serde_json::Value>()["name"],
+        "ci-deploy",
+        "name is trimmed"
+    );
+
+    // 64 characters, counted as characters: a non-ASCII name is not cut short.
+    bearer(server.post("/api/v1/auth/tokens"), &jwt)
+        .json(&serde_json::json!({ "name": "é".repeat(64), "scope": "read" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+}
