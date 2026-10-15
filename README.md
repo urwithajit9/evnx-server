@@ -347,6 +347,15 @@ DELETE /api/v1/auth/tokens/{id}
 
 #### Vault Operations
 
+**Credentials.** Every vault route needs a verified account. An `evnx_tok_` API
+token may list vaults, read members, keys, audit and versions, and push and pull.
+**Deleting a vault or a version, adding, removing or re-roling a member, and
+re-keying need a signed-in user** — an API token gets `403` on those
+(`DELETE /vaults/{id}`, `POST /vaults/{id}/members`,
+`PATCH|DELETE /vaults/{id}/members/{user_id}`, `DELETE /vaults/{id}/versions/{n}`,
+`POST /vaults/{id}/rekey`, `POST /vaults/{id}/rekey/blobs`), so a leaked CI token
+cannot change who holds a vault or destroy it.
+
 ```
 GET  /api/v1/vaults
   → 200 { "vaults": [{ "id", "name", "environment", "role", "version_count", "updated_at" }] }

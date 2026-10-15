@@ -64,20 +64,21 @@ pub fn create_router(state: AppState) -> Router {
         ])
         .allow_credentials(true)
         .max_age(std::time::Duration::from_secs(3600));
-    // Vault routes — require JWT + email verified
-    let vault_routes = Router::new()
+    // Vault routes — require JWT + email verified.
+    //
+    // ⚠️ Two routers, merged under `/api/v1/vaults` (SV-1, I-220, DEC-VL1).
+    // An `evnx_tok_` API token passed `require_verified` on every vault route,
+    // so a leaked CI token could delete the vault, delete versions, add, remove
+    // or demote members, and re-key — and re-key removes a member too
+    // (`remove_user_id`), or, fed blobs and wraps the server cannot check, locks
+    // every member out irrecoverably. Those routes now also need a user session:
+    // a token gets 403 there, as it does on account management. What CI needs —
+    // listing, reading, pushing and pulling — stays open to tokens.
+    let vault_token_routes = Router::new()
         .route("/", get(vaults::list_vaults).post(vaults::create_vault))
-        .route("/:vault_id", delete(vaults::delete_vault))
         .route("/:vault_id/my-key", get(vaults::get_my_key))
         .route("/:vault_id/audit", get(vaults::vault_audit))
-        .route(
-            "/:vault_id/members",
-            get(members::list_members).post(members::add_member),
-        )
-        .route(
-            "/:vault_id/members/:user_id",
-            patch(members::set_member_role).delete(members::remove_member),
-        )
+        .route("/:vault_id/members", get(members::list_members))
         .route(
             "/:vault_id/versions",
             get(versions::list_versions).post(versions::push_version),
@@ -87,6 +88,17 @@ pub fn create_router(state: AppState) -> Router {
             get(versions::get_latest_version),
         )
         .route("/:vault_id/versions/:n/blob", get(versions::download_blob))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_verified,
+        ));
+    let vault_session_routes = Router::new()
+        .route("/:vault_id", delete(vaults::delete_vault))
+        .route("/:vault_id/members", post(members::add_member))
+        .route(
+            "/:vault_id/members/:user_id",
+            patch(members::set_member_role).delete(members::remove_member),
+        )
         // ⚠️ Admin, not developer. A developer adds history; removing it — and the
         // blob with it, irrecoverably — takes an admin. The endpoint exists because
         // the version quota told people to delete old versions while there was no
@@ -96,10 +108,18 @@ pub fn create_router(state: AppState) -> Router {
         // see routes::rekey for why it cannot be a single request.
         .route("/:vault_id/rekey/blobs", post(rekey::stage_blob))
         .route("/:vault_id/rekey", post(rekey::rekey))
+        // Layers run outermost-last-added: the session check refuses a token
+        // first (403), then `require_verified` checks the address and sets the
+        // same request extensions the token router does.
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_verified,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_user_session,
         ));
+    let vault_routes = vault_token_routes.merge(vault_session_routes);
 
     // Auth routes — unauthenticated. Each of these either establishes a session
     // or carries its own credential in the request body (refresh token, email
