@@ -20,6 +20,49 @@ pub struct CreateTokenRequest {
     pub expires_in_days: Option<i64>,
 }
 
+/// The longest lifetime a token may be given: ten years (DEC-AU2).
+pub const MAX_TOKEN_DAYS: i64 = 3650;
+/// The longest token name, in characters.
+pub const MAX_TOKEN_NAME_CHARS: usize = 64;
+
+/// The token name, trimmed, or 422.
+///
+/// ⚠️ It was stored exactly as sent — blank, or any length — so a direct API
+/// call could create a token nobody can tell apart in `token list` (I-206).
+fn valid_token_name(name: &str) -> Result<String, AppError> {
+    let name = name.trim();
+    let chars = name.chars().count();
+    if chars == 0 || chars > MAX_TOKEN_NAME_CHARS {
+        return Err(AppError::Validation(format!(
+            "name must be 1–{MAX_TOKEN_NAME_CHARS} characters"
+        )));
+    }
+    Ok(name.to_string())
+}
+
+/// When a token made at `now` with `days` of life expires, or 422.
+///
+/// ⚠️ `days` was used unchecked: 0 or a negative number minted a token that was
+/// already expired, and a huge one overflowed `Duration::days` — which panics —
+/// inside the request (I-205). `None` still means "no expiry".
+fn expiry_from_days(
+    days: Option<i64>,
+    now: chrono::DateTime<Utc>,
+) -> Result<Option<chrono::DateTime<Utc>>, AppError> {
+    let Some(days) = days else {
+        return Ok(None);
+    };
+    if !(1..=MAX_TOKEN_DAYS).contains(&days) {
+        return Err(AppError::Validation(format!(
+            "expires_in_days must be between 1 and {MAX_TOKEN_DAYS}"
+        )));
+    }
+    chrono::Duration::try_days(days)
+        .and_then(|d| now.checked_add_signed(d))
+        .map(Some)
+        .ok_or_else(|| AppError::Validation("expires_in_days is out of range".into()))
+}
+
 #[derive(Serialize)]
 pub struct TokenResponse {
     pub id: Uuid,
@@ -39,6 +82,11 @@ pub async fn create_token(
 ) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), AppError> {
     let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
 
+    // Validated before the quota check and before anything is written, so a bad
+    // request costs nothing and stores nothing (SV-2).
+    let name = valid_token_name(&req.name)?;
+    let expires_at = expiry_from_days(req.expires_in_days, Utc::now())?;
+
     crate::services::quota::check_token_limit(&state.db, &state.config.quotas, user_id).await?;
 
     let valid_scopes = ["read", "read_write"];
@@ -56,9 +104,6 @@ pub async fn create_token(
     let token_hash = blake3::hash(raw_token.as_bytes()).to_hex().to_string();
 
     let token_id = Uuid::new_v4();
-    let expires_at = req
-        .expires_in_days
-        .map(|days| Utc::now() + chrono::Duration::days(days));
 
     sqlx::query!(
         r#"
@@ -67,7 +112,7 @@ pub async fn create_token(
         "#,
         token_id,
         user_id,
-        req.name,
+        name,
         token_hash,
         req.scope,
         req.vault_id,
@@ -103,7 +148,7 @@ pub async fn create_token(
         Json(serde_json::json!({
             "id": token_id,
             "raw_token": raw_token,  // shown ONCE — client must save it
-            "name": req.name,
+            "name": name,
             "scope": req.scope,
             "expires_at": expires_at,
             "note": "Save this token — it cannot be retrieved again.",

@@ -336,6 +336,8 @@ GET  /api/v1/auth/tokens
 POST /api/v1/auth/tokens
   Body: { "name": "ci-prod", "scope": "read", "vault_id": "uuid|null", "expires_in_days": 90 }
   → 201 { "id": "uuid", "raw_token": "evnx_tok_...", "name": "...", ... }
+  → 422 if name (trimmed) is not 1–64 characters, or expires_in_days is given
+    and not 1–3650. Omit expires_in_days for a token that does not expire.
   raw_token shown ONCE — server stores only BLAKE3 hash.
 
 DELETE /api/v1/auth/tokens/{id}
