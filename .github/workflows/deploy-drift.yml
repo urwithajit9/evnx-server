@@ -132,7 +132,15 @@ jobs:
           #
           # The oldest undeployed commit is the one that has been waiting longest, so
           # its age is the length of the drift.
-          oldest_undeployed=$(git log --format=%cI --reverse "${deployed}..HEAD" | head -1)
+          #
+          # ⛔ No `| head` here, nor anywhere under pipefail. `head -1` closes
+          # the pipe after one line; `git log` to a pipe flushes per commit, so
+          # if it writes again it dies of SIGPIPE, pipefail reports 141, and
+          # `-e` fails the step — as it did on 2026-10-16 with production 10
+          # commits behind and well inside the grace period. `tail` reads to
+          # the end, so the writer always finishes.
+          oldest_sha=$(git rev-list "${deployed}..HEAD" | tail -n 1)
+          oldest_undeployed=$(git log -1 --format=%cI "$oldest_sha")
           age_days=$(( ( $(date -u +%s) - $(date -u -d "$oldest_undeployed" +%s) ) / 86400 ))
 
           echo "Deployed $deployed is $behind commit(s) behind main; the oldest undeployed commit is $age_days day(s) old."
@@ -159,7 +167,7 @@ jobs:
             echo "**Undeployed commits:**"
             echo
             echo '```'
-            git log --oneline "${deployed}..HEAD" | head -20
+            git log --oneline -20 "${deployed}..HEAD"   # -20, not `| head` (see above)
             echo '```'
             echo
             echo "Deploy with \`docs/DEPLOYMENT.md\` §9, then confirm \`/health\`'s \`build\` field changes —"
