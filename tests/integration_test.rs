@@ -331,6 +331,86 @@ async fn srp_init_rate_limit_triggers_after_5_attempts() {
         .assert_status(StatusCode::TOO_MANY_REQUESTS);
 }
 
+// ─── I-304: a 429 says how long is really left ─────────────────────────────────
+
+/// A direct connection to the test Valkey, for setting a counter's state.
+async fn valkey() -> redis::aio::ConnectionManager {
+    let config = test_config().await;
+    let client = redis::Client::open(config.valkey_url.as_str()).unwrap();
+    redis::aio::ConnectionManager::new(client).await.unwrap()
+}
+
+/// `rate:srp_init:{…}` for `email`, as `routes::auth::email_subject` builds it.
+fn srp_init_key(email: &str) -> String {
+    format!(
+        "rate:srp_init:{}",
+        blake3::hash(email.trim().to_lowercase().as_bytes()).to_hex()
+    )
+}
+
+/// I-304, SV-4: the message hard-coded the whole window ("900 seconds") and no
+/// `Retry-After` was sent. The live review measured 648-714 s actually left.
+#[tokio::test]
+async fn t_i304_a_429_carries_the_time_really_left_and_a_retry_after_header() {
+    use redis::AsyncCommands;
+    let server = test_app().await;
+    let email = unique_email("retryafter");
+    let mut v = valkey().await;
+    // Five attempts already spent, in a window with two minutes left.
+    let _: () = v.set_ex(srp_init_key(&email), 5, 120).await.unwrap();
+
+    let resp = server
+        .post("/api/v1/auth/srp/init")
+        .json(&serde_json::json!({ "email": email, "client_public": "a".repeat(512) }))
+        .await;
+    resp.assert_status(StatusCode::TOO_MANY_REQUESTS);
+
+    let header: u64 = resp
+        .headers()
+        .get("retry-after")
+        .expect("no Retry-After header on a 429")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=120).contains(&header), "Retry-After: {header}");
+    let body = resp.json::<serde_json::Value>();
+    assert_eq!(body["code"], "RATE_LIMITED");
+    assert_eq!(
+        body["error"],
+        format!("Too many requests. Try again in {header} seconds."),
+        "the body and the header must give the same number"
+    );
+}
+
+/// The counter is created by INCR and given its expiry by a second command.
+/// A counter left without one — the server stopped between the two — would
+/// lock the address out for good. The refusal gives it the window again.
+#[tokio::test]
+async fn t_i304_a_counter_left_without_an_expiry_is_given_one() {
+    use redis::AsyncCommands;
+    let server = test_app().await;
+    let email = unique_email("noexpiry");
+    let key = srp_init_key(&email);
+    let mut v = valkey().await;
+    let _: () = v.set(&key, 5).await.unwrap();
+    let before: i64 = v.ttl(&key).await.unwrap();
+    assert_eq!(before, -1, "set up a counter with no expiry");
+
+    let resp = server
+        .post("/api/v1/auth/srp/init")
+        .json(&serde_json::json!({ "email": email, "client_public": "a".repeat(512) }))
+        .await;
+    resp.assert_status(StatusCode::TOO_MANY_REQUESTS);
+
+    let after: i64 = v.ttl(&key).await.unwrap();
+    assert!((1..=900).contains(&after), "TTL after the refusal: {after}");
+    assert_eq!(
+        resp.headers().get("retry-after").unwrap().to_str().unwrap(),
+        "900"
+    );
+}
+
 // ─── B4 regression: CI/CD API token routes ─────────────────────────────────────
 //
 // routes/tokens.rs was fully implemented but never added to the router, so there

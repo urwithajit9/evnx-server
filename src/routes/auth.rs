@@ -259,12 +259,11 @@ pub async fn srp_init(
 ) -> Result<Json<SrpInitResponse>, AppError> {
     // Rate limiting (unchanged)
     let rate_key = format!("rate:srp_init:{}", email_subject(&req.email));
-    let allowed = state.cache.check_rate_limit(&rate_key, 5, 900).await?;
-    if !allowed {
-        return Err(AppError::RateLimited {
-            retry_after_seconds: 900,
-        });
-    }
+    state
+        .cache
+        .rate_limit(&rate_key, 5, 900)
+        .await?
+        .or_refuse()?;
 
     // Lookup user — constant-time response for unknown emails
     let email_lower = req.email.trim().to_lowercase();
@@ -644,11 +643,11 @@ pub async fn resend_verification(
         "rate:resend_verify:{}",
         blake3::hash(email.as_bytes()).to_hex()
     );
-    if !state.cache.check_rate_limit(&rate_key, 3, 3600).await? {
-        return Err(AppError::RateLimited {
-            retry_after_seconds: 3600,
-        });
-    }
+    state
+        .cache
+        .rate_limit(&rate_key, 3, 3600)
+        .await?
+        .or_refuse()?;
 
     // From here on every path returns 202. Failures are logged, never surfaced.
     if let Some(user) = users::find_by_email(&state.db, &email).await? {

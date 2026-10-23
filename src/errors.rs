@@ -100,6 +100,15 @@ pub enum AppError {
 /// Log them server-side, return generic messages to users.
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        // I-304: the standard header beside the body's number, read before
+        // `self` is consumed below. The two always carry the same value.
+        let retry_after = match &self {
+            AppError::RateLimited {
+                retry_after_seconds,
+            } => Some(*retry_after_seconds),
+            _ => None,
+        };
+
         // Log internal errors (only in this impl, nowhere else)
         match &self {
             AppError::Database(e) => {
@@ -171,6 +180,13 @@ impl IntoResponse for AppError {
             }
         };
 
-        (status, Json(json!({ "error": message, "code": code }))).into_response()
+        let mut response =
+            (status, Json(json!({ "error": message, "code": code }))).into_response();
+        if let Some(seconds) = retry_after {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, seconds.into());
+        }
+        response
     }
 }

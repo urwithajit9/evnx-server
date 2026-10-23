@@ -5,8 +5,8 @@ use serde::{de::DeserializeOwned, Serialize};
 
 /// Wrapper around the Valkey operations used by evnx-server.
 ///
-/// Only six commands are used — SETEX, GET, DEL, INCR, EXPIRE, EXISTS — all
-/// core primitives with identical semantics in Redis and Valkey. No Lua, no
+/// Only seven commands are used — SETEX, GET, DEL, INCR, EXPIRE, EXISTS, TTL —
+/// all core primitives with identical semantics in Redis and Valkey. No Lua, no
 /// streams, no modules, so the backing store is interchangeable.
 ///
 /// Key naming convention:
@@ -87,15 +87,46 @@ impl CacheService {
         Ok(count)
     }
 
-    /// Check rate limit. Returns Ok(true) if under limit, Ok(false) if exceeded.
-    pub async fn check_rate_limit(
+    /// Count one attempt against a limit of `max_attempts` per `window_seconds`.
+    ///
+    /// ⚠️ **Over the limit, it says how long is really left** (I-304). Every
+    /// caller used to answer with the whole window — "900 seconds" — however
+    /// much of it remained; the live review measured 648-714 s actually left.
+    /// The TTL is read only on a refusal, so an allowed request costs nothing
+    /// extra.
+    ///
+    /// ⚠️ **A counter with no expiry is given one here.** [`Self::incr_with_ttl`]
+    /// creates the key and sets its expiry in two commands; a server stopped
+    /// between them leaves a counter that never expires, which locks the address
+    /// out for good. TTL `-1` is exactly that state, so the refusal repairs it.
+    pub async fn rate_limit(
         &self,
         key: &str,
         max_attempts: u64,
         window_seconds: u64,
-    ) -> Result<bool, CacheError> {
+    ) -> Result<RateLimit, CacheError> {
         let count = self.incr_with_ttl(key, window_seconds).await?;
-        Ok(count <= max_attempts)
+        if count <= max_attempts {
+            return Ok(RateLimit::Allowed);
+        }
+
+        let mut conn = self.0.clone();
+        let ttl: i64 = conn.ttl(key).await.map_err(CacheError::Valkey)?;
+        let retry_after_seconds = match ttl {
+            t if t > 0 => t as u64,
+            // -1: the key exists with no expiry — the gap above.
+            -1 => {
+                conn.expire::<_, ()>(key, window_seconds as i64)
+                    .await
+                    .map_err(CacheError::Valkey)?;
+                window_seconds
+            }
+            // -2 (expired since the INCR) or 0: the window is over now.
+            _ => 1,
+        };
+        Ok(RateLimit::Exceeded {
+            retry_after_seconds,
+        })
     }
 
     /// Check if a key exists (used for JWT blocklist).
@@ -123,6 +154,31 @@ impl CacheService {
         conn.set_ex::<_, _, ()>(key, "1", ttl_seconds)
             .await
             .map_err(CacheError::Valkey)
+    }
+}
+
+/// What [`CacheService::rate_limit`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimit {
+    Allowed,
+    /// Refused; the window has this many seconds left.
+    Exceeded {
+        retry_after_seconds: u64,
+    },
+}
+
+impl RateLimit {
+    /// `Err(RateLimited)` with the real wait when refused, so a handler reads
+    /// `state.cache.rate_limit(..).await?.or_refuse()?`.
+    pub fn or_refuse(self) -> Result<(), crate::errors::AppError> {
+        match self {
+            RateLimit::Allowed => Ok(()),
+            RateLimit::Exceeded {
+                retry_after_seconds,
+            } => Err(crate::errors::AppError::RateLimited {
+                retry_after_seconds,
+            }),
+        }
     }
 }
 
