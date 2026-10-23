@@ -38,6 +38,13 @@ pub fn build_router(state: AppState) -> Router {
     routes::create_router(state.clone())
         // Reject oversized bodies before parsing them — guards against memory exhaustion.
         .layer(RequestBodyLimitLayer::new(request_size_limit))
+        // I-305: the framework's own rejections (400/415/422 from extractors, 413
+        // from the limit above, the router's 404/405) get the `{error, code}`
+        // envelope too. Outside the limit so its 413 is covered; inside the
+        // security headers so a rewritten response still gets them.
+        .layer(axum::middleware::from_fn(
+            middleware::json_errors::json_error_bodies,
+        ))
         // Outermost so the headers land on every response, including rejections
         // produced by the layers below (413 from the body limit, 404, 405).
         .layer(axum::middleware::from_fn_with_state(

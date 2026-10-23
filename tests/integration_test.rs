@@ -411,6 +411,125 @@ async fn t_i304_a_counter_left_without_an_expiry_is_given_one() {
     );
 }
 
+// ─── I-305: every error body is {error, code} ──────────────────────────────────
+
+/// The status is the framework's; the body is the envelope every client reads.
+fn assert_envelope(resp: &axum_test::TestResponse, status: StatusCode, code: &str) -> String {
+    resp.assert_status(status);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    assert!(ct.starts_with("application/json"), "content-type {ct:?}");
+    let body = resp.json::<serde_json::Value>();
+    assert_eq!(body["code"], code, "{body}");
+    let error = body["error"].as_str().unwrap_or_default().to_string();
+    assert!(!error.is_empty(), "{body}");
+    error
+}
+
+/// I-305, SV-4: a body the JSON extractor rejects came back as `text/plain`,
+/// which the CLI showed as "unexpected response: HTTP 422".
+#[tokio::test]
+async fn t_i305_a_malformed_json_body_gets_the_envelope() {
+    let server = test_app().await;
+    let resp = server
+        .post("/api/v1/auth/srp/init")
+        .json(&serde_json::json!({ "email": 1 }))
+        .await;
+    let error = assert_envelope(&resp, StatusCode::UNPROCESSABLE_ENTITY, "VALIDATION_ERROR");
+    assert!(error.contains("invalid type"), "{error}");
+}
+
+#[tokio::test]
+async fn t_i305_a_body_that_is_not_json_gets_the_envelope() {
+    let server = test_app().await;
+    let resp = server.post("/api/v1/auth/srp/init").text("x").await;
+    assert_envelope(
+        &resp,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "VALIDATION_ERROR",
+    );
+}
+
+/// Unknown routes answered 404 with an empty body.
+#[tokio::test]
+async fn t_i305_an_unknown_route_gets_the_envelope() {
+    let server = test_app().await;
+    let resp = server.get("/api/v1/no-such-route").await;
+    assert_envelope(&resp, StatusCode::NOT_FOUND, "NOT_FOUND");
+    // Still behind the outer layer: the rewrite keeps the security headers.
+    assert_eq!(
+        resp.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+}
+
+/// 405 had an empty body too. Its `Allow` header has to survive the rewrite.
+#[tokio::test]
+async fn t_i305_a_wrong_method_gets_the_envelope_and_keeps_allow() {
+    let server = test_app().await;
+    let resp = server.delete("/health").await;
+    assert_envelope(&resp, StatusCode::METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED");
+    assert!(
+        resp.headers().get("allow").is_some(),
+        "Allow header dropped"
+    );
+}
+
+/// ⚠️ The emailed verification link answers a browser with an HTML page —
+/// on failure too (400). That is the one non-JSON error on purpose, and it
+/// must stay HTML.
+#[tokio::test]
+async fn t_i305_the_verification_page_stays_html() {
+    let server = test_app().await;
+    let resp = server
+        .get("/api/v1/auth/verify-email")
+        .add_query_param("token", "not-a-real-token")
+        .await;
+    resp.assert_status(StatusCode::BAD_REQUEST);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(ct.starts_with("text/html"), "content-type {ct:?}");
+    assert!(resp.text().contains("Link expired or already used"));
+}
+
+/// The body limit's 413 is a framework rejection too.
+#[tokio::test]
+async fn t_i305_an_oversized_body_gets_the_envelope() {
+    let server = test_app().await;
+    let limit = test_config().await.max_request_size_kb * 1024;
+    let big = "a".repeat(limit as usize + 1024);
+    let resp = server
+        .post("/api/v1/auth/srp/init")
+        .json(&serde_json::json!({ "email": "x@example.test", "client_public": big }))
+        .await;
+    assert_envelope(&resp, StatusCode::PAYLOAD_TOO_LARGE, "PAYLOAD_TOO_LARGE");
+}
+
+/// JSON errors and successes pass through as they were.
+#[tokio::test]
+async fn t_i305_json_errors_and_successes_are_untouched() {
+    let server = test_app().await;
+    let payload = register_payload(&unique_email("untouched"));
+    server.post("/api/v1/auth/register").json(&payload).await;
+    let dup = server.post("/api/v1/auth/register").json(&payload).await;
+    dup.assert_status(StatusCode::CONFLICT);
+    assert_eq!(
+        dup.json::<serde_json::Value>(),
+        serde_json::json!({ "error": "Email already registered", "code": "CONFLICT" })
+    );
+
+    let health = server.get("/health").await;
+    health.assert_status_ok();
+    assert_eq!(health.json::<serde_json::Value>()["status"], "ok");
+}
+
 // ─── B4 regression: CI/CD API token routes ─────────────────────────────────────
 //
 // routes/tokens.rs was fully implemented but never added to the router, so there
