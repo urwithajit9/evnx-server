@@ -306,15 +306,18 @@ async fn logout_blocklists_the_session_via_valkey() {
     );
 }
 
+/// Login starts allowed per address per window (`routes::auth::SRP_INIT_LIMIT`).
+const SRP_INIT_LIMIT: usize = 30;
+
 #[tokio::test]
-async fn srp_init_rate_limit_triggers_after_5_attempts() {
+async fn srp_init_rate_limit_triggers_after_30_attempts() {
     // Exercises INCR + EXPIRE. The key is per-email, so a unique address keeps
     // this test independent of previous runs (the counter lives 900s).
     let server = test_app().await;
     let email = unique_email("ratelimit");
     let body = serde_json::json!({ "email": email, "client_public": "a".repeat(512) });
 
-    for i in 0..5 {
+    for i in 0..SRP_INIT_LIMIT {
         let resp = server.post("/api/v1/auth/srp/init").json(&body).await;
         assert_ne!(
             resp.status_code(),
@@ -356,8 +359,11 @@ async fn t_i304_a_429_carries_the_time_really_left_and_a_retry_after_header() {
     let server = test_app().await;
     let email = unique_email("retryafter");
     let mut v = valkey().await;
-    // Five attempts already spent, in a window with two minutes left.
-    let _: () = v.set_ex(srp_init_key(&email), 5, 120).await.unwrap();
+    // Every attempt already spent, in a window with two minutes left.
+    let _: () = v
+        .set_ex(srp_init_key(&email), SRP_INIT_LIMIT, 120)
+        .await
+        .unwrap();
 
     let resp = server
         .post("/api/v1/auth/srp/init")
@@ -393,7 +399,7 @@ async fn t_i304_a_counter_left_without_an_expiry_is_given_one() {
     let email = unique_email("noexpiry");
     let key = srp_init_key(&email);
     let mut v = valkey().await;
-    let _: () = v.set(&key, 5).await.unwrap();
+    let _: () = v.set(&key, SRP_INIT_LIMIT).await.unwrap();
     let before: i64 = v.ttl(&key).await.unwrap();
     assert_eq!(before, -1, "set up a counter with no expiry");
 
@@ -1312,6 +1318,20 @@ async fn full_srp_login_issues_tokens_without_totp() {
     bearer(server.get("/api/v1/auth/me"), access)
         .await
         .assert_status_ok();
+}
+
+/// I-310, DEC-AU303: every login *start* counted toward 5 per 15 minutes, so
+/// the sixth good login in a row was refused 429. Wrong passwords are bounded
+/// by `srp_lockout` (5, then 15 minutes) — that is what stops guessing — so
+/// the start limit is 30 now.
+#[tokio::test]
+async fn t_i310_six_successful_logins_in_a_row_are_not_refused() {
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+    for _ in 0..6 {
+        // `srp_login` asserts 200 on both steps and checks the server's proof.
+        srp_login(&server, &account).await;
+    }
 }
 
 #[tokio::test]

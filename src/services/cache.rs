@@ -11,7 +11,8 @@ use serde::{de::DeserializeOwned, Serialize};
 ///
 /// Key naming convention:
 ///   srp:{session_id}            → SRP server state (5-min TTL)
-///   rate:srp_init:{email_hash}  → SRP init counter (5 per 15 min)
+///   rate:srp_init:{email_hash}  → SRP init counter (30 per 15 min; guessing
+///                                  is bounded by srp_lockout, 5 per 15 min)
 ///   rate:resend_verify:{email_hash} → verification resend counter (3 per hour)
 ///
 /// ⚠️ Rate limiting is keyed by **email hash, not by IP**, and the two are not
