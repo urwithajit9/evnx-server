@@ -3104,6 +3104,233 @@ async fn a_developer_cannot_change_roles() {
     assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
 }
 
+// ─── I-313, I-314: sharing never rewrites a membership (SV-3, DEC-VL3) ─────────
+//
+// `add_member` was an upsert, so sharing with someone already in the vault
+// replaced their role and their wrapped key. The owner outranks every role that
+// can be granted, so sharing with their own address demoted them to developer
+// and left a vault nobody could delete. An admin could rewrite the owner as a
+// viewer holding a key that opens nothing, and then remove them. The guards on
+// PATCH and DELETE (the owner's role is fixed, the owner cannot be removed) were
+// bypassed through POST. Sharing with a member is now a 409; a role changes
+// through PATCH only.
+
+/// Register a verified account and return its id, email and a JWT.
+async fn verified_user_with_email(server: &TestServer, prefix: &str) -> (Uuid, String, String) {
+    let email = unique_email(prefix);
+    let reg = server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&email))
+        .await;
+    reg.assert_status(StatusCode::CREATED);
+    let id = Uuid::parse_str(reg.json::<serde_json::Value>()["user_id"].as_str().unwrap()).unwrap();
+    let jwt = jwt_service().await.issue(id, Uuid::new_v4(), true).unwrap();
+    (id, email, jwt)
+}
+
+/// A share request for `email` at `role`, wrapped as `key`.
+fn share_as(email: &str, role: &str, key: &str) -> serde_json::Value {
+    serde_json::json!({
+        "user_email": email,
+        "role": role,
+        "encrypted_vault_key": key,
+        "eph_pub_key": "YmFy",
+        "mlkem_ciphertext": "Y".repeat(1452),
+    })
+}
+
+/// The role `GET /members` lists for `email`, if they are a member.
+async fn listed_role(
+    server: &TestServer,
+    jwt: &str,
+    vault_id: Uuid,
+    email: &str,
+) -> Option<String> {
+    let body = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/members")),
+        jwt,
+    )
+    .await
+    .json::<serde_json::Value>();
+    body["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["email"] == email)
+        .map(|m| m["role"].as_str().unwrap().to_string())
+}
+
+/// The wrapped key `GET /my-key` returns to `jwt`'s account.
+async fn my_key(server: &TestServer, jwt: &str, vault_id: Uuid) -> serde_json::Value {
+    bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/my-key")),
+        jwt,
+    )
+    .await
+    .json::<serde_json::Value>()
+}
+
+#[tokio::test]
+async fn t_i313_an_owner_sharing_with_themselves_is_refused_and_stays_owner() {
+    let server = test_app().await;
+    let (_owner, email, jwt) = verified_user_with_email(&server, "i313-owner").await;
+    let vault_id = create_vault(&server, &jwt).await;
+
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+        &jwt,
+    )
+    .json(&share_as(&email, "developer", "c2hhcmVk"))
+    .await;
+    let message = assert_envelope(&resp, StatusCode::CONFLICT, "CONFLICT");
+    assert!(message.contains("owner"), "{message}");
+
+    assert_eq!(
+        listed_role(&server, &jwt, vault_id, &email)
+            .await
+            .as_deref(),
+        Some("owner")
+    );
+    let mine = my_key(&server, &jwt, vault_id).await;
+    assert_eq!(
+        mine["encrypted_vault_key"], "Zm9v",
+        "the owner's key was replaced"
+    );
+    assert!(mine["eph_pub_key"].is_null(), "{mine}");
+
+    // Still the owner in deed as well as in the list: the vault can be deleted.
+    bearer(server.delete(&format!("/api/v1/vaults/{vault_id}")), &jwt)
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn t_i313_an_admin_cannot_rewrite_the_owners_row() {
+    let server = test_app().await;
+    let (owner_id, owner_email, owner_jwt) = verified_user_with_email(&server, "i313-owner").await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (_aid, admin_email, admin_jwt) = verified_user_with_email(&server, "i313-admin").await;
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+        &owner_jwt,
+    )
+    .json(&share_as(&admin_email, "admin", "Zm9v"))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    // The admin "shares" with the owner: a viewer's role and a key that opens
+    // nothing.
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+        &admin_jwt,
+    )
+    .json(&share_as(&owner_email, "viewer", "Z2FyYmFnZQ"))
+    .await;
+    assert_envelope(&resp, StatusCode::CONFLICT, "CONFLICT");
+
+    assert_eq!(
+        listed_role(&server, &owner_jwt, vault_id, &owner_email)
+            .await
+            .as_deref(),
+        Some("owner")
+    );
+    let mine = my_key(&server, &owner_jwt, vault_id).await;
+    assert_eq!(
+        mine["encrypted_vault_key"], "Zm9v",
+        "the owner's key was replaced"
+    );
+    assert!(mine["eph_pub_key"].is_null(), "{mine}");
+
+    // The second half of the attack: with the owner still the owner, the admin
+    // cannot remove them.
+    let resp = bearer(
+        server.delete(&format!("/api/v1/vaults/{vault_id}/members/{owner_id}")),
+        &admin_jwt,
+    )
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::CONFLICT, "{}", resp.text());
+}
+
+#[tokio::test]
+async fn t_i314_sharing_again_with_a_member_is_refused_and_changes_nothing() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (_did, dev_email, dev_jwt) = verified_user_with_email(&server, "i314-dev").await;
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+        &owner_jwt,
+    )
+    .json(&share_as(&dev_email, "developer", "Zm9v"))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+        &owner_jwt,
+    )
+    .json(&share_as(&dev_email, "viewer", "bmV3"))
+    .await;
+    let message = assert_envelope(&resp, StatusCode::CONFLICT, "CONFLICT");
+    assert!(
+        message.contains("already a member of this vault, as developer"),
+        "{message}"
+    );
+    assert!(message.contains("evnx vault role"), "{message}");
+
+    assert_eq!(
+        listed_role(&server, &owner_jwt, vault_id, &dev_email)
+            .await
+            .as_deref(),
+        Some("developer")
+    );
+    assert_eq!(
+        my_key(&server, &dev_jwt, vault_id).await["encrypted_vault_key"],
+        "Zm9v"
+    );
+
+    // One grant in the trail, not two: a refused share is not a grant.
+    let grants = audit_events(vault_id)
+        .await
+        .into_iter()
+        .filter(|(t, _)| t == "member_grant")
+        .count();
+    assert_eq!(grants, 1);
+}
+
+/// Guard: removal deletes the row, so someone who was removed can be shared
+/// with again, at a new role.
+#[tokio::test]
+async fn t_i313_a_removed_member_can_be_shared_with_again() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (dev_id, dev_email, _dj) = verified_user_with_email(&server, "i313-again").await;
+    for (role, removed) in [("developer", true), ("viewer", false)] {
+        bearer(
+            server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+            &owner_jwt,
+        )
+        .json(&share_as(&dev_email, role, "Zm9v"))
+        .await
+        .assert_status(StatusCode::CREATED);
+        if removed {
+            bearer(
+                server.delete(&format!("/api/v1/vaults/{vault_id}/members/{dev_id}")),
+                &owner_jwt,
+            )
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        }
+    }
+    assert_eq!(
+        listed_role(&server, &owner_jwt, vault_id, &dev_email)
+            .await
+            .as_deref(),
+        Some("viewer")
+    );
+}
+
 // ─── Phase 3 step 5: re-keying ────────────────────────────────────────────────
 
 /// Push `n` versions and return their numbers.

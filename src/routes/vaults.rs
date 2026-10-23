@@ -136,6 +136,8 @@ pub async fn create_vault(
         }
     };
 
+    // The vault was created in this transaction and has no members yet, so this
+    // always inserts; `add_member`'s "already a member" answer cannot arise.
     members::add_member(&mut *tx, vault_id, user_id, "owner", &wrap, user_id).await?;
 
     tx.commit().await.map_err(AppError::Database)?;
