@@ -530,6 +530,56 @@ async fn t_i305_json_errors_and_successes_are_untouched() {
     assert_eq!(health.json::<serde_json::Value>()["status"], "ok");
 }
 
+// ─── I-306: a plan limit says so beside FORBIDDEN ──────────────────────────────
+
+/// I-306, SV-4: a plan limit and a permission refusal were both `403
+/// FORBIDDEN`, told apart only by English text. The code stays FORBIDDEN —
+/// every installed CLI maps it to the message, and a new code would print
+/// "unexpected response: HTTP 403" in all of them — and `reason` is added.
+#[tokio::test]
+async fn t_i306_a_plan_limit_refusal_carries_reason_plan_limit() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    for _ in 0..3 {
+        create_vault(&server, &jwt).await;
+    }
+    let refused = bearer(server.post("/api/v1/vaults"), &jwt)
+        .json(&serde_json::json!({
+            "name": format!("v{}", Uuid::new_v4().simple()),
+            "environment": "development",
+            "encrypted_vault_key": "Zm9v",
+        }))
+        .await;
+    refused.assert_status(StatusCode::FORBIDDEN);
+    let body = refused.json::<serde_json::Value>();
+    assert_eq!(body["code"], "FORBIDDEN", "{body}");
+    assert_eq!(body["reason"], "PLAN_LIMIT", "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("allows 3 vaults"),
+        "{body}"
+    );
+}
+
+/// The other 403: no `reason`, so a client can tell "upgrade or clean up"
+/// from "you are not allowed".
+#[tokio::test]
+async fn t_i306_a_permission_refusal_has_no_reason() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let read_only = create_api_token(&server, &jwt, "read", None).await;
+    let refused = bearer(server.post("/api/v1/vaults"), &read_only)
+        .json(&serde_json::json!({
+            "name": format!("v{}", Uuid::new_v4().simple()),
+            "environment": "development",
+            "encrypted_vault_key": "Zm9v",
+        }))
+        .await;
+    refused.assert_status(StatusCode::FORBIDDEN);
+    let body = refused.json::<serde_json::Value>();
+    assert_eq!(body["code"], "FORBIDDEN", "{body}");
+    assert!(body.get("reason").is_none(), "{body}");
+}
+
 // ─── B4 regression: CI/CD API token routes ─────────────────────────────────────
 //
 // routes/tokens.rs was fully implemented but never added to the router, so there
