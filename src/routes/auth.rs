@@ -191,6 +191,22 @@ pub(crate) const SRP_MAX_FAILURES: u64 = 5;
 /// Matches `totp_lockout` so the two behave the same way.
 pub(crate) const SRP_LOCKOUT_SECONDS: u64 = 900;
 
+/// Login starts (`/srp/init`) allowed per address per [`SRP_INIT_WINDOW_SECONDS`].
+///
+/// ⚠️ **Not what stops password guessing — [`SRP_MAX_FAILURES`] is.** Every
+/// guess needs a proof at `/srp/verify`, and five wrong ones lock the address
+/// for 15 minutes. This limit counts *starts*, right or wrong, and at 5 it
+/// refused the sixth good login in a row (I-310, DEC-AU303): a script, a CLI
+/// beside the app, several machines. 30 leaves that room while still bounding
+/// how much one address can make the server compute.
+///
+/// ⓘ Per address, never per IP — see `CacheService`. It was never a defence
+/// against a flood spread across many addresses.
+pub(crate) const SRP_INIT_LIMIT: u64 = 30;
+
+/// The window [`SRP_INIT_LIMIT`] is counted over.
+pub(crate) const SRP_INIT_WINDOW_SECONDS: u64 = 900;
+
 /// Failed TOTP codes before the account is locked out.
 ///
 /// Three rather than SRP's five: a code is read off a screen and retyped rather
@@ -257,14 +273,14 @@ pub async fn srp_init(
     State(state): State<AppState>,
     Json(req): Json<SrpInitRequest>,
 ) -> Result<Json<SrpInitResponse>, AppError> {
-    // Rate limiting (unchanged)
+    // Login starts per address (I-310): guessing is bounded by the lockout in
+    // `srp_verify`, not here.
     let rate_key = format!("rate:srp_init:{}", email_subject(&req.email));
-    let allowed = state.cache.check_rate_limit(&rate_key, 5, 900).await?;
-    if !allowed {
-        return Err(AppError::RateLimited {
-            retry_after_seconds: 900,
-        });
-    }
+    state
+        .cache
+        .rate_limit(&rate_key, SRP_INIT_LIMIT, SRP_INIT_WINDOW_SECONDS)
+        .await?
+        .or_refuse()?;
 
     // Lookup user — constant-time response for unknown emails
     let email_lower = req.email.trim().to_lowercase();
@@ -448,8 +464,8 @@ pub async fn srp_verify(
 
     // The session is deleted only on SUCCESS, and that is deliberate — a
     // mistyped password must not send the user back through `/srp/init`, which
-    // is itself capped at 5 per 15 minutes, or three typos would lock someone
-    // out for a quarter of an hour.
+    // is itself capped (5 per 15 minutes when this was written, 30 since I-310),
+    // or a few typos would lock someone out for a quarter of an hour.
     //
     // Which is why the counter above exists: one `/srp/init` would otherwise buy
     // unlimited guesses for the session's 300-second life, and `srp_verify` has
@@ -644,11 +660,11 @@ pub async fn resend_verification(
         "rate:resend_verify:{}",
         blake3::hash(email.as_bytes()).to_hex()
     );
-    if !state.cache.check_rate_limit(&rate_key, 3, 3600).await? {
-        return Err(AppError::RateLimited {
-            retry_after_seconds: 3600,
-        });
-    }
+    state
+        .cache
+        .rate_limit(&rate_key, 3, 3600)
+        .await?
+        .or_refuse()?;
 
     // From here on every path returns 202. Failures are logged, never surfaced.
     if let Some(user) = users::find_by_email(&state.db, &email).await? {

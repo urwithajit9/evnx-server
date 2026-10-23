@@ -185,11 +185,11 @@ pub async fn reauth_init(
         .map_err(|_| AppError::Validation("client_public is not valid hex".into()))?;
 
     let rate_key = format!("rate:reauth_init:{user_id}");
-    if !state.cache.check_rate_limit(&rate_key, 10, 900).await? {
-        return Err(AppError::RateLimited {
-            retry_after_seconds: 900,
-        });
-    }
+    state
+        .cache
+        .rate_limit(&rate_key, 10, 900)
+        .await?
+        .or_refuse()?;
 
     let user = users::find_by_id(&state.db, user_id)
         .await?
@@ -580,11 +580,11 @@ pub async fn undo_init(
 
     let subject = email_subject(&req.email);
     let rate_key = format!("rate:undo_init:{subject}");
-    if !state.cache.check_rate_limit(&rate_key, 5, 900).await? {
-        return Err(AppError::RateLimited {
-            retry_after_seconds: 900,
-        });
-    }
+    state
+        .cache
+        .rate_limit(&rate_key, 5, 900)
+        .await?
+        .or_refuse()?;
 
     let email_lower = req.email.trim().to_lowercase();
     let snapshot = rotation::live_snapshot_for_email(&state.db, &email_lower).await?;

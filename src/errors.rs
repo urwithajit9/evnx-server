@@ -48,6 +48,11 @@ pub enum AppError {
     /// Reusing `FORBIDDEN` means `ApiError::Forbidden { message }` renders the text
     /// verbatim in every version already installed. A distinct code can be added once
     /// clients understand it, not before.
+    ///
+    /// ⓘ **Told apart by `"reason": "PLAN_LIMIT"` instead** (I-306). A field the
+    /// installed clients ignore, so nothing breaks, while a client that reads it
+    /// can say "upgrade or clean up" rather than "not allowed". Only this variant
+    /// sends it; a permission refusal carries no `reason`.
     #[error("{0}")]
     QuotaExceeded(String),
 
@@ -100,6 +105,17 @@ pub enum AppError {
 /// Log them server-side, return generic messages to users.
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        // I-304: the standard header beside the body's number, read before
+        // `self` is consumed below. The two always carry the same value.
+        let retry_after = match &self {
+            AppError::RateLimited {
+                retry_after_seconds,
+            } => Some(*retry_after_seconds),
+            _ => None,
+        };
+        // I-306: what kind of FORBIDDEN this is, for the clients that read it.
+        let reason = matches!(self, AppError::QuotaExceeded(_)).then_some("PLAN_LIMIT");
+
         // Log internal errors (only in this impl, nowhere else)
         match &self {
             AppError::Database(e) => {
@@ -171,6 +187,16 @@ impl IntoResponse for AppError {
             }
         };
 
-        (status, Json(json!({ "error": message, "code": code }))).into_response()
+        let body = match reason {
+            Some(reason) => json!({ "error": message, "code": code, "reason": reason }),
+            None => json!({ "error": message, "code": code }),
+        };
+        let mut response = (status, Json(body)).into_response();
+        if let Some(seconds) = retry_after {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, seconds.into());
+        }
+        response
     }
 }

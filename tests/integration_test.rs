@@ -306,15 +306,18 @@ async fn logout_blocklists_the_session_via_valkey() {
     );
 }
 
+/// Login starts allowed per address per window (`routes::auth::SRP_INIT_LIMIT`).
+const SRP_INIT_LIMIT: usize = 30;
+
 #[tokio::test]
-async fn srp_init_rate_limit_triggers_after_5_attempts() {
+async fn srp_init_rate_limit_triggers_after_30_attempts() {
     // Exercises INCR + EXPIRE. The key is per-email, so a unique address keeps
     // this test independent of previous runs (the counter lives 900s).
     let server = test_app().await;
     let email = unique_email("ratelimit");
     let body = serde_json::json!({ "email": email, "client_public": "a".repeat(512) });
 
-    for i in 0..5 {
+    for i in 0..SRP_INIT_LIMIT {
         let resp = server.post("/api/v1/auth/srp/init").json(&body).await;
         assert_ne!(
             resp.status_code(),
@@ -329,6 +332,258 @@ async fn srp_init_rate_limit_triggers_after_5_attempts() {
         .json(&body)
         .await
         .assert_status(StatusCode::TOO_MANY_REQUESTS);
+}
+
+// ─── I-304: a 429 says how long is really left ─────────────────────────────────
+
+/// A direct connection to the test Valkey, for setting a counter's state.
+async fn valkey() -> redis::aio::ConnectionManager {
+    let config = test_config().await;
+    let client = redis::Client::open(config.valkey_url.as_str()).unwrap();
+    redis::aio::ConnectionManager::new(client).await.unwrap()
+}
+
+/// `rate:srp_init:{…}` for `email`, as `routes::auth::email_subject` builds it.
+fn srp_init_key(email: &str) -> String {
+    format!(
+        "rate:srp_init:{}",
+        blake3::hash(email.trim().to_lowercase().as_bytes()).to_hex()
+    )
+}
+
+/// I-304, SV-4: the message hard-coded the whole window ("900 seconds") and no
+/// `Retry-After` was sent. The live review measured 648-714 s actually left.
+#[tokio::test]
+async fn t_i304_a_429_carries_the_time_really_left_and_a_retry_after_header() {
+    use redis::AsyncCommands;
+    let server = test_app().await;
+    let email = unique_email("retryafter");
+    let mut v = valkey().await;
+    // Every attempt already spent, in a window with two minutes left.
+    let _: () = v
+        .set_ex(srp_init_key(&email), SRP_INIT_LIMIT, 120)
+        .await
+        .unwrap();
+
+    let resp = server
+        .post("/api/v1/auth/srp/init")
+        .json(&serde_json::json!({ "email": email, "client_public": "a".repeat(512) }))
+        .await;
+    resp.assert_status(StatusCode::TOO_MANY_REQUESTS);
+
+    let header: u64 = resp
+        .headers()
+        .get("retry-after")
+        .expect("no Retry-After header on a 429")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=120).contains(&header), "Retry-After: {header}");
+    let body = resp.json::<serde_json::Value>();
+    assert_eq!(body["code"], "RATE_LIMITED");
+    assert_eq!(
+        body["error"],
+        format!("Too many requests. Try again in {header} seconds."),
+        "the body and the header must give the same number"
+    );
+}
+
+/// The counter is created by INCR and given its expiry by a second command.
+/// A counter left without one — the server stopped between the two — would
+/// lock the address out for good. The refusal gives it the window again.
+#[tokio::test]
+async fn t_i304_a_counter_left_without_an_expiry_is_given_one() {
+    use redis::AsyncCommands;
+    let server = test_app().await;
+    let email = unique_email("noexpiry");
+    let key = srp_init_key(&email);
+    let mut v = valkey().await;
+    let _: () = v.set(&key, SRP_INIT_LIMIT).await.unwrap();
+    let before: i64 = v.ttl(&key).await.unwrap();
+    assert_eq!(before, -1, "set up a counter with no expiry");
+
+    let resp = server
+        .post("/api/v1/auth/srp/init")
+        .json(&serde_json::json!({ "email": email, "client_public": "a".repeat(512) }))
+        .await;
+    resp.assert_status(StatusCode::TOO_MANY_REQUESTS);
+
+    let after: i64 = v.ttl(&key).await.unwrap();
+    assert!((1..=900).contains(&after), "TTL after the refusal: {after}");
+    assert_eq!(
+        resp.headers().get("retry-after").unwrap().to_str().unwrap(),
+        "900"
+    );
+}
+
+// ─── I-305: every error body is {error, code} ──────────────────────────────────
+
+/// The status is the framework's; the body is the envelope every client reads.
+fn assert_envelope(resp: &axum_test::TestResponse, status: StatusCode, code: &str) -> String {
+    resp.assert_status(status);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    assert!(ct.starts_with("application/json"), "content-type {ct:?}");
+    let body = resp.json::<serde_json::Value>();
+    assert_eq!(body["code"], code, "{body}");
+    let error = body["error"].as_str().unwrap_or_default().to_string();
+    assert!(!error.is_empty(), "{body}");
+    error
+}
+
+/// I-305, SV-4: a body the JSON extractor rejects came back as `text/plain`,
+/// which the CLI showed as "unexpected response: HTTP 422".
+#[tokio::test]
+async fn t_i305_a_malformed_json_body_gets_the_envelope() {
+    let server = test_app().await;
+    let resp = server
+        .post("/api/v1/auth/srp/init")
+        .json(&serde_json::json!({ "email": 1 }))
+        .await;
+    let error = assert_envelope(&resp, StatusCode::UNPROCESSABLE_ENTITY, "VALIDATION_ERROR");
+    assert!(error.contains("invalid type"), "{error}");
+}
+
+#[tokio::test]
+async fn t_i305_a_body_that_is_not_json_gets_the_envelope() {
+    let server = test_app().await;
+    let resp = server.post("/api/v1/auth/srp/init").text("x").await;
+    assert_envelope(
+        &resp,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "VALIDATION_ERROR",
+    );
+}
+
+/// Unknown routes answered 404 with an empty body.
+#[tokio::test]
+async fn t_i305_an_unknown_route_gets_the_envelope() {
+    let server = test_app().await;
+    let resp = server.get("/api/v1/no-such-route").await;
+    assert_envelope(&resp, StatusCode::NOT_FOUND, "NOT_FOUND");
+    // Still behind the outer layer: the rewrite keeps the security headers.
+    assert_eq!(
+        resp.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+}
+
+/// 405 had an empty body too. Its `Allow` header has to survive the rewrite.
+#[tokio::test]
+async fn t_i305_a_wrong_method_gets_the_envelope_and_keeps_allow() {
+    let server = test_app().await;
+    let resp = server.delete("/health").await;
+    assert_envelope(&resp, StatusCode::METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED");
+    assert!(
+        resp.headers().get("allow").is_some(),
+        "Allow header dropped"
+    );
+}
+
+/// ⚠️ The emailed verification link answers a browser with an HTML page —
+/// on failure too (400). That is the one non-JSON error on purpose, and it
+/// must stay HTML.
+#[tokio::test]
+async fn t_i305_the_verification_page_stays_html() {
+    let server = test_app().await;
+    let resp = server
+        .get("/api/v1/auth/verify-email")
+        .add_query_param("token", "not-a-real-token")
+        .await;
+    resp.assert_status(StatusCode::BAD_REQUEST);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(ct.starts_with("text/html"), "content-type {ct:?}");
+    assert!(resp.text().contains("Link expired or already used"));
+}
+
+/// The body limit's 413 is a framework rejection too.
+#[tokio::test]
+async fn t_i305_an_oversized_body_gets_the_envelope() {
+    let server = test_app().await;
+    let limit = test_config().await.max_request_size_kb * 1024;
+    let big = "a".repeat(limit as usize + 1024);
+    let resp = server
+        .post("/api/v1/auth/srp/init")
+        .json(&serde_json::json!({ "email": "x@example.test", "client_public": big }))
+        .await;
+    assert_envelope(&resp, StatusCode::PAYLOAD_TOO_LARGE, "PAYLOAD_TOO_LARGE");
+}
+
+/// JSON errors and successes pass through as they were.
+#[tokio::test]
+async fn t_i305_json_errors_and_successes_are_untouched() {
+    let server = test_app().await;
+    let payload = register_payload(&unique_email("untouched"));
+    server.post("/api/v1/auth/register").json(&payload).await;
+    let dup = server.post("/api/v1/auth/register").json(&payload).await;
+    dup.assert_status(StatusCode::CONFLICT);
+    assert_eq!(
+        dup.json::<serde_json::Value>(),
+        serde_json::json!({ "error": "Email already registered", "code": "CONFLICT" })
+    );
+
+    let health = server.get("/health").await;
+    health.assert_status_ok();
+    assert_eq!(health.json::<serde_json::Value>()["status"], "ok");
+}
+
+// ─── I-306: a plan limit says so beside FORBIDDEN ──────────────────────────────
+
+/// I-306, SV-4: a plan limit and a permission refusal were both `403
+/// FORBIDDEN`, told apart only by English text. The code stays FORBIDDEN —
+/// every installed CLI maps it to the message, and a new code would print
+/// "unexpected response: HTTP 403" in all of them — and `reason` is added.
+#[tokio::test]
+async fn t_i306_a_plan_limit_refusal_carries_reason_plan_limit() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    for _ in 0..3 {
+        create_vault(&server, &jwt).await;
+    }
+    let refused = bearer(server.post("/api/v1/vaults"), &jwt)
+        .json(&serde_json::json!({
+            "name": format!("v{}", Uuid::new_v4().simple()),
+            "environment": "development",
+            "encrypted_vault_key": "Zm9v",
+        }))
+        .await;
+    refused.assert_status(StatusCode::FORBIDDEN);
+    let body = refused.json::<serde_json::Value>();
+    assert_eq!(body["code"], "FORBIDDEN", "{body}");
+    assert_eq!(body["reason"], "PLAN_LIMIT", "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("allows 3 vaults"),
+        "{body}"
+    );
+}
+
+/// The other 403: no `reason`, so a client can tell "upgrade or clean up"
+/// from "you are not allowed".
+#[tokio::test]
+async fn t_i306_a_permission_refusal_has_no_reason() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let read_only = create_api_token(&server, &jwt, "read", None).await;
+    let refused = bearer(server.post("/api/v1/vaults"), &read_only)
+        .json(&serde_json::json!({
+            "name": format!("v{}", Uuid::new_v4().simple()),
+            "environment": "development",
+            "encrypted_vault_key": "Zm9v",
+        }))
+        .await;
+    refused.assert_status(StatusCode::FORBIDDEN);
+    let body = refused.json::<serde_json::Value>();
+    assert_eq!(body["code"], "FORBIDDEN", "{body}");
+    assert!(body.get("reason").is_none(), "{body}");
 }
 
 // ─── B4 regression: CI/CD API token routes ─────────────────────────────────────
@@ -1063,6 +1318,20 @@ async fn full_srp_login_issues_tokens_without_totp() {
     bearer(server.get("/api/v1/auth/me"), access)
         .await
         .assert_status_ok();
+}
+
+/// I-310, DEC-AU303: every login *start* counted toward 5 per 15 minutes, so
+/// the sixth good login in a row was refused 429. Wrong passwords are bounded
+/// by `srp_lockout` (5, then 15 minutes) — that is what stops guessing — so
+/// the start limit is 30 now.
+#[tokio::test]
+async fn t_i310_six_successful_logins_in_a_row_are_not_refused() {
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+    for _ in 0..6 {
+        // `srp_login` asserts 200 on both steps and checks the server's proof.
+        srp_login(&server, &account).await;
+    }
 }
 
 #[tokio::test]
