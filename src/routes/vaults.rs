@@ -17,8 +17,14 @@ use crate::{
 
 #[derive(Deserialize, Validate)]
 pub struct CreateVaultRequest {
-    #[validate(length(min = 1, max = 64, message = "name must be 1–64 chars"))]
-    #[validate(regex(path = "NAME_RE", message = "name: only alphanumeric and hyphens"))]
+    // ⚠️ No field name in these messages: the validator's report already puts
+    // `name: ` in front, and "name: name: only alphanumeric …" was the result
+    // (I-315). "Alphanumeric" was wrong too — `M` is alphanumeric.
+    #[validate(length(min = 1, max = 64, message = "1–64 characters"))]
+    #[validate(regex(
+        path = "NAME_RE",
+        message = "lower-case letters, digits and hyphens only"
+    ))]
     pub name: String,
 
     #[validate(length(min = 1, max = 32))]

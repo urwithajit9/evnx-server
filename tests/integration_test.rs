@@ -652,6 +652,43 @@ async fn create_vault_accepts_a_master_key_wrap_with_no_ephemeral() {
     resp.assert_status(StatusCode::CREATED);
 }
 
+// ─── I-315: a vault name's rule, stated once (DEC-VL8) ─────────────────────────
+//
+// Both messages repeated the field name and the validator adds it again, so
+// `MyApp` came back as "name: name: only alphanumeric and hyphens" — doubled,
+// and wrong, since `M` is alphanumeric. The rule is unchanged: 1–64 characters,
+// lower-case letters, digits and hyphens.
+
+/// The 422 message `POST /vaults` gives for `name`.
+async fn vault_name_refusal(name: &str) -> String {
+    let server = test_app().await;
+    let (_user_id, token) = verified_user(&server).await;
+    let resp = bearer(server.post("/api/v1/vaults"), &token)
+        .json(&serde_json::json!({
+            "name": name,
+            "environment": "development",
+            "encrypted_vault_key": "Zm9v",
+        }))
+        .await;
+    assert_envelope(&resp, StatusCode::UNPROCESSABLE_ENTITY, "VALIDATION_ERROR")
+}
+
+#[tokio::test]
+async fn t_i315_an_upper_case_name_is_refused_with_the_rule_once() {
+    assert_eq!(
+        vault_name_refusal("MyApp").await,
+        "name: lower-case letters, digits and hyphens only"
+    );
+}
+
+#[tokio::test]
+async fn t_i315_a_long_name_says_how_long() {
+    assert_eq!(
+        vault_name_refusal(&"a".repeat(65)).await,
+        "name: 1–64 characters"
+    );
+}
+
 /// Mint an API token. `vault_id: None` means unscoped.
 async fn create_api_token(
     server: &TestServer,
