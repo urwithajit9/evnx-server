@@ -17,8 +17,14 @@ use crate::{
 
 #[derive(Deserialize, Validate)]
 pub struct CreateVaultRequest {
-    #[validate(length(min = 1, max = 64, message = "name must be 1–64 chars"))]
-    #[validate(regex(path = "NAME_RE", message = "name: only alphanumeric and hyphens"))]
+    // ⚠️ No field name in these messages: the validator's report already puts
+    // `name: ` in front, and "name: name: only alphanumeric …" was the result
+    // (I-315). "Alphanumeric" was wrong too — `M` is alphanumeric.
+    #[validate(length(min = 1, max = 64, message = "1–64 characters"))]
+    #[validate(regex(
+        path = "NAME_RE",
+        message = "lower-case letters, digits and hyphens only"
+    ))]
     pub name: String,
 
     #[validate(length(min = 1, max = 32))]
@@ -136,6 +142,8 @@ pub async fn create_vault(
         }
     };
 
+    // The vault was created in this transaction and has no members yet, so this
+    // always inserts; `add_member`'s "already a member" answer cannot arise.
     members::add_member(&mut *tx, vault_id, user_id, "owner", &wrap, user_id).await?;
 
     tx.commit().await.map_err(AppError::Database)?;

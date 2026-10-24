@@ -75,6 +75,15 @@ impl MemberKeyWrap {
 
 /// Grant a user access to a vault by storing their wrapped vault key.
 ///
+/// Returns `false`, and writes nothing, when they are already a member.
+///
+/// ⚠️ Never an upsert (I-313, I-314, DEC-VL3). It was one, and sharing with a
+/// member replaced their role and their key: the owner sharing with their own
+/// address demoted themselves and could no longer delete the vault, and an admin
+/// could rewrite the owner as a viewer and then remove them. A role changes
+/// through [`set_role`] and a key through [`set_wrap`] in a re-key, each behind
+/// its own guard.
+///
 /// Generic over the executor so vault creation can insert the owner's row in the
 /// same transaction as the vault itself.
 pub async fn add_member<'e, E>(
@@ -84,25 +93,19 @@ pub async fn add_member<'e, E>(
     role: &str,
     wrap: &MemberKeyWrap,
     granted_by: Uuid,
-) -> Result<(), sqlx::Error>
+) -> Result<bool, sqlx::Error>
 where
     E: sqlx::PgExecutor<'e>,
 {
     let (encrypted_vault_key, eph_pub_key, mlkem_ciphertext) = wrap.columns();
 
-    sqlx::query!(
+    let r = sqlx::query!(
         r#"
         INSERT INTO vault_members
             (vault_id, user_id, role, encrypted_vault_key, eph_pub_key,
              mlkem_ciphertext, granted_by)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (vault_id, user_id) DO UPDATE
-            SET role = EXCLUDED.role,
-                encrypted_vault_key = EXCLUDED.encrypted_vault_key,
-                eph_pub_key = EXCLUDED.eph_pub_key,
-                mlkem_ciphertext = EXCLUDED.mlkem_ciphertext,
-                granted_by = EXCLUDED.granted_by,
-                granted_at = NOW()
+        ON CONFLICT (vault_id, user_id) DO NOTHING
         "#,
         vault_id,
         user_id,
@@ -114,7 +117,7 @@ where
     )
     .execute(executor)
     .await?;
-    Ok(())
+    Ok(r.rows_affected() > 0)
 }
 
 pub async fn get_wrapped_key(

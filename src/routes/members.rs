@@ -93,7 +93,7 @@ pub async fn add_member(
         )));
     }
 
-    members::add_member(
+    let added = members::add_member(
         &state.db,
         vault_id,
         target.id,
@@ -108,6 +108,36 @@ pub async fn add_member(
         requester_id,
     )
     .await?;
+
+    // ⚠️ Sharing never rewrites a membership (I-313, I-314, DEC-VL3).
+    //
+    // The outrank check above is about the role being *granted*, never the role
+    // the target already holds — so when this was an upsert, an admin could
+    // "share" with the owner and turn them into a viewer, the step that let them
+    // remove the owner next. `set_member_role` and `remove_member` check the
+    // target's current rank; this route never had to, because it now never
+    // touches an existing row. 409, like the other refusals here: nothing about
+    // the request is malformed, the vault's state rules it out.
+    if !added {
+        let message = match vaults::find_member_role(&state.db, vault_id, target.id)
+            .await?
+            .as_deref()
+        {
+            Some("owner") => format!(
+                "{} owns this vault. Sharing cannot change the owner's role or key.",
+                target.email
+            ),
+            Some(role) => format!(
+                "{} is already a member of this vault, as {role}. Sharing again does \
+                 not change a role: use `evnx vault role`, or the vault's member \
+                 list on app.evnx.dev.",
+                target.email
+            ),
+            // Removed between the insert and this lookup.
+            None => format!("{} is already a member of this vault.", target.email),
+        };
+        return Err(AppError::Conflict(message));
+    }
 
     crate::services::audit::record_membership_event(
         &state.db,
