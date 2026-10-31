@@ -142,7 +142,9 @@ log "dump ok: $FILE (${SIZE} bytes)"
 
 # Prove it is restorable *content*, not just a valid gzip: the schema must be in
 # there. Catches a dump taken against an empty or wrong database.
-zcat "$OUT" | grep -q "CREATE TABLE public.vault_members" \
+# Not `grep -q`: it quits on the first match, zcat dies of SIGPIPE, and pipefail
+# then fails a dump that passed. That rejected every backup from 2026-10-05 (T26).
+zcat "$OUT" | grep "CREATE TABLE public.vault_members" >/dev/null \
   || die "dump does not contain vault_members — wrong database?"
 log "content check ok: vault_members present"
 

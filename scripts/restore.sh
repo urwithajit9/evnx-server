@@ -66,7 +66,8 @@ else
 fi
 
 gzip -t "$DUMP" || die "$DUMP fails its gzip integrity check"
-zcat "$DUMP" | grep -q "CREATE TABLE public.vault_members" || die "no vault_members in dump"
+# Not `grep -q`: zcat would die of SIGPIPE under pipefail and fail a good dump (T26).
+zcat "$DUMP" | grep "CREATE TABLE public.vault_members" >/dev/null || die "no vault_members in dump"
 log "dump verified"
 
 counts() {
