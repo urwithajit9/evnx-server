@@ -168,6 +168,13 @@ pub async fn get_latest_version(
 
 // ─── Download Blob ─────────────────────────────────────────────────────────────
 
+#[derive(Deserialize, Default)]
+pub struct DownloadQuery {
+    /// Optional; `"rekey"` marks the pull as part of a key rotation.
+    #[serde(default)]
+    pub purpose: Option<String>,
+}
+
 pub async fn download_blob(
     State(state): State<AppState>,
     client: ClientContext,
@@ -176,10 +183,25 @@ pub async fn download_blob(
     // and audit trail, not confidentiality.
     access: VaultAccess<AtLeastViewer>,
     Path((_, version_num)): Path<(Uuid, i32)>,
+    axum::extract::Query(q): axum::extract::Query<DownloadQuery>,
 ) -> Result<Response, AppError> {
     let VaultAccess {
-        vault_id, user_id, ..
+        vault_id,
+        user_id,
+        role,
+        ..
     } = access;
+
+    // RM-57: a rekey read is marked in the audit trail. Only roles that can
+    // rekey (admin+) are believed; anyone else's `purpose` is ignored and the
+    // pull is recorded exactly as before. Never a reason to refuse.
+    let rekey_read =
+        q.purpose.as_deref() == Some("rekey") && role >= crate::middleware::vault_role::Role::Admin;
+    let pull_metadata = if rekey_read {
+        serde_json::json!({ "version": version_num, "purpose": "rekey" })
+    } else {
+        serde_json::json!({ "version": version_num })
+    };
 
     let version = versions::get_by_num(&state.db, vault_id, version_num)
         .await?
@@ -209,7 +231,7 @@ pub async fn download_blob(
                     vault_id: Some(vault_id),
                     user_id: Some(user_id),
                     event_type: "pull".into(),
-                    metadata: Some(serde_json::json!({ "version": version_num })),
+                    metadata: Some(pull_metadata),
                     ip_hash: client.ip_hash.clone(),
                     user_agent_hash: client.user_agent_hash.clone(),
                 },

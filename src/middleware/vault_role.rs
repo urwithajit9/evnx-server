@@ -224,7 +224,9 @@ impl<M: MinRole> FromRequestParts<AppState> for VaultAccess<M> {
         // 403, not 404: they are a member, so the vault's existence is not a
         // secret from them. Only the action is refused.
         if role < M::MIN {
-            return Err(AppError::Forbidden);
+            return Err(AppError::Refused(crate::errors::Refusal::RoleTooLow {
+                required: M::MIN.as_str(),
+            }));
         }
 
         Ok(Self {
