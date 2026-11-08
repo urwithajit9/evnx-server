@@ -94,8 +94,9 @@ pub struct CreateOrgRequest {
 /// money.
 ///
 /// # Errors
-/// * `409` — the slug is taken, or the account already owns its plan's
+/// * `403` (`reason: "PLAN_LIMIT"`) — the account already owns its plan's
 ///   maximum number of organisations (`QUOTA_<PLAN>_ORGS`, free: 5).
+/// * `409` — the slug is taken.
 /// * `422` — the name or slug is malformed.
 pub async fn create_org(
     State(state): State<AppState>,

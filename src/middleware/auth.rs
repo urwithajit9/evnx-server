@@ -281,13 +281,13 @@ pub async fn require_verified(
 
     if let Some(ctx) = api_token {
         if !ctx.can_write && is_write_method(req.method()) {
-            return Err(AppError::Forbidden);
+            return Err(AppError::Refused(crate::errors::Refusal::TokenReadOnly));
         }
 
         if let Some(scoped_vault) = ctx.vault_id {
             match vault_id_from_path(&mut req).await {
                 Some(requested) if requested == scoped_vault => {}
-                _ => return Err(AppError::Forbidden),
+                _ => return Err(AppError::Refused(crate::errors::Refusal::TokenScope)),
             }
         }
 

@@ -566,10 +566,11 @@ async fn t_i306_a_plan_limit_refusal_carries_reason_plan_limit() {
     );
 }
 
-/// The other 403: no `reason`, so a client can tell "upgrade or clean up"
-/// from "you are not allowed".
+/// The other 403: never `PLAN_LIMIT`, so a client can tell "upgrade or clean
+/// up" from "you are not allowed". Since RM-56 a permission refusal may carry
+/// its own reason (here `TOKEN_READ_ONLY`), but not that one.
 #[tokio::test]
-async fn t_i306_a_permission_refusal_has_no_reason() {
+async fn t_i306_a_permission_refusal_is_not_a_plan_limit() {
     let server = test_app().await;
     let (_uid, jwt) = verified_user(&server).await;
     let read_only = create_api_token(&server, &jwt, "read", None).await;
@@ -583,7 +584,8 @@ async fn t_i306_a_permission_refusal_has_no_reason() {
     refused.assert_status(StatusCode::FORBIDDEN);
     let body = refused.json::<serde_json::Value>();
     assert_eq!(body["code"], "FORBIDDEN", "{body}");
-    assert!(body.get("reason").is_none(), "{body}");
+    assert_ne!(body["reason"], "PLAN_LIMIT", "{body}");
+    assert_eq!(body["reason"], "TOKEN_READ_ONLY", "{body}");
 }
 
 // ─── B4 regression: CI/CD API token routes ─────────────────────────────────────
@@ -8014,14 +8016,14 @@ async fn the_free_plan_still_allows_exactly_five_organisations() {
         .await;
     assert_eq!(
         sixth.status_code(),
-        StatusCode::CONFLICT,
+        StatusCode::FORBIDDEN,
         "the sixth must be refused: {}",
         sixth.text()
     );
-    // ⚠️ 409, not 403. Every other quota answers 403, and this one has answered
-    // 409 since organisations shipped — the same code `POST /orgs` uses for a
-    // taken slug. Making a constant configurable must not quietly change a
-    // public endpoint's status code; that is its own decision.
+    // RM-58: 403 + PLAN_LIMIT like every other plan limit (was 409).
+    let body: serde_json::Value = sixth.json();
+    assert_eq!(body["code"], "FORBIDDEN");
+    assert_eq!(body["reason"], "PLAN_LIMIT");
     assert!(
         sixth.text().contains("already owns"),
         "the refusal must say why, not just conflict: {}",
@@ -8996,4 +8998,126 @@ async fn sv2_token_name_must_be_1_to_64_characters() {
         .json(&serde_json::json!({ "name": "é".repeat(64), "scope": "read" }))
         .await
         .assert_status(StatusCode::CREATED);
+}
+
+// ─── RM-56 / RM-57: 403 reasons, removed_email, rekey reads ───────────────────
+
+#[tokio::test]
+async fn a_viewer_push_is_403_role_too_low_with_required_role() {
+    let server = test_app().await;
+    let (_o, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (_v, viewer_jwt) = member_at(&server, &owner_jwt, vault_id, "viewer").await;
+
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/versions")),
+        &viewer_jwt,
+    )
+    .json(&serde_json::json!({}))
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["code"], "FORBIDDEN");
+    assert_eq!(body["reason"], "ROLE_TOO_LOW");
+    assert_eq!(body["required_role"], "developer");
+}
+
+#[tokio::test]
+async fn a_scoped_token_on_another_vault_is_403_token_scope() {
+    let server = test_app().await;
+    let (_u, jwt) = verified_user(&server).await;
+    let a = create_vault(&server, &jwt).await;
+    let b = create_vault(&server, &jwt).await;
+    let raw = create_api_token(&server, &jwt, "read", Some(a)).await;
+
+    let resp = bearer(server.get(&format!("/api/v1/vaults/{b}/versions")), &raw).await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["code"], "FORBIDDEN");
+    assert_eq!(body["reason"], "TOKEN_SCOPE");
+}
+
+#[tokio::test]
+async fn a_read_only_token_write_is_403_token_read_only() {
+    let server = test_app().await;
+    let (_u, jwt) = verified_user(&server).await;
+    let raw = create_api_token(&server, &jwt, "read", None).await;
+
+    let resp = bearer(server.post("/api/v1/vaults"), &raw)
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["code"], "FORBIDDEN");
+    assert_eq!(body["reason"], "TOKEN_READ_ONLY");
+}
+
+#[tokio::test]
+async fn audit_resolves_the_removed_member_email_and_rekey_reads_are_marked() {
+    let server = test_app().await;
+    let (owner_id, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (leaver_id, _lj) = member_at(&server, &owner_jwt, vault_id, "developer").await;
+    let (viewer_id, viewer_jwt) = member_at(&server, &owner_jwt, vault_id, "viewer").await;
+    push_versions(&server, &owner_jwt, vault_id, 1).await;
+
+    // Admin+ with ?purpose=rekey is recorded; a viewer's is not.
+    let url = format!("/api/v1/vaults/{vault_id}/versions/1/blob");
+    bearer(
+        server.get(&url).add_query_param("purpose", "rekey"),
+        &owner_jwt,
+    )
+    .await
+    .assert_status_ok();
+    bearer(
+        server.get(&url).add_query_param("purpose", "rekey"),
+        &viewer_jwt,
+    )
+    .await
+    .assert_status_ok();
+
+    let (blob_key, blob_hash, size) = stage(&server, &owner_jwt, vault_id, 1).await;
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &owner_jwt,
+    )
+    .json(&serde_json::json!({
+        "versions": [{"version_num": 1, "blob_key": blob_key,
+                      "blob_hash": blob_hash, "blob_size_bytes": size}],
+        "members": [own_wrap_for(owner_id), wrap_for(viewer_id)],
+        "remove_user_id": leaver_id,
+    }))
+    .await
+    .assert_status_ok();
+
+    let events = audit_events(vault_id).await;
+    let pulls: Vec<_> = events.iter().filter(|(t, _)| t == "pull").collect();
+    assert_eq!(pulls.len(), 2);
+    assert_eq!(
+        pulls
+            .iter()
+            .filter(|(_, m)| m["purpose"] == "rekey")
+            .count(),
+        1,
+        "only the admin's rekey read is marked: {pulls:?}"
+    );
+
+    let audit: serde_json::Value = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/audit")),
+        &owner_jwt,
+    )
+    .await
+    .json();
+    let rekey = audit["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["event_type"] == "vault_rekey")
+        .expect("rekey event");
+    assert!(rekey["metadata"]["removed_email"]
+        .as_str()
+        .is_some_and(|e| e.contains('@')));
+    // Stored row is untouched.
+    let (_, stored) = events.iter().find(|(t, _)| t == "vault_rekey").unwrap();
+    assert!(stored.get("removed_email").is_none());
 }

@@ -22,6 +22,17 @@ use serde_json::json;
 ///     Ok(Json(MyResponse::from(user)))
 /// }
 /// ```
+/// Why a permission refusal happened, for [`AppError::Refused`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The caller's role is below the minimum. `required` is the lowercase role name.
+    RoleTooLow { required: &'static str },
+    /// An API token scoped to a different vault.
+    TokenScope,
+    /// A read-only API token attempting a write.
+    TokenReadOnly,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     // ─── Auth errors ───────────────────────────────────────────────────────────
@@ -36,6 +47,12 @@ pub enum AppError {
 
     #[error("Insufficient permissions")]
     Forbidden,
+
+    /// A 403 that says *why* (RM-56). Same status and `code: "FORBIDDEN"` as
+    /// [`AppError::Forbidden`]; the body adds `reason` (and `required_role` for
+    /// `ROLE_TOO_LOW`) so a client can build a hint. Non-members still get 404.
+    #[error("Insufficient permissions")]
+    Refused(Refusal),
 
     /// A plan limit was reached.
     ///
@@ -52,7 +69,8 @@ pub enum AppError {
     /// ⓘ **Told apart by `"reason": "PLAN_LIMIT"` instead** (I-306). A field the
     /// installed clients ignore, so nothing breaks, while a client that reads it
     /// can say "upgrade or clean up" rather than "not allowed". Only this variant
-    /// sends it; a permission refusal carries no `reason`.
+    /// sends `PLAN_LIMIT`; permission refusals either carry no `reason`
+    /// ([`AppError::Forbidden`]) or one of the [`Refusal`] reasons.
     #[error("{0}")]
     QuotaExceeded(String),
 
@@ -114,7 +132,17 @@ impl IntoResponse for AppError {
             _ => None,
         };
         // I-306: what kind of FORBIDDEN this is, for the clients that read it.
-        let reason = matches!(self, AppError::QuotaExceeded(_)).then_some("PLAN_LIMIT");
+        let mut required_role = None;
+        let reason = match &self {
+            AppError::QuotaExceeded(_) => Some("PLAN_LIMIT"),
+            AppError::Refused(Refusal::RoleTooLow { required }) => {
+                required_role = Some(*required);
+                Some("ROLE_TOO_LOW")
+            }
+            AppError::Refused(Refusal::TokenScope) => Some("TOKEN_SCOPE"),
+            AppError::Refused(Refusal::TokenReadOnly) => Some("TOKEN_READ_ONLY"),
+            _ => None,
+        };
 
         // Log internal errors (only in this impl, nowhere else)
         match &self {
@@ -149,7 +177,7 @@ impl IntoResponse for AppError {
                 "Account temporarily locked".to_string(),
             ),
             AppError::QuotaExceeded(ref msg) => (StatusCode::FORBIDDEN, "FORBIDDEN", msg.clone()),
-            AppError::Forbidden => (
+            AppError::Refused(_) | AppError::Forbidden => (
                 StatusCode::FORBIDDEN,
                 "FORBIDDEN",
                 "Insufficient permissions".to_string(),
@@ -187,9 +215,12 @@ impl IntoResponse for AppError {
             }
         };
 
-        let body = match reason {
-            Some(reason) => json!({ "error": message, "code": code, "reason": reason }),
-            None => json!({ "error": message, "code": code }),
+        let body = match (reason, required_role) {
+            (Some(reason), Some(role)) => json!({
+                "error": message, "code": code, "reason": reason, "required_role": role
+            }),
+            (Some(reason), None) => json!({ "error": message, "code": code, "reason": reason }),
+            _ => json!({ "error": message, "code": code }),
         };
         let mut response = (status, Json(body)).into_response();
         if let Some(seconds) = retry_after {
@@ -198,5 +229,37 @@ impl IntoResponse for AppError {
                 .insert(axum::http::header::RETRY_AFTER, seconds.into());
         }
         response
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    async fn body_of(e: AppError) -> (StatusCode, serde_json::Value) {
+        let resp = e.into_response();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn refusals_render_403_forbidden_with_a_reason() {
+        let (s, b) = body_of(AppError::Refused(Refusal::RoleTooLow { required: "admin" })).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(b["code"], "FORBIDDEN");
+        assert_eq!(b["reason"], "ROLE_TOO_LOW");
+        assert_eq!(b["required_role"], "admin");
+        assert_eq!(b["error"], "Insufficient permissions");
+
+        let (_, b) = body_of(AppError::Refused(Refusal::TokenScope)).await;
+        assert_eq!(b["reason"], "TOKEN_SCOPE");
+        assert!(b.get("required_role").is_none());
+        let (_, b) = body_of(AppError::Refused(Refusal::TokenReadOnly)).await;
+        assert_eq!(b["reason"], "TOKEN_READ_ONLY");
+
+        let (s, b) = body_of(AppError::Forbidden).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert!(b.get("reason").is_none());
     }
 }

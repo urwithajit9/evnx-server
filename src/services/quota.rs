@@ -267,14 +267,9 @@ pub async fn plan_for(db: &sqlx::PgPool, user_id: uuid::Uuid) -> Result<Plan, Ap
 /// Refuse when the account already **owns** its plan's maximum number of
 /// organisations.
 ///
-/// ⚠️ **Returns `Conflict` (409), not `QuotaExceeded` (403), and that is
-/// deliberate.** Every other limit here answers 403. This one has answered 409
-/// since organisations shipped, the handler's own docs say so, and `POST /orgs`
-/// also answers 409 for a taken slug — so a client that distinguishes them does
-/// it by message, not by code. Making it consistent would be a nicer API and a
-/// silent contract change to a public endpoint, which is not what making a
-/// constant configurable is for. ⓘ Worth deciding on purpose later; it is
-/// tracked rather than done here.
+/// Answers `QuotaExceeded` (403, `reason: "PLAN_LIMIT"`) like every other plan
+/// limit (RM-58). ⚠️ It answered 409 before; `POST /orgs` still answers 409 for
+/// a taken slug.
 ///
 /// ⓘ Counts **owned, live** organisations: `owner_id` matching and
 /// `deleted_at IS NULL`. Membership and seats are not ownership and cost
@@ -300,7 +295,7 @@ pub async fn check_org_limit(
     .await?;
 
     if owned >= i64::from(limit) {
-        return Err(AppError::Conflict(format!(
+        return Err(AppError::QuotaExceeded(format!(
             "this account already owns {limit} organisations, which is the limit for the \
              {} plan. Delete one you no longer need.",
             plan.as_str()
