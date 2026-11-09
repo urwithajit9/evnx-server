@@ -109,6 +109,22 @@ impl Role {
     /// it out through `add_member` would allow two owners, and "exactly one
     /// owner" is what `remove_member` relies on to refuse removing the last one.
     pub const ASSIGNABLE: [Role; 3] = [Role::Viewer, Role::Developer, Role::Admin];
+
+    /// Every role, least to most privileged.
+    pub const ALL: [Role; 4] = [Role::Viewer, Role::Developer, Role::Admin, Role::Owner];
+
+    /// The stored names of every role that is at least `min`.
+    ///
+    /// For queries that must apply a [`MinRole`] in SQL (`vm.role = ANY($n)`)
+    /// rather than per request, such as the cross-vault audit feed. Derived from
+    /// the same ladder as [`VaultAccess`], so the two cannot disagree.
+    pub fn names_at_least(min: Role) -> Vec<String> {
+        Self::ALL
+            .into_iter()
+            .filter(|r| *r >= min)
+            .map(|r| r.as_str().to_owned())
+            .collect()
+    }
 }
 
 /// The minimum rank a route requires. Implemented by the marker types below.
@@ -138,6 +154,12 @@ pub struct AtLeastAdmin;
 impl MinRole for AtLeastAdmin {
     const MIN: Role = Role::Admin;
 }
+
+/// Who may read a vault's audit trail, per vault and in the cross-vault feed.
+///
+/// One alias so `GET /vaults/:id/audit` and `GET /audit` cannot drift apart: the
+/// feed shows a vault's events exactly when this requirement is met there.
+pub type AuditReader = AtLeastViewer;
 
 /// The owner alone. Deleting a vault, and removing a member.
 pub struct OwnerOnly;

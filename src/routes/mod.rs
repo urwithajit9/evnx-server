@@ -9,6 +9,7 @@ use axum::{
 };
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
+pub mod audit;
 pub mod auth;
 pub mod billing;
 pub mod devices;
@@ -308,6 +309,19 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/billing/webhook", post(billing::webhook))
         .nest("/api/v1/auth", auth_routes)
         .nest("/api/v1/vaults", vault_routes)
+        // Cross-vault activity feed. `require_verified`, like the per-vault audit
+        // route it aggregates: a user session or an unscoped API token. A token
+        // scoped to one vault is refused (403 TOKEN_SCOPE) because this path has
+        // no `:vault_id` for the guard to match.
+        .nest(
+            "/api/v1/audit",
+            Router::new()
+                .route("/", get(audit::audit_feed))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_verified,
+                )),
+        )
         .nest("/api/v1/orgs", org_routes)
         .nest(
             "/api/v1/users",

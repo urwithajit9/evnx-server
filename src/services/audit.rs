@@ -194,6 +194,231 @@ pub async fn list_for_vault(
     .await
 }
 
+/// Resolve `metadata.removed_user_id` to an email for a page of events (RM-57).
+///
+/// Read-time, because the audit table is append-only and the stored row is never
+/// touched. One query per page, none when no event carries a removed id. `null`
+/// is rendered by [`event_json`] for an account that no longer exists.
+pub async fn removed_emails<'a>(
+    pool: &PgPool,
+    events: impl IntoIterator<Item = &'a AuditRow>,
+) -> Result<std::collections::HashMap<Uuid, String>, sqlx::Error> {
+    let ids: Vec<Uuid> = events
+        .into_iter()
+        .filter_map(|e| {
+            e.metadata
+                .as_ref()?
+                .get("removed_user_id")?
+                .as_str()
+                .and_then(|s| Uuid::parse_str(s).ok())
+        })
+        .collect();
+    if ids.is_empty() {
+        return Ok(Default::default());
+    }
+    Ok(
+        sqlx::query_as::<_, (Uuid, String)>("SELECT id, email FROM users WHERE id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect(),
+    )
+}
+
+/// One event in the shape both audit views return.
+///
+/// Shared by `GET /vaults/:id/audit` and `GET /audit` so the two cannot differ in
+/// what an event looks like. No `ip_hash`, no `user_agent_hash`, by construction:
+/// [`AuditRow`] does not carry them.
+pub fn event_json(
+    e: AuditRow,
+    removed_emails: &std::collections::HashMap<Uuid, String>,
+) -> serde_json::Value {
+    let mut metadata = e.metadata;
+    if let Some(serde_json::Value::Object(map)) = metadata.as_mut() {
+        if let Some(id) = map
+            .get("removed_user_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+        {
+            // `null` when the account no longer exists.
+            map.insert(
+                "removed_email".into(),
+                removed_emails
+                    .get(&id)
+                    .map_or(serde_json::Value::Null, |m| m.clone().into()),
+            );
+        }
+    }
+    serde_json::json!({
+        "id":           e.id,
+        "event_type":   e.event_type,
+        "user_id":      e.user_id,
+        // `null` when the account has been deleted since.
+        "actor_email":  e.actor_email,
+        "metadata":     metadata,
+        "created_at":   e.created_at,
+    })
+}
+
+/// One event of the cross-vault feed: the event plus the vault it belongs to.
+pub struct FeedRow {
+    pub event: AuditRow,
+    pub vault_id: Uuid,
+    pub vault_name: String,
+}
+
+/// Position in the feed: the `(created_at, id)` of the last event returned.
+///
+/// Encoded as URL-safe base64 of `"<unix microseconds>.<uuid>"`. Opaque to
+/// clients; only [`FeedCursor::decode`] may interpret it. Microseconds because
+/// that is Postgres' `timestamptz` precision, so the round trip is exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedCursor {
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub id: Uuid,
+}
+
+impl FeedCursor {
+    pub fn encode(&self) -> String {
+        use base64ct::{Base64UrlUnpadded, Encoding};
+        Base64UrlUnpadded::encode_string(
+            format!("{}.{}", self.created_at.timestamp_micros(), self.id).as_bytes(),
+        )
+    }
+
+    /// `None` for anything this server did not produce.
+    pub fn decode(raw: &str) -> Option<Self> {
+        use base64ct::{Base64UrlUnpadded, Encoding};
+        let bytes = Base64UrlUnpadded::decode_vec(raw).ok()?;
+        let text = std::str::from_utf8(&bytes).ok()?;
+        let (micros, id) = text.split_once('.')?;
+        Some(Self {
+            created_at: chrono::DateTime::from_timestamp_micros(micros.parse().ok()?)?,
+            id: Uuid::parse_str(id).ok()?,
+        })
+    }
+}
+
+/// How many of `wanted` the user may read the audit trail of right now.
+///
+/// Same condition as [`list_feed`]: a current membership, at a role that meets
+/// `readable_roles`, on a vault that is not soft-deleted.
+pub async fn count_readable_vaults(
+    pool: &PgPool,
+    user_id: Uuid,
+    readable_roles: &[String],
+    wanted: &[Uuid],
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(*) AS "n!"
+        FROM vault_members vm
+        JOIN vaults v ON v.id = vm.vault_id AND v.deleted_at IS NULL
+        WHERE vm.user_id = $1
+          AND vm.role = ANY($2)
+          AND vm.vault_id = ANY($3)
+        "#,
+        user_id,
+        readable_roles,
+        wanted,
+    )
+    .fetch_one(pool)
+    .await
+}
+
+/// The newest audit events across every vault `user_id` can read, newest first.
+///
+/// # Scope
+///
+/// An event is returned only if the caller has, **right now**, a membership on
+/// its vault whose role is in `readable_roles` and the vault is not
+/// soft-deleted: the condition `find_member_role` + `VaultAccess<AuditReader>`
+/// apply to `GET /vaults/:id/audit`, expressed as a join. A revoked membership
+/// therefore stops contributing at once, and events with no vault
+/// (`vault_id IS NULL`, e.g. logins) never match.
+///
+/// `only_vaults`, when given, narrows that set; it can never widen it.
+/// `not_before` is the plan's retention horizon (a visibility limit, not
+/// deletion; see `routes::vaults::vault_audit`). `before` is the keyset position.
+///
+/// # Shape of the query
+///
+/// A `LATERAL` per readable vault takes that vault's newest `limit` rows from
+/// `idx_audit_events_vault_page`, so the cost is bounded by
+/// `vaults x limit` index rows however long the history is, and a deep page costs
+/// the same as the first (no offset, no sort of the whole table). The outer
+/// query merges and cuts to `limit`. Order is `(created_at DESC, id DESC)`, a
+/// total order, so equal timestamps neither repeat nor skip across pages.
+pub async fn list_feed(
+    pool: &PgPool,
+    user_id: Uuid,
+    readable_roles: &[String],
+    only_vaults: Option<&[Uuid]>,
+    not_before: Option<chrono::DateTime<chrono::Utc>>,
+    before: Option<FeedCursor>,
+    limit: i64,
+) -> Result<Vec<FeedRow>, sqlx::Error> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            a.id          AS "id!",
+            a.event_type  AS "event_type!",
+            a.user_id,
+            u.email       AS "actor_email?",
+            a.metadata,
+            a.created_at  AS "created_at!",
+            v.id          AS "vault_id!",
+            v.name        AS "vault_name!"
+        FROM vault_members vm
+        JOIN vaults v ON v.id = vm.vault_id AND v.deleted_at IS NULL
+        CROSS JOIN LATERAL (
+            SELECT e.id, e.event_type, e.user_id, e.metadata, e.created_at
+            FROM audit_events e
+            WHERE e.vault_id = v.id
+              AND e.created_at >= COALESCE($4::timestamptz, '-infinity'::timestamptz)
+              AND (e.created_at, e.id) < (
+                    COALESCE($5::timestamptz, 'infinity'::timestamptz),
+                    COALESCE($6::uuid, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid))
+            ORDER BY e.created_at DESC, e.id DESC
+            LIMIT $7
+        ) a
+        LEFT JOIN users u ON u.id = a.user_id
+        WHERE vm.user_id = $1
+          AND vm.role = ANY($2)
+          AND ($3::uuid[] IS NULL OR vm.vault_id = ANY($3))
+        ORDER BY a.created_at DESC, a.id DESC
+        LIMIT $7
+        "#,
+        user_id,
+        readable_roles,
+        only_vaults,
+        not_before,
+        before.map(|c| c.created_at),
+        before.map(|c| c.id),
+        limit,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| FeedRow {
+            event: AuditRow {
+                id: r.id,
+                event_type: r.event_type,
+                user_id: r.user_id,
+                actor_email: r.actor_email,
+                metadata: r.metadata,
+                created_at: r.created_at,
+            },
+            vault_id: r.vault_id,
+            vault_name: r.vault_name,
+        })
+        .collect())
+}
+
 /// Whether this account has signed in from this origin before.
 ///
 /// # What "recognised" means here, and what it does not

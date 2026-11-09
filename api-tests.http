@@ -131,6 +131,27 @@ Authorization: Bearer YOUR_JWT_TOKEN
 DELETE {{base_url}}/api/v1/vaults/VAULT_ID
 Authorization: Bearer YOUR_JWT_TOKEN
 
+### ── Audit feed (all vaults) ────────────────────────────────────────────────
+
+### Audit feed — newest first across every vault you can read
+GET {{base_url}}/api/v1/audit?limit=50
+Authorization: Bearer YOUR_JWT_TOKEN
+
+### Audit feed — next page (paste next_cursor from the previous response)
+GET {{base_url}}/api/v1/audit?limit=50&before=NEXT_CURSOR
+Authorization: Bearer YOUR_JWT_TOKEN
+
+### Audit feed — only some vaults (comma-separated; 404 if any is not yours)
+GET {{base_url}}/api/v1/audit?vault_id=VAULT_ID_1,VAULT_ID_2
+Authorization: Bearer YOUR_JWT_TOKEN
+
+### Audit feed — No Auth → 401
+GET {{base_url}}/api/v1/audit
+
+### Audit feed — limit out of range → 422
+GET {{base_url}}/api/v1/audit?limit=201
+Authorization: Bearer YOUR_JWT_TOKEN
+
 ### ── Versions ────────────────────────────────────────────────────────────────
 
 ### Push Version — replace VAULT_ID
