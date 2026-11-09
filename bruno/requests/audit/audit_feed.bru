@@ -1,0 +1,33 @@
+meta {
+  name: Audit Feed (all vaults)
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/api/v1/audit?limit=50
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("status is 200", function() {
+    expect(res.getStatus()).to.equal(200);
+  });
+
+  test("events array and cursor in response", function() {
+    expect(res.getBody().events).to.be.an("array");
+    expect(res.getBody()).to.have.property("next_cursor");
+  });
+
+  test("every event names its vault", function() {
+    res.getBody().events.forEach(function(e) {
+      expect(e).to.have.property("vault_id");
+      expect(e).to.have.property("vault_name");
+    });
+  });
+}

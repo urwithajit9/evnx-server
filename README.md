@@ -164,6 +164,7 @@ evnx-server/
     │   ├── auth.rs              ← register, srp/init, srp/verify, totp/*, refresh, logout
     │   ├── tokens.rs            ← GET/POST/DELETE /auth/tokens (CI/CD API tokens)
     │   ├── vaults.rs            ← GET/POST/DELETE /vaults
+    │   ├── audit.rs             ← GET /audit (cross-vault activity feed)
     │   ├── versions.rs          ← GET/POST /vaults/{id}/versions, GET blob
     │   ├── members.rs           ← POST/DELETE /vaults/{id}/members
     │   └── users.rs             ← GET /users/{email}/public-key
@@ -379,6 +380,15 @@ POST /api/v1/vaults/{id}/members
 
 DELETE /api/v1/vaults/{id}/members/{user_id}
   → 204 No Content (removes vault_members row — user loses access immediately)
+```
+
+#### Audit Feed
+
+```
+GET  /api/v1/audit?limit=50&before=<cursor>&vault_id=<id>[,<id>...]
+  → 200 { "events": [{ ..per-vault event.., "vault_id", "vault_name" }], "limit", "next_cursor", "retention_days" }
+  Newest first across every vault the caller can read (same rule as
+  GET /vaults/{id}/audit, per vault). Keyset-paged. Details: docs/API-CHANGES.md.
 ```
 
 #### Vault Version Operations
