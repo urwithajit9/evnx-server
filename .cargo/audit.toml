@@ -17,4 +17,15 @@ ignore = [
     # available, so this cannot be resolved by upgrading.
     # Verified 2026-09-12.
     "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2026-0459 — `libsqlite3-sys` 0.30.1 bundles a C SQLite affected by
+    # CVE-2026-119375 (fixed in libsqlite3-sys >= 0.39.0).
+    # Reached only through sqlx-sqlite, which the sqlx macros crate lists in the
+    # lockfile even with default-features = false. This server is Postgres-only:
+    # `cargo tree -e normal,build -i libsqlite3-sys` and the same with
+    # `--all-features` and `--target all` find nothing, so no SQLite is compiled.
+    # It cannot be upgraded within sqlx 0.8 (sqlx-sqlite 0.8.6 requires
+    # libsqlite3-sys ^0.30); the real fix is moving to sqlx 0.9.
+    # Verified 2026-11-09.
+    "RUSTSEC-2026-0459",
 ]
