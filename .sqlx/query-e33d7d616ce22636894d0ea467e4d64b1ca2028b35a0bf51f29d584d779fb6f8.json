@@ -1,0 +1,70 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            a.id          AS \"id!\",\n            a.event_type  AS \"event_type!\",\n            a.user_id,\n            u.email       AS \"actor_email?\",\n            a.metadata,\n            a.created_at  AS \"created_at!\",\n            v.id          AS \"vault_id!\",\n            v.name        AS \"vault_name!\"\n        FROM vault_members vm\n        JOIN vaults v ON v.id = vm.vault_id AND v.deleted_at IS NULL\n        CROSS JOIN LATERAL (\n            SELECT e.id, e.event_type, e.user_id, e.metadata, e.created_at\n            FROM audit_events e\n            WHERE e.vault_id = v.id\n              AND e.created_at >= COALESCE($4::timestamptz, '-infinity'::timestamptz)\n              AND (e.created_at, e.id) < (\n                    COALESCE($5::timestamptz, 'infinity'::timestamptz),\n                    COALESCE($6::uuid, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid))\n            ORDER BY e.created_at DESC, e.id DESC\n            LIMIT $7\n        ) a\n        LEFT JOIN users u ON u.id = a.user_id\n        WHERE vm.user_id = $1\n          AND vm.role = ANY($2)\n          AND ($3::uuid[] IS NULL OR vm.vault_id = ANY($3))\n        ORDER BY a.created_at DESC, a.id DESC\n        LIMIT $7\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "event_type!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "actor_email?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "metadata",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "vault_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "vault_name!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray",
+        "UuidArray",
+        "Timestamptz",
+        "Timestamptz",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e33d7d616ce22636894d0ea467e4d64b1ca2028b35a0bf51f29d584d779fb6f8"
+}

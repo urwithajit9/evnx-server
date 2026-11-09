@@ -8,7 +8,7 @@ use validator::Validate;
 use crate::{
     db::{members, vaults},
     errors::AppError,
-    middleware::vault_role::{AtLeastViewer, OwnerOnly, VaultAccess},
+    middleware::vault_role::{AtLeastViewer, AuditReader, OwnerOnly, VaultAccess},
     services::jwt::Claims,
     state::AppState,
 };
@@ -263,7 +263,7 @@ pub async fn get_my_key(
 /// test asserting so.
 pub async fn vault_audit(
     State(state): State<AppState>,
-    access: VaultAccess<AtLeastViewer>,
+    access: VaultAccess<AuditReader>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Capped rather than paginated. An audit view is read by a human scanning for
     // something surprising, and 200 events is more than anyone scans; proper
@@ -306,57 +306,12 @@ pub async fn vault_audit(
 
     // RM-57: resolve `removed_user_id` to an email at read time (the audit table
     // is append-only, so the stored row is never touched). One query per page.
-    let removed_ids: Vec<uuid::Uuid> = events
-        .iter()
-        .filter_map(|e| {
-            e.metadata
-                .as_ref()?
-                .get("removed_user_id")?
-                .as_str()
-                .and_then(|s| uuid::Uuid::parse_str(s).ok())
-        })
-        .collect();
-    let removed_emails: std::collections::HashMap<uuid::Uuid, String> = if removed_ids.is_empty() {
-        Default::default()
-    } else {
-        sqlx::query_as::<_, (uuid::Uuid, String)>("SELECT id, email FROM users WHERE id = ANY($1)")
-            .bind(&removed_ids)
-            .fetch_all(&state.db)
-            .await?
-            .into_iter()
-            .collect()
-    };
+    let removed_emails = crate::services::audit::removed_emails(&state.db, &events).await?;
 
     Ok(Json(serde_json::json!({
         "events": events
             .into_iter()
-            .map(|e| {
-                let mut metadata = e.metadata;
-                if let Some(serde_json::Value::Object(map)) = metadata.as_mut() {
-                    if let Some(id) = map
-                        .get("removed_user_id")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                    {
-                        // `null` when the account no longer exists.
-                        map.insert(
-                            "removed_email".into(),
-                            removed_emails
-                                .get(&id)
-                                .map_or(serde_json::Value::Null, |m| m.clone().into()),
-                        );
-                    }
-                }
-                serde_json::json!({
-                    "id":           e.id,
-                    "event_type":   e.event_type,
-                    "user_id":      e.user_id,
-                    // `null` when the account has been deleted since.
-                    "actor_email":  e.actor_email,
-                    "metadata":     metadata,
-                    "created_at":   e.created_at,
-                })
-            })
+            .map(|e| crate::services::audit::event_json(e, &removed_emails))
             .collect::<Vec<_>>(),
         "limit": LIMIT,
         // Told rather than left to be inferred. A trail that silently stops is

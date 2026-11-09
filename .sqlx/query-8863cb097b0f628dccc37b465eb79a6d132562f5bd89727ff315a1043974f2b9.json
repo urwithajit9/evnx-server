@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(*) AS \"n!\"\n        FROM vault_members vm\n        JOIN vaults v ON v.id = vm.vault_id AND v.deleted_at IS NULL\n        WHERE vm.user_id = $1\n          AND vm.role = ANY($2)\n          AND vm.vault_id = ANY($3)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "8863cb097b0f628dccc37b465eb79a6d132562f5bd89727ff315a1043974f2b9"
+}
