@@ -112,8 +112,18 @@ fi
 
 step "2 · Migrations between here and there"
 # ⓘ Advisory, and only works when this checkout contains both commits.
-if [ -n "$RUNNING" ] && [ "$TARGET" != "latest" ] && git rev-parse --verify -q "$RUNNING" >/dev/null 2>&1; then
-  CHANGED="$(git diff --name-only "$RUNNING" "$TARGET" -- migrations/ 2>/dev/null || true)"
+# ⚠️ It used to check only the running commit. When the target was missing (no
+# `git pull` on this host yet), `git diff` failed, the error was swallowed, and
+# the step printed "none" for a deploy that did add a migration (014, 2026-11-09).
+# Now: fetch if either commit is missing, and say "skipped" if one still is.
+has_commit() { git rev-parse --verify -q "$1^{commit}" >/dev/null 2>&1; }
+if [ -n "$RUNNING" ] && [ "$TARGET" != "latest" ]; then
+  if ! has_commit "$RUNNING" || ! has_commit "$TARGET"; then
+    git fetch -q origin 2>/dev/null || true
+  fi
+fi
+if [ -n "$RUNNING" ] && [ "$TARGET" != "latest" ] && has_commit "$RUNNING" && has_commit "$TARGET"; then
+  CHANGED="$(git diff --name-only "$RUNNING" "$TARGET" -- migrations/)"
   if [ -n "$CHANGED" ]; then
     printf '\033[33m  ⚠ migrations differ:\033[0m\n'
     printf '    %s\n' $CHANGED
@@ -122,8 +132,11 @@ if [ -n "$RUNNING" ] && [ "$TARGET" != "latest" ] && git rev-parse --verify -q "
   else
     note "none — this is a code-only deploy"
   fi
+elif [ -n "$RUNNING" ] && [ "$TARGET" != "latest" ]; then
+  printf '\033[33m  ⚠ skipped: %s or %s is not in this checkout, even after git fetch.\033[0m\n' "$RUNNING" "$TARGET"
+  note "Check by hand: git fetch && git diff --name-only $RUNNING $TARGET -- migrations/"
 else
-  note "skipped (cannot compare: unknown running build, 'latest', or shallow clone)"
+  note "skipped (cannot compare: unknown running build, or 'latest')"
 fi
 
 if [ "$DRY_RUN" = "--dry-run" ]; then
