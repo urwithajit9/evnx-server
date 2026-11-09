@@ -9121,3 +9121,594 @@ async fn audit_resolves_the_removed_member_email_and_rekey_reads_are_marked() {
     let (_, stored) = events.iter().find(|(t, _)| t == "vault_rekey").unwrap();
     assert!(stored.get("removed_email").is_none());
 }
+
+// ─── AF: the cross-vault audit feed, GET /api/v1/audit ────────────────────────
+//
+// Events are seeded straight into `audit_events` (INSERT is the one thing the
+// append-only trigger allows) so timestamps, including identical ones, are under
+// the test's control. Every user here is new, so the feed holds only their own
+// vaults' events: the vault-creation and push events the API wrote itself, plus
+// whatever a test seeds.
+
+/// `GET path?query`, with the query split into parameters: axum-test 14 would
+/// otherwise percent-encode the `?` into the path and the route would 404.
+fn af_get(server: &TestServer, path_and_query: &str) -> TestRequest {
+    let (path, query) = path_and_query
+        .split_once('?')
+        .unwrap_or((path_and_query, ""));
+    let mut req = server.get(path);
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        req = req.add_query_param(k, v);
+    }
+    req
+}
+
+async fn af_db() -> sqlx::PgPool {
+    sqlx::PgPool::connect(&test_config().await.database_url)
+        .await
+        .unwrap()
+}
+
+/// Insert one audit event with a chosen timestamp and return its id.
+async fn af_seed(
+    db: &sqlx::PgPool,
+    vault_id: Uuid,
+    actor: Option<Uuid>,
+    event_type: &str,
+    metadata: Option<serde_json::Value>,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO audit_events (vault_id, user_id, event_type, metadata, created_at) \
+         VALUES ($1, $2, $3, $4, $5) RETURNING id",
+    )
+    .bind(vault_id)
+    .bind(actor)
+    .bind(event_type)
+    .bind(metadata)
+    .bind(created_at)
+    .fetch_one(db)
+    .await
+    .unwrap()
+}
+
+fn af_ago(seconds: i64) -> chrono::DateTime<chrono::Utc> {
+    // Whole microseconds, as Postgres stores them.
+    let now = chrono::Utc::now();
+    chrono::DateTime::from_timestamp_micros(now.timestamp_micros() - seconds * 1_000_000).unwrap()
+}
+
+/// Walk the feed to the end with `limit` per page. Returns every event in order
+/// and the number of pages fetched.
+async fn af_walk(
+    server: &TestServer,
+    jwt: &str,
+    limit: usize,
+    extra: &str,
+) -> (Vec<serde_json::Value>, usize) {
+    let mut all = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let mut url = format!("/api/v1/audit?limit={limit}{extra}");
+        if let Some(c) = &cursor {
+            url.push_str(&format!("&before={c}"));
+        }
+        let resp = bearer(af_get(server, &url), jwt).await;
+        resp.assert_status_ok();
+        let body = resp.json::<serde_json::Value>();
+        pages += 1;
+        assert!(pages < 500, "the cursor never reached the end");
+        all.extend(body["events"].as_array().unwrap().iter().cloned());
+        match body["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_string()),
+            None => return (all, pages),
+        }
+    }
+}
+
+fn af_ids(events: &[serde_json::Value]) -> Vec<Uuid> {
+    events
+        .iter()
+        .map(|e| Uuid::parse_str(e["id"].as_str().unwrap()).unwrap())
+        .collect()
+}
+
+fn af_key(e: &serde_json::Value) -> (chrono::DateTime<chrono::Utc>, Uuid) {
+    (
+        e["created_at"].as_str().unwrap().parse().unwrap(),
+        Uuid::parse_str(e["id"].as_str().unwrap()).unwrap(),
+    )
+}
+
+async fn af_feed(server: &TestServer, jwt: &str, query: &str) -> serde_json::Value {
+    let resp = bearer(af_get(server, &format!("/api/v1/audit{query}")), jwt).await;
+    resp.assert_status_ok();
+    resp.json::<serde_json::Value>()
+}
+
+#[tokio::test]
+async fn t_af1_a_member_sees_all_and_only_their_vaults_newest_first() {
+    let server = test_app().await;
+    let db = af_db().await;
+    let (me, jwt) = verified_user(&server).await;
+    let (other, other_jwt) = verified_user(&server).await;
+    let v1 = create_vault(&server, &jwt).await;
+    let v2 = create_vault(&server, &jwt).await;
+    let theirs = create_vault(&server, &other_jwt).await;
+    // Someone else's vault that also has me as a member must appear too.
+    let shared = create_vault(&server, &other_jwt).await;
+    let share_email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+        .bind(me)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    bearer(
+        server.post(&format!("/api/v1/vaults/{shared}/members")),
+        &other_jwt,
+    )
+    .json(&share_as(&share_email, "viewer", "Zm9v"))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    let a = af_seed(&db, v1, Some(me), "af_probe", None, af_ago(30)).await;
+    let b = af_seed(&db, v2, Some(me), "af_probe", None, af_ago(20)).await;
+    let c = af_seed(&db, shared, Some(other), "af_probe", None, af_ago(10)).await;
+    let hidden = af_seed(&db, theirs, Some(other), "af_probe", None, af_ago(5)).await;
+    // An event with no vault (a login) is not part of any vault's trail.
+    sqlx::query("INSERT INTO audit_events (user_id, event_type) VALUES ($1, 'af_vaultless')")
+        .bind(me)
+        .execute(&db)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let (events, _) = af_walk(&server, &jwt, 50, "").await;
+    let ids = af_ids(&events);
+    for want in [a, b, c] {
+        assert!(ids.contains(&want), "missing a readable event");
+    }
+    assert!(!ids.contains(&hidden), "an unreadable vault's event leaked");
+
+    let mine = [v1, v2, shared];
+    for e in &events {
+        let vid = Uuid::parse_str(e["vault_id"].as_str().unwrap()).unwrap();
+        assert!(
+            mine.contains(&vid),
+            "event from a vault the caller is not in"
+        );
+        assert_ne!(e["event_type"], "af_vaultless");
+        let name: String = sqlx::query_scalar("SELECT name FROM vaults WHERE id = $1")
+            .bind(vid)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(e["vault_name"], name);
+    }
+    let keys: Vec<_> = events.iter().map(af_key).collect();
+    let mut sorted = keys.clone();
+    sorted.sort_by(|x, y| y.cmp(x));
+    assert_eq!(keys, sorted, "newest first, ties broken by id descending");
+
+    // The seeded probes keep their relative order.
+    let pos = |id| ids.iter().position(|x| *x == id).unwrap();
+    assert!(pos(c) < pos(b) && pos(b) < pos(a));
+}
+
+/// The feed's role rule is the per-vault route's: any member, viewer included.
+/// Both sides: every role sees the vault, a non-member sees nothing of it.
+#[tokio::test]
+async fn t_af2_the_role_rule_matches_the_per_vault_audit_route() {
+    let server = test_app().await;
+    let db = af_db().await;
+    let (_o, owner_jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &owner_jwt).await;
+    let probe = af_seed(&db, vault, None, "af_probe", None, af_ago(5)).await;
+    let (_o2, outsider) = verified_user(&server).await;
+
+    for role in ["viewer", "developer", "admin"] {
+        let (_id, jwt) = member_at(&server, &owner_jwt, vault, role).await;
+        let per_vault = bearer(server.get(&format!("/api/v1/vaults/{vault}/audit")), &jwt).await;
+        per_vault.assert_status_ok();
+        let feed = af_feed(&server, &jwt, "").await;
+        assert!(
+            af_ids(feed["events"].as_array().unwrap()).contains(&probe),
+            "{role} reads the per-vault trail, so the feed must show it"
+        );
+    }
+    let feed = af_feed(&server, &owner_jwt, "").await;
+    assert!(af_ids(feed["events"].as_array().unwrap()).contains(&probe));
+
+    let per_vault = bearer(
+        server.get(&format!("/api/v1/vaults/{vault}/audit")),
+        &outsider,
+    )
+    .await;
+    assert_eq!(per_vault.status_code(), StatusCode::NOT_FOUND);
+    let feed = af_feed(&server, &outsider, "").await;
+    assert!(
+        feed["events"].as_array().unwrap().is_empty(),
+        "a non-member's feed must be empty"
+    );
+}
+
+/// An event in the feed is, field for field, the event the per-vault route
+/// returns, plus `vault_id` and `vault_name`.
+#[tokio::test]
+async fn t_af3_events_have_the_per_vault_shape_with_removed_email_and_purpose() {
+    let server = test_app().await;
+    let db = af_db().await;
+    let (me, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+    let (_gone, gone_email, _gj) = verified_user_with_email(&server, "af-removed").await;
+    let gone_id: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
+        .bind(&gone_email)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    let ghost = Uuid::new_v4();
+
+    let rekey = af_seed(
+        &db,
+        vault,
+        Some(me),
+        "vault_rekey",
+        Some(serde_json::json!({ "removed_user_id": gone_id })),
+        af_ago(30),
+    )
+    .await;
+    let ghost_rekey = af_seed(
+        &db,
+        vault,
+        Some(me),
+        "vault_rekey",
+        Some(serde_json::json!({ "removed_user_id": ghost })),
+        af_ago(20),
+    )
+    .await;
+    let pull = af_seed(
+        &db,
+        vault,
+        Some(me),
+        "pull",
+        Some(serde_json::json!({ "version": 1, "purpose": "rekey" })),
+        af_ago(10),
+    )
+    .await;
+
+    let feed = af_feed(&server, &jwt, "").await;
+    let feed_events = feed["events"].as_array().unwrap();
+    let find = |id: Uuid| {
+        feed_events
+            .iter()
+            .find(|e| e["id"] == id.to_string())
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(find(rekey)["metadata"]["removed_email"], gone_email);
+    assert!(find(ghost_rekey)["metadata"]["removed_email"].is_null());
+    assert!(find(ghost_rekey)["metadata"]
+        .as_object()
+        .unwrap()
+        .contains_key("removed_email"));
+    assert_eq!(find(pull)["metadata"]["purpose"], "rekey");
+
+    let per_vault = bearer(server.get(&format!("/api/v1/vaults/{vault}/audit")), &jwt)
+        .await
+        .json::<serde_json::Value>();
+    for pv in per_vault["events"].as_array().unwrap() {
+        let mut from_feed = feed_events
+            .iter()
+            .find(|e| e["id"] == pv["id"])
+            .expect("every per-vault event is in the feed")
+            .clone();
+        let obj = from_feed.as_object_mut().unwrap();
+        assert_eq!(obj.remove("vault_id").unwrap(), vault.to_string());
+        assert!(obj.remove("vault_name").unwrap().is_string());
+        assert_eq!(&from_feed, pv, "same event, same shape");
+    }
+    let raw = bearer(server.get("/api/v1/audit"), &jwt).await.text();
+    for forbidden in ["ip_hash", "user_agent_hash"] {
+        assert!(!raw.contains(forbidden), "the feed leaked `{forbidden}`");
+    }
+}
+
+#[tokio::test]
+async fn t_af4_a_revoked_member_stops_seeing_that_vaults_events() {
+    let server = test_app().await;
+    let db = af_db().await;
+    let (_o, owner_jwt) = verified_user(&server).await;
+    let kept = create_vault(&server, &owner_jwt).await;
+    let revoked = create_vault(&server, &owner_jwt).await;
+    let (member, member_jwt) = member_at(&server, &owner_jwt, kept, "developer").await;
+    // Same member, second vault.
+    let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+        .bind(member)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    bearer(
+        server.post(&format!("/api/v1/vaults/{revoked}/members")),
+        &owner_jwt,
+    )
+    .json(&share_as(&email, "developer", "Zm9v"))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    let in_kept = af_seed(&db, kept, None, "af_probe", None, af_ago(20)).await;
+    let in_revoked = af_seed(&db, revoked, None, "af_probe", None, af_ago(10)).await;
+
+    let before = af_feed(&server, &member_jwt, "").await;
+    let ids = af_ids(before["events"].as_array().unwrap());
+    assert!(ids.contains(&in_kept) && ids.contains(&in_revoked));
+
+    bearer(
+        server.delete(&format!("/api/v1/vaults/{revoked}/members/{member}")),
+        &owner_jwt,
+    )
+    .await
+    .assert_status(StatusCode::NO_CONTENT);
+
+    let after = af_feed(&server, &member_jwt, "").await;
+    let events = after["events"].as_array().unwrap();
+    let ids = af_ids(events);
+    assert!(ids.contains(&in_kept));
+    assert!(!ids.contains(&in_revoked), "revoked vault still in feed");
+    assert!(
+        events.iter().all(|e| e["vault_id"] != revoked.to_string()),
+        "no event of the revoked vault, including the revocation itself"
+    );
+    // The owner still sees everything.
+    let owner = af_feed(&server, &owner_jwt, "").await;
+    assert!(af_ids(owner["events"].as_array().unwrap()).contains(&in_revoked));
+}
+
+#[tokio::test]
+async fn t_af5_a_deleted_vault_drops_out_of_the_feed() {
+    let server = test_app().await;
+    let db = af_db().await;
+    let (_o, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+    let probe = af_seed(&db, vault, None, "af_probe", None, af_ago(5)).await;
+    assert!(af_ids(
+        af_feed(&server, &jwt, "").await["events"]
+            .as_array()
+            .unwrap()
+    )
+    .contains(&probe));
+
+    bearer(server.delete(&format!("/api/v1/vaults/{vault}")), &jwt)
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    // `find_member_role` refuses a soft-deleted vault, so the per-vault route
+    // answers 404 and the feed must agree.
+    let gone = bearer(server.get(&format!("/api/v1/vaults/{vault}/audit")), &jwt).await;
+    assert_eq!(gone.status_code(), StatusCode::NOT_FOUND);
+    let feed = af_feed(&server, &jwt, "").await;
+    assert!(!af_ids(feed["events"].as_array().unwrap()).contains(&probe));
+}
+
+#[tokio::test]
+async fn t_af6_paging_walks_every_event_once_including_equal_timestamps() {
+    let server = test_app().await;
+    let db = af_db().await;
+    let (me, jwt) = verified_user(&server).await;
+    let v1 = create_vault(&server, &jwt).await;
+    let v2 = create_vault(&server, &jwt).await;
+
+    // 40 events: ten per timestamp, split across both vaults, so the page
+    // boundary falls inside a run of identical `created_at` at every limit
+    // below.
+    let mut seeded = Vec::new();
+    for slot in 0..4 {
+        let at = af_ago(1000 - slot * 100);
+        for i in 0..10 {
+            let vault = if i % 2 == 0 { v1 } else { v2 };
+            seeded.push(af_seed(&db, vault, Some(me), "af_probe", None, at).await);
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let (reference, pages) = af_walk(&server, &jwt, 200, "").await;
+    assert_eq!(pages, 1);
+    let want = af_ids(&reference);
+    for id in &seeded {
+        assert!(want.contains(id));
+    }
+
+    for limit in [1, 3, 7, 10, 11] {
+        let (walked, pages) = af_walk(&server, &jwt, limit, "").await;
+        assert_eq!(af_ids(&walked), want, "limit {limit}: gaps or duplicates");
+        assert!(pages >= want.len() / limit, "limit {limit}");
+    }
+
+    // The last page says so, and the first says there is more.
+    let first = af_feed(&server, &jwt, "?limit=5").await;
+    assert_eq!(first["limit"], 5);
+    assert_eq!(first["events"].as_array().unwrap().len(), 5);
+    assert!(first["next_cursor"].is_string());
+    let all = af_feed(&server, &jwt, "?limit=200").await;
+    assert!(all["next_cursor"].is_null());
+    // An exact multiple must not hand out a final empty page.
+    let n = want.len();
+    let exact = af_feed(&server, &jwt, &format!("?limit={n}")).await;
+    assert_eq!(exact["events"].as_array().unwrap().len(), n);
+    assert!(exact["next_cursor"].is_null());
+}
+
+#[tokio::test]
+async fn t_af7_limit_and_cursor_are_validated() {
+    let server = test_app().await;
+    let (_u, jwt) = verified_user(&server).await;
+
+    // Default and bounds.
+    assert_eq!(af_feed(&server, &jwt, "").await["limit"], 50);
+    assert_eq!(af_feed(&server, &jwt, "?limit=1").await["limit"], 1);
+    assert_eq!(af_feed(&server, &jwt, "?limit=200").await["limit"], 200);
+
+    let not_base64 = "!!!";
+    let wrong_content = {
+        use base64ct::{Base64UrlUnpadded, Encoding};
+        Base64UrlUnpadded::encode_string(b"not.a-cursor")
+    };
+    for query in [
+        "?limit=0",
+        "?limit=201",
+        "?limit=-1",
+        "?limit=abc",
+        "?limit=",
+        "?limit=1.5",
+        &format!("?before={not_base64}"),
+        &format!("?before={wrong_content}"),
+        "?before=",
+        "?vault_id=not-a-uuid",
+        "?vault_id=",
+    ] {
+        let resp = bearer(af_get(&server, &format!("/api/v1/audit{query}")), &jwt).await;
+        assert_envelope(&resp, StatusCode::UNPROCESSABLE_ENTITY, "VALIDATION_ERROR");
+        let _ = query;
+    }
+}
+
+#[tokio::test]
+async fn t_af8_the_vault_id_filter_narrows_and_never_widens() {
+    let server = test_app().await;
+    let db = af_db().await;
+    let (_me, jwt) = verified_user(&server).await;
+    let (_o, other_jwt) = verified_user(&server).await;
+    let v1 = create_vault(&server, &jwt).await;
+    let v2 = create_vault(&server, &jwt).await;
+    let v3 = create_vault(&server, &jwt).await;
+    let foreign = create_vault(&server, &other_jwt).await;
+    af_seed(&db, v1, None, "af_probe", None, af_ago(30)).await;
+    af_seed(&db, v2, None, "af_probe", None, af_ago(20)).await;
+    af_seed(&db, v3, None, "af_probe", None, af_ago(10)).await;
+
+    let vaults_in = |feed: &serde_json::Value| -> std::collections::BTreeSet<String> {
+        feed["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["vault_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let set = |ids: &[Uuid]| -> std::collections::BTreeSet<String> {
+        ids.iter().map(|i| i.to_string()).collect()
+    };
+
+    assert_eq!(
+        vaults_in(&af_feed(&server, &jwt, "").await),
+        set(&[v1, v2, v3])
+    );
+    assert_eq!(
+        vaults_in(&af_feed(&server, &jwt, &format!("?vault_id={v2}")).await),
+        set(&[v2])
+    );
+    assert_eq!(
+        vaults_in(&af_feed(&server, &jwt, &format!("?vault_id={v1},{v3}")).await),
+        set(&[v1, v3])
+    );
+    // A repeated id is one id, and the filter composes with paging.
+    let (walked, _) = af_walk(&server, &jwt, 2, &format!("&vault_id={v1},{v1}")).await;
+    assert!(!walked.is_empty());
+    assert!(walked.iter().all(|e| e["vault_id"] == v1.to_string()));
+
+    // A vault the caller cannot read is a 404, alone or among readable ones,
+    // exactly as the vault routes answer a non-member.
+    for query in [
+        format!("?vault_id={foreign}"),
+        format!("?vault_id={v1},{foreign}"),
+        format!("?vault_id={}", Uuid::new_v4()),
+    ] {
+        let resp = bearer(af_get(&server, &format!("/api/v1/audit{query}")), &jwt).await;
+        assert_envelope(&resp, StatusCode::NOT_FOUND, "NOT_FOUND");
+    }
+    // ...and the foreign vault's events never surfaced anywhere above.
+    let all = af_feed(&server, &jwt, "?limit=200").await;
+    assert!(!vaults_in(&all).contains(&foreign.to_string()));
+}
+
+#[tokio::test]
+async fn t_af9_plan_retention_hides_old_events_as_the_per_vault_route_does() {
+    let server = test_app().await;
+    let db = af_db().await;
+    let (_u, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+    let recent = af_seed(&db, vault, None, "af_probe", None, af_ago(60)).await;
+    let ancient = af_seed(&db, vault, None, "af_probe", None, af_ago(400 * 86_400)).await;
+
+    let feed = af_feed(&server, &jwt, "").await;
+    let per_vault = bearer(server.get(&format!("/api/v1/vaults/{vault}/audit")), &jwt)
+        .await
+        .json::<serde_json::Value>();
+    assert_eq!(feed["retention_days"], per_vault["retention_days"]);
+    let feed_ids = af_ids(feed["events"].as_array().unwrap());
+    let pv_ids = af_ids(per_vault["events"].as_array().unwrap());
+    assert!(feed_ids.contains(&recent) && pv_ids.contains(&recent));
+    if feed["retention_days"].is_number() {
+        assert!(!feed_ids.contains(&ancient) && !pv_ids.contains(&ancient));
+    } else {
+        assert!(feed_ids.contains(&ancient) && pv_ids.contains(&ancient));
+    }
+}
+
+#[tokio::test]
+async fn t_af10_authentication_matches_the_per_vault_route() {
+    let server = test_app().await;
+    let db = af_db().await;
+    let (_u, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+    let other = create_vault(&server, &jwt).await;
+    let probe = af_seed(&db, vault, None, "af_probe", None, af_ago(5)).await;
+
+    // No credentials, and junk ones: 401, as on the per-vault route.
+    assert_envelope(
+        &server.get("/api/v1/audit").await,
+        StatusCode::UNAUTHORIZED,
+        "UNAUTHORIZED",
+    );
+    assert_envelope(
+        &bearer(server.get("/api/v1/audit"), "not.a.jwt").await,
+        StatusCode::UNAUTHORIZED,
+        "UNAUTHORIZED",
+    );
+    assert_eq!(
+        server
+            .get(&format!("/api/v1/vaults/{vault}/audit"))
+            .await
+            .status_code(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // An unscoped read token is allowed on both (it is a GET)...
+    let read_tok = create_api_token(&server, &jwt, "read", None).await;
+    bearer(
+        server.get(&format!("/api/v1/vaults/{vault}/audit")),
+        &read_tok,
+    )
+    .await
+    .assert_status_ok();
+    let feed = af_feed(&server, &read_tok, "").await;
+    assert!(af_ids(feed["events"].as_array().unwrap()).contains(&probe));
+
+    // ...and a token scoped to one vault may read that vault's trail but not the
+    // feed: the feed spans vaults, and the guard has no `:vault_id` to match.
+    let scoped = create_api_token(&server, &jwt, "read", Some(vault)).await;
+    bearer(
+        server.get(&format!("/api/v1/vaults/{vault}/audit")),
+        &scoped,
+    )
+    .await
+    .assert_status_ok();
+    for url in [
+        "/api/v1/audit".to_string(),
+        format!("/api/v1/audit?vault_id={vault}"),
+    ] {
+        let resp = bearer(af_get(&server, &url), &scoped).await;
+        assert_envelope(&resp, StatusCode::FORBIDDEN, "FORBIDDEN");
+        assert_eq!(resp.json::<serde_json::Value>()["reason"], "TOKEN_SCOPE");
+    }
+    let _ = other;
+}
