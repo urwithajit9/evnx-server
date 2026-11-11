@@ -10269,3 +10269,98 @@ async fn c4_a_rekey_rechecks_the_removed_members_role_under_the_lock() {
     .unwrap();
     assert_eq!(still, 1, "the owner was removed");
 }
+
+// ─── last_pushed_at on the vault list ─────────────────────────────────────────
+//
+// `updated_at` moves on rename, member changes and rekey, so a client showing
+// "last pushed" from it over-reports. `last_pushed_at` is the newest version's
+// `pushed_at` and nothing else.
+
+async fn listed_vault(server: &TestServer, jwt: &str, vault: Uuid) -> serde_json::Value {
+    let resp = bearer(server.get("/api/v1/vaults"), jwt).await;
+    resp.assert_status_ok();
+    resp.json::<serde_json::Value>()["vaults"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"].as_str() == Some(&vault.to_string()))
+        .expect("vault missing from the list")
+        .clone()
+}
+
+#[tokio::test]
+async fn last_pushed_at_is_null_for_a_vault_with_no_versions() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+
+    let v = listed_vault(&server, &jwt, vault).await;
+    assert!(
+        v.get("last_pushed_at").is_some_and(|x| x.is_null()),
+        "expected an explicit null, got {v}"
+    );
+    assert_eq!(v["version_count"], 0);
+}
+
+#[tokio::test]
+async fn last_pushed_at_is_the_newest_push() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+
+    assert_eq!(push_one(&server, &jwt, vault, 0).await, StatusCode::CREATED);
+    let first = listed_vault(&server, &jwt, vault).await["last_pushed_at"]
+        .as_str()
+        .expect("set after the first push")
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(push_one(&server, &jwt, vault, 1).await, StatusCode::CREATED);
+    let second = listed_vault(&server, &jwt, vault).await["last_pushed_at"]
+        .as_str()
+        .unwrap()
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .unwrap();
+
+    let v2: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT pushed_at FROM vault_versions WHERE vault_id = $1 AND version_num = 2",
+    )
+    .bind(vault)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(second, v2, "last_pushed_at must be the second push's time");
+    assert!(second > first);
+}
+
+#[tokio::test]
+async fn a_rename_does_not_move_last_pushed_at() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+
+    assert_eq!(push_one(&server, &jwt, vault, 0).await, StatusCode::CREATED);
+    let before = listed_vault(&server, &jwt, vault).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // No rename route exists yet; the UPDATE is what one would do.
+    sqlx::query("UPDATE vaults SET name = $2, updated_at = NOW() WHERE id = $1")
+        .bind(vault)
+        .bind(format!("r{}", Uuid::new_v4().simple()))
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let after = listed_vault(&server, &jwt, vault).await;
+    assert_ne!(
+        before["updated_at"], after["updated_at"],
+        "rename moved updated_at"
+    );
+    assert_eq!(before["last_pushed_at"], after["last_pushed_at"]);
+    assert!(after["last_pushed_at"].is_string());
+}

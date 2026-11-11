@@ -168,6 +168,10 @@ pub struct VaultSummary {
     pub role: String,
     pub version_count: i64,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// When the newest version was pushed; `null` for a vault with no versions.
+    /// Prefer this to `updated_at` for "last pushed": `updated_at` also moves on
+    /// rename, member changes and rekey.
+    pub last_pushed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub async fn list_vaults(
@@ -187,6 +191,7 @@ pub async fn list_vaults(
             role: v.role,
             version_count: v.version_count,
             updated_at: v.updated_at,
+            last_pushed_at: v.last_pushed_at,
         })
         .collect();
 
