@@ -9712,3 +9712,453 @@ async fn t_af10_authentication_matches_the_per_vault_route() {
     }
     let _ = other;
 }
+
+// ─── C4: push / revoke / re-key races ─────────────────────────────────────────
+//
+// ⚠️ How these prove a race without a test-only hook in the server.
+//
+// The handlers' lock acquisition is observable from outside: Postgres reports
+// which backends are waiting on which. So a test opens its own transaction on a
+// separate connection, takes (or changes) exactly the rows a concurrent request
+// must contend for, starts the real HTTP request, waits until Postgres says the
+// request's backend is blocked by ours (`pg_blocking_pids`), and only then
+// commits. That is a deterministic interleaving of "the extractor has already
+// admitted the request" and "the other transaction commits before the handler's
+// write", driven through the real router and the real SQL. Without the locks the
+// request would not block at all and the wait below would time out.
+
+/// The bare router, for tests that need two requests in flight at once.
+async fn c4_router() -> axum::Router {
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    sqlx::migrate!("./migrations").run(&db).await.unwrap();
+    build_router(AppState::new_for_test(db, config).await)
+}
+
+/// `c4_push` against a bare router: (status, JSON body).
+async fn c4_push_router(
+    router: axum::Router,
+    jwt: &str,
+    vault_id: Uuid,
+    base_version: Option<i32>,
+    tag: &str,
+) -> (StatusCode, serde_json::Value) {
+    use base64ct::Encoding;
+    use tower::ServiceExt;
+    let raw = format!("c4-{tag}").into_bytes();
+    let body = serde_json::json!({
+        "nonce": "AAAAAAAAAAAAAAAA",
+        "ciphertext": base64ct::Base64::encode_string(&raw),
+        "blob_hash": blake3::hash(&raw).to_hex().to_string(),
+        "key_names": ["A"],
+        "key_count": 1,
+        "base_version": base_version,
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/vaults/{vault_id}/versions"))
+        .header(AUTHORIZATION, format!("Bearer {jwt}"))
+        .header(CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+async fn c4_pool() -> sqlx::PgPool {
+    sqlx::PgPool::connect(&test_config().await.database_url)
+        .await
+        .expect("test: Postgres unreachable")
+}
+
+/// Wait until some backend is blocked on a lock held by `blocker_pid`.
+async fn c4_wait_blocked_by(pool: &sqlx::PgPool, blocker_pid: i32) {
+    for _ in 0..200 {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+        )
+        .bind(blocker_pid)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if n > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the request never blocked on the transaction's lock — is the lock missing?");
+}
+
+async fn c4_push(
+    server: &TestServer,
+    jwt: &str,
+    vault_id: Uuid,
+    base_version: Option<i32>,
+    tag: &str,
+) -> axum_test::TestResponse {
+    let raw = format!("c4-{tag}").into_bytes();
+    let ct = {
+        use base64ct::Encoding;
+        base64ct::Base64::encode_string(&raw)
+    };
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/versions")),
+        jwt,
+    )
+    .json(&serde_json::json!({
+        "nonce": "AAAAAAAAAAAAAAAA",
+        "ciphertext": ct,
+        "blob_hash": blake3::hash(&raw).to_hex().to_string(),
+        "key_names": ["A"],
+        "key_count": 1,
+        "base_version": base_version,
+    }))
+    .await
+}
+
+async fn c4_version_count(pool: &sqlx::PgPool, vault_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM vault_versions WHERE vault_id = $1")
+        .bind(vault_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Blob objects under this vault's prefix in the local test backend.
+async fn c4_blob_files(vault_id: Uuid) -> usize {
+    fn walk(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| {
+                        let p = e.path();
+                        if p.is_dir() {
+                            walk(&p)
+                        } else {
+                            1
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+    let root = test_config().await.storage_local_path;
+    walk(&std::path::Path::new(&root).join(format!("vaults/{vault_id}")))
+}
+
+/// A member whose role is revoked after the extractor admitted their push but
+/// before the handler's write commits must get 403 and leave nothing behind.
+async fn c4_push_loses_to_a_revocation(downgrade: bool) {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (dev_id, dev_jwt) = member_at(&server, &owner_jwt, vault_id, "developer").await;
+    let pool = c4_pool().await;
+
+    // The revocation: written, not yet committed.
+    let mut tx = pool.begin().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    let sql = if downgrade {
+        "UPDATE vault_members SET role = 'viewer' WHERE vault_id = $1 AND user_id = $2"
+    } else {
+        "DELETE FROM vault_members WHERE vault_id = $1 AND user_id = $2"
+    };
+    sqlx::query(sql)
+        .bind(vault_id)
+        .bind(dev_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    // The extractor still sees the old row (uncommitted), so the push is
+    // admitted; it blocks at the handler's membership lock until we commit.
+    let push = c4_push(&server, &dev_jwt, vault_id, None, "revoked");
+    let release = async {
+        c4_wait_blocked_by(&pool, pid).await;
+        tx.commit().await.unwrap();
+    };
+    let (resp, ()) = tokio::join!(push, release);
+
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+    let body = resp.json::<serde_json::Value>();
+    assert_eq!(body["code"], "FORBIDDEN");
+    assert_eq!(body["reason"], "ROLE_TOO_LOW");
+    assert_eq!(body["required_role"], "developer");
+    assert_eq!(
+        c4_version_count(&pool, vault_id).await,
+        0,
+        "a revoked user landed a version"
+    );
+    assert_eq!(
+        c4_blob_files(vault_id).await,
+        0,
+        "the refused push left its blob behind"
+    );
+}
+
+#[tokio::test]
+async fn c4_a_member_removed_before_the_push_commits_gets_403_and_no_version() {
+    c4_push_loses_to_a_revocation(false).await;
+}
+
+#[tokio::test]
+async fn c4_a_member_downgraded_before_the_push_commits_gets_403_and_no_version() {
+    c4_push_loses_to_a_revocation(true).await;
+}
+
+/// The other direction: the revocation is the request, and a push is in flight.
+/// The push's transaction is stood in for by the same locks it takes.
+#[tokio::test]
+async fn c4_removing_or_downgrading_a_member_waits_for_their_in_flight_push() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let (dev_id, _dj) = member_at(&server, &owner_jwt, vault_id, "developer").await;
+    let pool = c4_pool().await;
+
+    for removal in [false, true] {
+        let mut tx = pool.begin().await.unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert!(evnx_server::db::locks::lock_vault_shared(&mut tx, vault_id)
+            .await
+            .unwrap());
+        assert!(
+            evnx_server::db::locks::lock_member_shared(&mut tx, vault_id, dev_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let released = AtomicBool::new(false);
+        let url = format!("/api/v1/vaults/{vault_id}/members/{dev_id}");
+        let request = async {
+            let resp = if removal {
+                bearer(server.delete(&url), &owner_jwt).await
+            } else {
+                bearer(server.patch(&url), &owner_jwt)
+                    .json(&serde_json::json!({ "role": "viewer" }))
+                    .await
+            };
+            assert!(
+                released.load(Ordering::SeqCst),
+                "the change returned while the push's locks were still held"
+            );
+            resp
+        };
+        let release = async {
+            c4_wait_blocked_by(&pool, pid).await;
+            released.store(true, Ordering::SeqCst);
+            tx.commit().await.unwrap();
+        };
+        let (resp, ()) = tokio::join!(request, release);
+        resp.assert_status(StatusCode::NO_CONTENT);
+    }
+}
+
+/// Two pushes on the same base: one lands, the other is a 409 — never a 500 —
+/// and the loser leaves no blob behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn c4_two_concurrent_pushes_give_one_201_and_one_409() {
+    // ⚠️ Driven through the bare router, not `TestServer`. A `TestServer` takes
+    // a mutex around the whole request, so two requests through it are really
+    // sequential — and a sequential pair passes for the wrong reason (the second
+    // sees the first's version already committed). Cloned routers overlap.
+    let server = test_app().await;
+    let router = c4_router().await;
+    let (_owner, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    let pool = c4_pool().await;
+
+    for round in 0..4 {
+        let base = Some(round);
+        let (tag_a, tag_b) = (format!("a{round}"), format!("b{round}"));
+        let ((sa, ba), (sb, bb)) = tokio::join!(
+            c4_push_router(router.clone(), &jwt, vault_id, base, &tag_a),
+            c4_push_router(router.clone(), &jwt, vault_id, base, &tag_b),
+        );
+        let mut codes = [sa.as_u16(), sb.as_u16()];
+        codes.sort();
+        assert_eq!(codes, [201, 409], "round {round}: {codes:?}");
+
+        let body = if sa == StatusCode::CONFLICT { ba } else { bb };
+        assert_eq!(body["code"], "CONFLICT");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("Remote is at version"),
+            "{body}"
+        );
+    }
+    assert_eq!(c4_version_count(&pool, vault_id).await, 4);
+    assert_eq!(
+        c4_blob_files(vault_id).await,
+        4,
+        "a losing push left an orphan blob"
+    );
+
+    // Without a base_version whether the second push overlaps the first depends
+    // on timing, so either 201 + 201 (it started after the first committed) or
+    // 201 + 409 is right. What must never happen is a 500, or a blob and a row
+    // that disagree.
+    // (A fresh vault: the first one is at the free plan's version limit.)
+    let vault_id = create_vault(&server, &jwt).await;
+    let mut created = 0;
+    for round in 0..2 {
+        let (tag_a, tag_b) = (format!("n{round}a"), format!("n{round}b"));
+        let ((sa, _), (sb, _)) = tokio::join!(
+            c4_push_router(router.clone(), &jwt, vault_id, None, &tag_a),
+            c4_push_router(router.clone(), &jwt, vault_id, None, &tag_b),
+        );
+        for s in [sa, sb] {
+            assert!(
+                s == StatusCode::CREATED || s == StatusCode::CONFLICT,
+                "unbased push answered {s}"
+            );
+            created += i64::from(s == StatusCode::CREATED);
+        }
+    }
+    assert_eq!(c4_version_count(&pool, vault_id).await, created);
+    assert_eq!(c4_blob_files(vault_id).await as i64, created);
+}
+
+async fn c4_staged_rekey_body(
+    server: &TestServer,
+    jwt: &str,
+    vault_id: Uuid,
+    owner_id: Uuid,
+    n: i32,
+) -> serde_json::Value {
+    let mut versions = Vec::new();
+    for v in 1..=n {
+        let (blob_key, blob_hash, size) = stage(server, jwt, vault_id, v).await;
+        versions.push(serde_json::json!({
+            "version_num": v, "blob_key": blob_key,
+            "blob_hash": blob_hash, "blob_size_bytes": size,
+        }));
+    }
+    serde_json::json!({ "versions": versions, "members": [wrap_for(owner_id)] })
+}
+
+/// A client that fetched the version set, then lost a race to a push, is told
+/// 409 and nothing is repointed.
+#[tokio::test]
+async fn c4_a_rekey_with_a_version_pushed_after_the_set_was_fetched_is_409() {
+    let server = test_app().await;
+    let (owner_id, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    push_versions(&server, &jwt, vault_id, 2).await;
+    let body = c4_staged_rekey_body(&server, &jwt, vault_id, owner_id, 2).await;
+
+    c4_push(&server, &jwt, vault_id, Some(2), "late")
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    let resp = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &jwt,
+    )
+    .json(&body)
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::CONFLICT);
+    assert_eq!(resp.json::<serde_json::Value>()["code"], "CONFLICT");
+}
+
+/// The race itself: a push's transaction is open (holding the locks a push
+/// takes, with its version inserted) when the re-key arrives. The re-key must
+/// wait for it, then see the new version and refuse — not validate against the
+/// pre-push set and commit around it.
+#[tokio::test]
+async fn c4_a_rekey_waits_for_an_in_flight_push_and_then_sees_its_version() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let server = test_app().await;
+    let (owner_id, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    push_versions(&server, &jwt, vault_id, 2).await;
+    let body = c4_staged_rekey_body(&server, &jwt, vault_id, owner_id, 2).await;
+    let pool = c4_pool().await;
+
+    let mut tx = pool.begin().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert!(evnx_server::db::locks::lock_vault_shared(&mut tx, vault_id)
+        .await
+        .unwrap());
+    evnx_server::db::versions::create(
+        &mut *tx,
+        evnx_server::db::versions::CreateVersion {
+            vault_id,
+            version_num: 3,
+            blob_key: format!("vaults/{vault_id}/00000003/in-flight.enc"),
+            blob_size_bytes: 1,
+            blob_hash: "00".into(),
+            key_count: 1,
+            key_names: vec!["A".into()],
+            pushed_by: owner_id,
+        },
+    )
+    .await
+    .unwrap();
+
+    let released = AtomicBool::new(false);
+    let rekey = async {
+        let resp = bearer(
+            server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+            &jwt,
+        )
+        .json(&body)
+        .await;
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the re-key did not wait for the push in flight"
+        );
+        resp
+    };
+    let release = async {
+        c4_wait_blocked_by(&pool, pid).await;
+        released.store(true, Ordering::SeqCst);
+        tx.commit().await.unwrap();
+    };
+    let (resp, ()) = tokio::join!(rekey, release);
+
+    assert_eq!(resp.status_code(), StatusCode::CONFLICT);
+    let msg = resp.json::<serde_json::Value>()["error"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(msg.contains("missing: [3]"), "{msg}");
+    // Nothing was repointed: versions 1 and 2 still sit on their pushed blobs.
+    let rekeyed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vault_versions WHERE vault_id = $1 AND blob_hash = ANY($2)",
+    )
+    .bind(vault_id)
+    .bind(
+        (1..=2)
+            .map(|v| {
+                blake3::hash(format!("rekeyed-v{v}").as_bytes())
+                    .to_hex()
+                    .to_string()
+            })
+            .collect::<Vec<_>>(),
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rekeyed, 0, "a refused re-key repointed a version");
+}
