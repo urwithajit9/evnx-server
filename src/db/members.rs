@@ -245,12 +245,15 @@ pub async fn set_role(
 }
 
 /// Every member's id and role, for validating a re-key covers them all.
-pub async fn member_ids(pool: &PgPool, vault_id: Uuid) -> Result<Vec<Uuid>, sqlx::Error> {
+pub async fn member_ids<'e, E>(executor: E, vault_id: Uuid) -> Result<Vec<Uuid>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let rows = sqlx::query!(
         "SELECT user_id FROM vault_members WHERE vault_id = $1",
         vault_id,
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     Ok(rows.into_iter().map(|r| r.user_id).collect())
 }

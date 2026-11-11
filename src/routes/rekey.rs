@@ -245,8 +245,22 @@ pub async fn rekey(
         }
     }
 
+    // ── Lock, then validate against what will still be there at commit ───────
+    //
+    // ⚠️ C4. The transaction opens BEFORE the version set is read, and takes the
+    // vault row `FOR UPDATE` first. That waits for every push in flight and
+    // holds new ones off until commit (a push holds the row `FOR KEY SHARE`;
+    // see `db::locks` for the order and the reasoning). Reading the set on the
+    // pool and writing in a later transaction left a window in which a push
+    // landed a version on the OLD key — one the revoked member still holds. Under
+    // the lock the set cannot change between this read and the commit.
+    let mut tx = state.db.begin().await.map_err(AppError::Database)?;
+    if !crate::db::locks::lock_vault_exclusive(&mut tx, vault_id).await? {
+        return Err(AppError::NotFound);
+    }
+
     // ── Every version, exactly once ──────────────────────────────────────────
-    let existing: HashSet<i32> = versions::all_version_nums(&state.db, vault_id)
+    let existing: HashSet<i32> = versions::all_version_nums(&mut *tx, vault_id)
         .await?
         .into_iter()
         .collect();
@@ -267,7 +281,7 @@ pub async fn rekey(
     }
 
     // ── Every remaining member, exactly once ─────────────────────────────────
-    let mut remaining: HashSet<Uuid> = members::member_ids(&state.db, vault_id)
+    let mut remaining: HashSet<Uuid> = members::member_ids(&mut *tx, vault_id)
         .await?
         .into_iter()
         .collect();
@@ -309,8 +323,6 @@ pub async fn rekey(
         .collect::<Result<_, _>>()?;
 
     // ── Commit ───────────────────────────────────────────────────────────────
-    let mut tx = state.db.begin().await.map_err(AppError::Database)?;
-
     for v in &req.versions {
         if !versions::repoint_blob(
             &mut *tx,
