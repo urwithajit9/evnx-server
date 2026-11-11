@@ -10162,3 +10162,53 @@ async fn c4_a_rekey_waits_for_an_in_flight_push_and_then_sees_its_version() {
     .unwrap();
     assert_eq!(rekeyed, 0, "a refused re-key repointed a version");
 }
+
+/// Adding a member during a re-key waits for it. The re-key's `FOR UPDATE` on
+/// the vault row is stood in for by a transaction holding the same lock.
+#[tokio::test]
+async fn c4_adding_a_member_waits_for_a_rekey_in_flight() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &owner_jwt).await;
+    let email = unique_email("c4-add");
+    server
+        .post("/api/v1/auth/register")
+        .json(&register_payload(&email))
+        .await
+        .assert_status(StatusCode::CREATED);
+    let pool = c4_pool().await;
+
+    let mut tx = pool.begin().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert!(
+        evnx_server::db::locks::lock_vault_exclusive(&mut tx, vault_id)
+            .await
+            .unwrap()
+    );
+
+    let released = AtomicBool::new(false);
+    let add = async {
+        let resp = bearer(
+            server.post(&format!("/api/v1/vaults/{vault_id}/members")),
+            &owner_jwt,
+        )
+        .json(&share_payload(&email))
+        .await;
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the member was added while the re-key's lock was held"
+        );
+        resp
+    };
+    let release = async {
+        c4_wait_blocked_by(&pool, pid).await;
+        released.store(true, Ordering::SeqCst);
+        tx.commit().await.unwrap();
+    };
+    let (resp, ()) = tokio::join!(add, release);
+    resp.assert_status(StatusCode::CREATED);
+}

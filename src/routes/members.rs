@@ -93,8 +93,17 @@ pub async fn add_member(
         )));
     }
 
+    // C4: vault row `FOR KEY SHARE` first, in the write's own transaction, so an
+    // add arriving during a re-key waits for it (the re-key holds the row `FOR
+    // UPDATE`) instead of landing a member on the old key after the re-key has
+    // already decided who to re-wrap for. Same order as push and remove; see
+    // `db::locks`.
+    let mut tx = state.db.begin().await?;
+    if !crate::db::locks::lock_vault_shared(&mut tx, vault_id).await? {
+        return Err(AppError::NotFound);
+    }
     let added = members::add_member(
-        &state.db,
+        &mut *tx,
         vault_id,
         target.id,
         granted.as_str(),
@@ -108,6 +117,7 @@ pub async fn add_member(
         requester_id,
     )
     .await?;
+    tx.commit().await?;
 
     // ⚠️ Sharing never rewrites a membership (I-313, I-314, DEC-VL3).
     //
