@@ -144,13 +144,22 @@ pub async fn remove_member(
     vault_id: Uuid,
     user_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
+    // C4: same order as `set_role` — vault row `FOR KEY SHARE`, then the DELETE's
+    // own exclusive lock on the membership row, which waits for an in-flight push
+    // by that member (it holds the row `FOR SHARE`). Once this commits, no push
+    // by them can; see `db::locks`.
+    let mut tx = pool.begin().await?;
+    if !super::locks::lock_vault_shared(&mut tx, vault_id).await? {
+        return Ok(false);
+    }
     let r = sqlx::query!(
         "DELETE FROM vault_members WHERE vault_id = $1 AND user_id = $2",
         vault_id,
         user_id,
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(r.rows_affected() > 0)
 }
 
@@ -214,24 +223,37 @@ pub async fn set_role(
     user_id: Uuid,
     role: &str,
 ) -> Result<bool, sqlx::Error> {
+    // C4: vault row first (`FOR KEY SHARE`, so a re-key in flight is waited for
+    // and not raced), then the UPDATE takes the membership row exclusively. A
+    // push holds that row `FOR SHARE` until it commits, so this waits for it; a
+    // push that begins afterwards re-reads the role and is refused if it fell
+    // below developer. See `db::locks` for the order.
+    let mut tx = pool.begin().await?;
+    if !super::locks::lock_vault_shared(&mut tx, vault_id).await? {
+        return Ok(false);
+    }
     let r = sqlx::query!(
         "UPDATE vault_members SET role = $3 WHERE vault_id = $1 AND user_id = $2",
         vault_id,
         user_id,
         role,
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(r.rows_affected() > 0)
 }
 
 /// Every member's id and role, for validating a re-key covers them all.
-pub async fn member_ids(pool: &PgPool, vault_id: Uuid) -> Result<Vec<Uuid>, sqlx::Error> {
+pub async fn member_ids<'e, E>(executor: E, vault_id: Uuid) -> Result<Vec<Uuid>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let rows = sqlx::query!(
         "SELECT user_id FROM vault_members WHERE vault_id = $1",
         vault_id,
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     Ok(rows.into_iter().map(|r| r.user_id).collect())
 }
