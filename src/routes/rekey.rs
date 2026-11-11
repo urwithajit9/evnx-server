@@ -201,6 +201,29 @@ pub struct RekeyRequest {
     pub remove_user_id: Option<Uuid>,
 }
 
+/// Whether `caller` may remove a member currently holding `stored_role`: never
+/// the owner, and only someone they outrank — the same rule as `remove_member`,
+/// which is what stops two admins evicting each other.
+fn check_removable(
+    caller: crate::middleware::vault_role::Role,
+    stored_role: &str,
+) -> Result<(), AppError> {
+    use crate::middleware::vault_role::Role;
+    let their_role = Role::parse(stored_role)
+        .ok_or_else(|| AppError::Internal(format!("unrecognised vault role: {stored_role:?}")))?;
+    if their_role == Role::Owner {
+        return Err(AppError::Conflict(
+            "the vault owner cannot be removed. Transfer ownership first — \
+             which is not built yet."
+                .into(),
+        ));
+    }
+    if caller <= their_role {
+        return Err(AppError::Forbidden);
+    }
+    Ok(())
+}
+
 /// Rotate a vault's key: repoint every version and re-wrap for every member.
 ///
 /// ⚠️ **Validated whole, then committed whole.** Every check below runs before
@@ -224,25 +247,15 @@ pub async fn rekey(
     let vault_id = access.vault_id;
 
     // ── Who is leaving, if anyone ────────────────────────────────────────────
+    //
+    // A cheap pre-check for a fast 4xx. It reads on the pool, so it can be stale;
+    // the same rules are enforced again under the lock below, which is the one
+    // that counts.
     if let Some(leaving) = req.remove_user_id {
         let stored = crate::db::vaults::find_member_role(&state.db, vault_id, leaving)
             .await?
             .ok_or(AppError::NotFound)?;
-        let their_role = crate::middleware::vault_role::Role::parse(&stored)
-            .ok_or_else(|| AppError::Internal(format!("unrecognised vault role: {stored:?}")))?;
-
-        if their_role == crate::middleware::vault_role::Role::Owner {
-            return Err(AppError::Conflict(
-                "the vault owner cannot be removed. Transfer ownership first — \
-                 which is not built yet."
-                    .into(),
-            ));
-        }
-        // Same rule as `remove_member`: removing someone requires outranking
-        // them, which is what stops two admins evicting each other.
-        if !access.outranks(their_role) {
-            return Err(AppError::Forbidden);
-        }
+        check_removable(access.role, &stored)?;
     }
 
     // ── Lock, then validate against what will still be there at commit ───────
@@ -257,6 +270,30 @@ pub async fn rekey(
     let mut tx = state.db.begin().await.map_err(AppError::Database)?;
     if !crate::db::locks::lock_vault_exclusive(&mut tx, vault_id).await? {
         return Err(AppError::NotFound);
+    }
+
+    // ── Who is leaving, again, under the lock ────────────────────────────────
+    //
+    // Roles can change between the pre-check and here (a promotion of the leaver
+    // to owner-adjacent rank, a downgrade of the caller). Re-read both rows now;
+    // `FOR SHARE` keeps them as read until commit.
+    if let Some(leaving) = req.remove_user_id {
+        use crate::middleware::vault_role::{MinRole, Role};
+        let caller_stored = crate::db::locks::lock_member_shared(&mut tx, vault_id, access.user_id)
+            .await?
+            .ok_or(AppError::Forbidden)?;
+        let caller_role = Role::parse(&caller_stored).ok_or_else(|| {
+            AppError::Internal(format!("unrecognised vault role: {caller_stored:?}"))
+        })?;
+        if caller_role < AtLeastAdmin::MIN {
+            return Err(AppError::Refused(crate::errors::Refusal::RoleTooLow {
+                required: AtLeastAdmin::MIN.as_str(),
+            }));
+        }
+        let stored = crate::db::locks::lock_member_shared(&mut tx, vault_id, leaving)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        check_removable(caller_role, &stored)?;
     }
 
     // ── Every version, exactly once ──────────────────────────────────────────

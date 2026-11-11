@@ -10212,3 +10212,60 @@ async fn c4_adding_a_member_waits_for_a_rekey_in_flight() {
     let (resp, ()) = tokio::join!(add, release);
     resp.assert_status(StatusCode::CREATED);
 }
+
+/// The leaver's role is read under the lock. Here it changes to owner after the
+/// cheap pre-check has passed; the re-key must notice and refuse.
+#[tokio::test]
+async fn c4_a_rekey_rechecks_the_removed_members_role_under_the_lock() {
+    let server = test_app().await;
+    let (owner_id, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    let (dev_id, _dj) = member_at(&server, &jwt, vault_id, "developer").await;
+    push_versions(&server, &jwt, vault_id, 1).await;
+    let (blob_key, blob_hash, size) = stage(&server, &jwt, vault_id, 1).await;
+    let pool = c4_pool().await;
+
+    let mut tx = pool.begin().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE vault_members SET role = 'owner' WHERE vault_id = $1 AND user_id = $2")
+        .bind(vault_id)
+        .bind(dev_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    let rekey = async {
+        bearer(
+            server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+            &jwt,
+        )
+        .json(&serde_json::json!({
+            "versions": [{
+                "version_num": 1, "blob_key": blob_key,
+                "blob_hash": blob_hash, "blob_size_bytes": size,
+            }],
+            "members": [wrap_for(owner_id)],
+            "remove_user_id": dev_id,
+        }))
+        .await
+    };
+    let release = async {
+        c4_wait_blocked_by(&pool, pid).await;
+        tx.commit().await.unwrap();
+    };
+    let (resp, ()) = tokio::join!(rekey, release);
+
+    assert_eq!(resp.status_code(), StatusCode::CONFLICT);
+    let still: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vault_members WHERE vault_id = $1 AND user_id = $2",
+    )
+    .bind(vault_id)
+    .bind(dev_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(still, 1, "the owner was removed");
+}
