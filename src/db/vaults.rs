@@ -14,6 +14,7 @@ pub struct VaultRow {
 }
 
 /// A vault row joined with the requesting user's member info.
+#[derive(sqlx::FromRow)]
 pub struct VaultWithRole {
     pub id: Uuid,
     pub name: String,
@@ -22,6 +23,9 @@ pub struct VaultWithRole {
     pub role: String,
     pub version_count: i64,
     pub updated_at: chrono::DateTime<Utc>,
+    /// `pushed_at` of the newest version, or `None` when nothing was ever pushed.
+    /// Unlike `updated_at`, rename / member changes / rekey never move it.
+    pub last_pushed_at: Option<chrono::DateTime<Utc>>,
 }
 
 /// Insert a vault row.
@@ -60,23 +64,35 @@ pub async fn list_for_user(
     pool: &PgPool,
     user_id: Uuid,
 ) -> Result<Vec<VaultWithRole>, sqlx::Error> {
-    sqlx::query_as!(
-        VaultWithRole,
+    // Runtime query (not `query_as!`) so the `.sqlx` offline cache needs no
+    // regeneration. The LATERAL subquery reads the newest version through
+    // `idx_vault_versions_vault (vault_id, version_num DESC)`: one index probe per
+    // vault, no N+1. `version_num` rises with every push, so the newest number is
+    // the latest push.
+    sqlx::query_as::<_, VaultWithRole>(
         r#"
         SELECT
             v.id, v.name, v.environment, v.owner_id,
             vm.role,
-            COUNT(vv.id)::BIGINT AS "version_count!",
-            v.updated_at
+            COUNT(vv.id)::BIGINT AS version_count,
+            v.updated_at,
+            lp.pushed_at AS last_pushed_at
         FROM vaults v
         JOIN vault_members vm ON vm.vault_id = v.id AND vm.user_id = $1
         LEFT JOIN vault_versions vv ON vv.vault_id = v.id
+        LEFT JOIN LATERAL (
+            SELECT pushed_at
+            FROM vault_versions
+            WHERE vault_id = v.id
+            ORDER BY version_num DESC
+            LIMIT 1
+        ) lp ON TRUE
         WHERE v.deleted_at IS NULL
-        GROUP BY v.id, vm.role
+        GROUP BY v.id, vm.role, lp.pushed_at
         ORDER BY v.updated_at DESC
         "#,
-        user_id,
     )
+    .bind(user_id)
     .fetch_all(pool)
     .await
 }
