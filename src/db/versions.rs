@@ -36,20 +36,26 @@ pub struct CreateVersion {
     pub pushed_by: Uuid,
 }
 
-pub async fn get_latest_version_num(
-    pool: &PgPool,
+pub async fn get_latest_version_num<'e, E>(
+    executor: E,
     vault_id: Uuid,
-) -> Result<Option<i32>, sqlx::Error> {
+) -> Result<Option<i32>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let row = sqlx::query!(
         "SELECT MAX(version_num) AS max FROM vault_versions WHERE vault_id = $1",
         vault_id,
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
     Ok(row.max)
 }
 
-pub async fn create(pool: &PgPool, input: CreateVersion) -> Result<VersionRow, sqlx::Error> {
+pub async fn create<'e, E>(executor: E, input: CreateVersion) -> Result<VersionRow, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query_as!(
         VersionRow,
         r#"
@@ -68,7 +74,7 @@ pub async fn create(pool: &PgPool, input: CreateVersion) -> Result<VersionRow, s
         &input.key_names,
         input.pushed_by,
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
@@ -150,12 +156,15 @@ where
 }
 
 /// Every version number a vault currently has, ascending.
-pub async fn all_version_nums(pool: &PgPool, vault_id: Uuid) -> Result<Vec<i32>, sqlx::Error> {
+pub async fn all_version_nums<'e, E>(executor: E, vault_id: Uuid) -> Result<Vec<i32>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let rows = sqlx::query!(
         "SELECT version_num FROM vault_versions WHERE vault_id = $1 ORDER BY version_num ASC",
         vault_id,
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     Ok(rows.into_iter().map(|r| r.version_num).collect())
 }

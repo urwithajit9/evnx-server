@@ -1,4 +1,5 @@
 // src/db/mod.rs — stub
+pub mod locks;
 pub mod members;
 pub mod rotation;
 pub mod tokens;

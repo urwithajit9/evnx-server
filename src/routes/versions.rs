@@ -56,16 +56,17 @@ pub async fn push_version(
     // Before the blob is uploaded, so a refusal leaves no orphan in storage.
     crate::services::quota::check_version_limit(&state.db, &state.config.quotas, vault_id).await?;
 
-    // 2. Optimistic locking: check base_version matches current latest
+    // 2. Optimistic locking: check base_version matches current latest.
+    //
+    // This is an early, lock-free refusal so a stale push fails before its blob
+    // is uploaded. It is NOT the guarantee — the same check is repeated inside
+    // the transaction below, where nothing can move underneath it.
     let current_version = versions::get_latest_version_num(&state.db, vault_id).await?;
     let current_num = current_version.unwrap_or(0);
 
     if let Some(base) = req.base_version {
         if base != current_num {
-            return Err(AppError::Conflict(format!(
-                "Remote is at version {}. Pull latest before pushing (you based on {}).",
-                current_num, base
-            )));
+            return Err(stale_push(current_num, base));
         }
     }
 
@@ -92,17 +93,22 @@ pub async fn push_version(
     let blob_bytes = Bytes::from(blob);
     let blob_size = blob_bytes.len() as i32;
 
-    // 4. Upload to S3
+    // 4. Upload to storage — OUTSIDE any transaction, so no network IO happens
+    // while a lock is held. The key ends in a fresh UUID, so an upload that ends
+    // up unreferenced is an orphan, never an overwrite.
     let blob_key = crate::services::storage::StorageService::blob_key(vault_id, new_version_num);
     state.storage.upload_blob(&blob_key, blob_bytes).await?;
 
-    // 5. Insert version record in DB
-    let version = versions::create(
+    // 5. Insert version record in DB, under the C4 locks.
+    let inserted = commit_version(
         &state.db,
+        user_id,
+        current_num,
+        req.base_version,
         versions::CreateVersion {
             vault_id,
             version_num: new_version_num,
-            blob_key,
+            blob_key: blob_key.clone(),
             blob_size_bytes: blob_size,
             blob_hash: req.blob_hash,
             key_count: req.key_count,
@@ -110,7 +116,22 @@ pub async fn push_version(
             pushed_by: user_id,
         },
     )
-    .await?;
+    .await;
+
+    let version = match inserted {
+        Ok(v) => v,
+        Err(e) => {
+            // The blob is referenced by nothing. Best effort: a failed delete is
+            // an orphan object, which is what an abandoned re-key leaves too.
+            if let Err(del) = state.storage.delete_blob(&blob_key).await {
+                tracing::warn!(
+                    %vault_id, blob_key = %blob_key, error = %del,
+                    "push refused after upload; could not delete the orphan blob"
+                );
+            }
+            return Err(e);
+        }
+    };
 
     // 6. Record audit event (fire-and-forget — don't block response)
     tokio::spawn({
@@ -140,6 +161,89 @@ pub async fn push_version(
             pushed_at: version.pushed_at,
         }),
     ))
+}
+
+/// The 409 for a push that was based on a version the vault has moved past.
+/// The CLI appends "pull first" guidance to this message, so keep it a plain
+/// statement of where the remote is.
+fn stale_push(remote_at: i32, based_on: i32) -> AppError {
+    AppError::Conflict(format!(
+        "Remote is at version {remote_at}. Pull latest before pushing (you based on {based_on})."
+    ))
+}
+
+/// Re-check the caller's role and insert the version, in one transaction.
+///
+/// ⚠️ **Lock order: vault row, then the caller's membership row** — see
+/// [`crate::db::locks`] for the table and the reasoning. The extractor's role
+/// check ran on its own connection, before the upload; it can be stale by the
+/// time we get here, which is the C4 hole. Holding the membership row `FOR
+/// SHARE` until commit makes a concurrent removal or downgrade wait for this
+/// push, and makes a push that starts afterwards see it.
+///
+/// `expected_latest` is what the pre-upload read saw. The blob key was named for
+/// `expected_latest + 1`, so if the vault has moved on the push is stale
+/// whether or not the client sent a `base_version`: 409, not a renumbered
+/// version that disagrees with its own blob key.
+async fn commit_version(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    expected_latest: i32,
+    base_version: Option<i32>,
+    input: versions::CreateVersion,
+) -> Result<versions::VersionRow, AppError> {
+    use crate::db::locks;
+    use crate::middleware::vault_role::{MinRole, Role};
+
+    let vault_id = input.vault_id;
+    let mut tx = db.begin().await?;
+
+    if !locks::lock_vault_shared(&mut tx, vault_id).await? {
+        return Err(AppError::NotFound);
+    }
+
+    // 403 with the extractor's own refusal. A member removed in the meantime is
+    // also a 403 rather than the extractor's 404: they were a member when the
+    // request was admitted, so the vault's existence is no secret from them.
+    let refused = || {
+        AppError::Refused(crate::errors::Refusal::RoleTooLow {
+            required: AtLeastDeveloper::MIN.as_str(),
+        })
+    };
+    let stored = locks::lock_member_shared(&mut tx, vault_id, user_id)
+        .await?
+        .ok_or_else(refused)?;
+    let role = Role::parse(&stored).ok_or_else(|| {
+        AppError::Internal(format!(
+            "unrecognised vault role in the database: {stored:?}"
+        ))
+    })?;
+    if role < AtLeastDeveloper::MIN {
+        return Err(refused());
+    }
+
+    let latest = versions::get_latest_version_num(&mut *tx, vault_id)
+        .await?
+        .unwrap_or(0);
+    if latest != expected_latest {
+        return Err(stale_push(latest, base_version.unwrap_or(expected_latest)));
+    }
+
+    let version = match versions::create(&mut *tx, input).await {
+        Ok(v) => v,
+        // Two pushes read the same latest under shared locks; the second INSERT
+        // waits on the first's index entry and fails here once it commits.
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            return Err(stale_push(
+                expected_latest + 1,
+                base_version.unwrap_or(expected_latest),
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    tx.commit().await?;
+    Ok(version)
 }
 
 // ─── Get Latest Version Metadata ──────────────────────────────────────────────
