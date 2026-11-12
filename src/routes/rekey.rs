@@ -503,6 +503,23 @@ pub async fn rekey(
         }),
     );
 
+    // ── The blobs the swap replaced ──────────────────────────────────────────
+    //
+    // After the commit, never before: until it lands the old blobs are what the
+    // vault opens with. Best effort — a failed delete leaves an unreferenced
+    // object, which `evnx-server sweep-blobs` finds later, and must not turn a
+    // rotation that succeeded into an error.
+    for v in &req.versions {
+        if let Some(old_key) = current_keys.get(&v.version_num) {
+            if let Err(e) = state.storage.delete_blob(old_key).await {
+                tracing::warn!(
+                    %vault_id, version = v.version_num, blob_key = %old_key, error = %e,
+                    "re-key committed; could not delete the replaced blob"
+                );
+            }
+        }
+    }
+
     Ok(Json(serde_json::json!({
         "versions_rekeyed": req.versions.len(),
         "members_rewrapped": req.members.len(),

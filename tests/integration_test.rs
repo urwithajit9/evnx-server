@@ -3802,6 +3802,203 @@ async fn a_rekey_swap_checks_the_blobs_it_is_told_to_use() {
     assert_eq!(db_blob_key(vault_id, 2).await, k2);
 }
 
+async fn test_storage() -> evnx_server::services::storage::StorageService {
+    evnx_server::services::storage::StorageService::from_config(&test_config().await).unwrap()
+}
+
+async fn test_pool() -> sqlx::PgPool {
+    sqlx::PgPool::connect(&test_config().await.database_url)
+        .await
+        .unwrap()
+}
+
+/// After a re-key commits the replaced blobs are gone and the new ones stay.
+#[tokio::test]
+async fn a_rekey_deletes_the_blobs_it_replaced() {
+    let server = test_app().await;
+    let storage = test_storage().await;
+    let (owner_id, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    push_versions(&server, &jwt, vault_id, 2).await;
+
+    let old = [
+        db_blob_key(vault_id, 1).await,
+        db_blob_key(vault_id, 2).await,
+    ];
+    for k in &old {
+        assert!(storage.blob_exists(k).await.unwrap(), "setup: {k}");
+    }
+
+    let mut versions = Vec::new();
+    for v in 1..=2 {
+        let (blob_key, blob_hash, size) = stage(&server, &jwt, vault_id, v).await;
+        versions.push(serde_json::json!({
+            "version_num": v, "blob_key": blob_key,
+            "blob_hash": blob_hash, "blob_size_bytes": size,
+        }));
+    }
+
+    // A refused swap deletes nothing: the old blobs are still what the vault
+    // opens with.
+    let refused = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &jwt,
+    )
+    .json(&serde_json::json!({ "versions": versions, "members": [] }))
+    .await;
+    assert_eq!(refused.status_code(), StatusCode::CONFLICT);
+    for k in &old {
+        assert!(
+            storage.blob_exists(k).await.unwrap(),
+            "{k} deleted by a refused swap"
+        );
+    }
+
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &jwt,
+    )
+    .json(&serde_json::json!({ "versions": versions, "members": [wrap_for(owner_id)] }))
+    .await
+    .assert_status_ok();
+
+    for k in &old {
+        assert!(
+            !storage.blob_exists(k).await.unwrap(),
+            "{k} survived the re-key"
+        );
+    }
+    for v in 1..=2 {
+        let now = db_blob_key(vault_id, v).await;
+        assert!(
+            storage.blob_exists(&now).await.unwrap(),
+            "new blob {now} missing"
+        );
+    }
+
+    // The vault still serves its versions from the new blobs.
+    let resp = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/versions/2/blob")),
+        &jwt,
+    )
+    .await;
+    resp.assert_status_ok();
+}
+
+/// The orphan finder lists unreferenced, old-enough objects, never a
+/// referenced one or a young one, and deleting is idempotent.
+#[tokio::test]
+async fn the_orphan_sweep_finds_only_unreferenced_old_objects() {
+    use evnx_server::services::blob_sweep::{delete_all, find_orphans};
+    let server = test_app().await;
+    let storage = test_storage().await;
+    let db = test_pool().await;
+    let (_owner, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    push_versions(&server, &jwt, vault_id, 1).await;
+    let referenced = db_blob_key(vault_id, 1).await;
+
+    // An object nothing points to, shaped like the server's own keys.
+    let orphan = evnx_server::services::storage::StorageService::blob_key(vault_id, 7);
+    storage
+        .upload_blob(&orphan, bytes::Bytes::from_static(b"stray"))
+        .await
+        .unwrap();
+    // A stray file that is not a blob key at all.
+    let stray = format!("vaults/{vault_id}/README.txt");
+    storage
+        .upload_blob(&stray, bytes::Bytes::from_static(b"hi"))
+        .await
+        .unwrap();
+
+    // Everything is "too new" for a 24 hour minimum.
+    let young = find_orphans(&db, &storage, chrono::Duration::hours(24))
+        .await
+        .unwrap();
+    assert!(
+        !young.orphans.contains(&orphan),
+        "a young object was offered"
+    );
+
+    // With no minimum it is offered; the referenced blob and the stray file
+    // never are.
+    let report = find_orphans(&db, &storage, chrono::Duration::zero())
+        .await
+        .unwrap();
+    assert!(report.orphans.contains(&orphan));
+    assert!(!report.orphans.contains(&referenced));
+    assert!(!report.orphans.contains(&stray));
+    assert!(report.unrecognised >= 1);
+    assert!(report.referenced >= 1);
+
+    // Delete only our own object: other tests are running against this storage.
+    let (deleted, failed) = delete_all(&storage, std::slice::from_ref(&orphan)).await;
+    assert_eq!((deleted, failed.len()), (1, 0));
+    assert!(!storage.blob_exists(&orphan).await.unwrap());
+    assert!(storage.blob_exists(&referenced).await.unwrap());
+    assert!(storage.blob_exists(&stray).await.unwrap());
+
+    // Again, with the object already gone: still fine.
+    let (_, failed) = delete_all(&storage, std::slice::from_ref(&orphan)).await;
+    assert!(failed.is_empty());
+    let again = find_orphans(&db, &storage, chrono::Duration::zero())
+        .await
+        .unwrap();
+    assert!(!again.orphans.contains(&orphan));
+
+    storage.delete_blob(&stray).await.unwrap();
+}
+
+/// The command is a dry run unless told otherwise, and rejects what it does not
+/// understand.
+#[tokio::test]
+async fn the_sweep_command_defaults_to_a_dry_run() {
+    use evnx_server::services::blob_sweep::run_command;
+    let storage = test_storage().await;
+    let db = test_pool().await;
+    let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    let orphan = evnx_server::services::storage::StorageService::blob_key(Uuid::new_v4(), 1);
+    storage
+        .upload_blob(&orphan, bytes::Bytes::from_static(b"stray"))
+        .await
+        .unwrap();
+
+    // Dry run with no minimum age: lists it, deletes nothing.
+    assert_eq!(
+        run_command(&db, &storage, &args(&["--min-age-hours", "0"])).await,
+        0
+    );
+    assert!(
+        storage.blob_exists(&orphan).await.unwrap(),
+        "a dry run deleted"
+    );
+
+    // --apply with a minimum no object can meet deletes nothing either.
+    assert_eq!(
+        run_command(
+            &db,
+            &storage,
+            &args(&["--apply", "--min-age-hours", "100000"])
+        )
+        .await,
+        0
+    );
+    assert!(storage.blob_exists(&orphan).await.unwrap());
+
+    assert_eq!(run_command(&db, &storage, &args(&["--wat"])).await, 2);
+    assert_eq!(
+        run_command(&db, &storage, &args(&["--min-age-hours"])).await,
+        2
+    );
+    assert_eq!(
+        run_command(&db, &storage, &args(&["--min-age-hours", "-3"])).await,
+        2
+    );
+
+    storage.delete_blob(&orphan).await.unwrap();
+}
+
 /// A hybrid wrap — what you produce for somebody else from their public keys.
 fn wrap_for(user_id: Uuid) -> serde_json::Value {
     serde_json::json!({

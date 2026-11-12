@@ -1,5 +1,6 @@
 // src/services/mod.rs — stub
 pub mod audit;
+pub mod blob_sweep;
 pub mod cache;
 pub mod email;
 pub mod jwt;

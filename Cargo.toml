@@ -107,6 +107,9 @@ base32 = "0.5.1"
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
 
+# Streaming a storage listing (already in the lockfile through object_store).
+futures-util = "0.3"
+
 [dev-dependencies]
 # Testing HTTP endpoints without running a real server
 axum-test = "14"

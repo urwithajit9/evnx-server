@@ -921,6 +921,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "evnx-crypto",
+ "futures-util",
  "headers",
  "hex",
  "hkdf",

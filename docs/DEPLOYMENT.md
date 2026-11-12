@@ -598,6 +598,30 @@ for you — check before rolling back across one.
 
 ---
 
+## 10. Housekeeping: unreferenced blobs
+
+A re-key deletes the blobs it replaced once it has committed. If that delete
+fails the object stays behind, as does a blob from a push that failed after its
+upload, or a re-key that was staged and never swapped. Nothing reads them, but
+they hold ciphertext, so they are worth clearing now and then.
+
+```bash
+# Lists what would be deleted. Changes nothing.
+docker compose -f docker/docker-compose.prod.yml --env-file .env.prod \
+  exec server evnx-server sweep-blobs
+
+# Deletes it.
+docker compose -f docker/docker-compose.prod.yml --env-file .env.prod \
+  exec server evnx-server sweep-blobs --apply
+```
+
+It lists the storage bucket, then the `vault_versions` table, and offers objects
+under `vaults/` that no row points to. Objects younger than 24 hours are left
+alone, because a push in flight or a staged re-key looks the same as an orphan;
+`--min-age-hours N` changes that. Anything under `vaults/` that is not shaped
+like a blob key is counted and never touched. Running it again after `--apply`
+finds nothing.
+
 ## Troubleshooting
 
 | Symptom | Cause |

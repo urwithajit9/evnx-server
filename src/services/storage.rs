@@ -167,16 +167,43 @@ impl StorageService {
         }
     }
 
-    pub async fn delete_blob(&self, key: &str) -> Result<(), StorageError> {
+    /// Every object under `vaults/`, with when it was last written.
+    ///
+    /// Reads the whole listing into memory; one entry per stored blob.
+    pub async fn list_blobs(&self) -> Result<Vec<StoredObject>, StorageError> {
+        use futures_util::TryStreamExt;
         self.store
-            .delete(&ObjectPath::from(key))
+            .list(Some(&ObjectPath::from("vaults")))
+            .map_ok(|m| StoredObject {
+                key: m.location.to_string(),
+                last_modified: m.last_modified,
+            })
+            .try_collect()
             .await
-            .map_err(|e| StorageError::Delete(e.to_string()))
+            .map_err(|e| StorageError::List(e.to_string()))
     }
+
+    /// Delete an object. One that is already gone counts as deleted, as it does
+    /// on S3, so a repeated or racing delete is not an error on any backend.
+    pub async fn delete_blob(&self, key: &str) -> Result<(), StorageError> {
+        match self.store.delete(&ObjectPath::from(key)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(StorageError::Delete(e.to_string())),
+        }
+    }
+}
+
+/// One entry of a storage listing.
+#[derive(Debug, Clone)]
+pub struct StoredObject {
+    pub key: String,
+    pub last_modified: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    #[error("Listing failed: {0}")]
+    List(String),
     #[error("Upload failed: {0}")]
     Upload(String),
     #[error("Download failed: {0}")]
