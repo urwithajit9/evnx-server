@@ -209,6 +209,33 @@ async fn auth_me_accepts_a_user_jwt() {
 }
 
 #[tokio::test]
+async fn auth_me_refuses_a_vault_scoped_api_token() {
+    // /auth/me returns the sealed key material, which only a signed-in session
+    // should be able to read.
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+    let raw = create_api_token(&server, &jwt, "read", Some(vault)).await;
+
+    let resp = bearer(server.get("/api/v1/auth/me"), &raw).await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+    let body = resp.json::<serde_json::Value>();
+    assert_eq!(body["code"], "FORBIDDEN");
+    assert!(body.get("encrypted_private_key").is_none());
+    assert!(body.get("argon2_salt").is_none());
+}
+
+#[tokio::test]
+async fn auth_me_refuses_an_unscoped_api_token() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let raw = create_api_token(&server, &jwt, "read_write", None).await;
+
+    let resp = bearer(server.get("/api/v1/auth/me"), &raw).await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn unverified_email_cannot_reach_vault_routes() {
     let server = test_app().await;
     let user_id = register_user(&server).await;
@@ -262,9 +289,9 @@ async fn api_token_cannot_reach_account_management() {
         .await;
     assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
 
-    // /auth/me allows API tokens by design, so an unknown one is 401, not 403.
+    // /auth/me returns key material and is a session-only route like the rest.
     let resp = bearer(server.get("/api/v1/auth/me"), &fake).await;
-    assert_eq!(resp.status_code(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

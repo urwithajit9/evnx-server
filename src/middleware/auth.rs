@@ -217,9 +217,8 @@ async fn authenticate(
 /// Does **not** require a verified email, and does **not** enforce token scope —
 /// only use it on routes where a token's vault scope is irrelevant.
 ///
-/// Used by `GET /auth/me` (the CLI must fetch its encrypted private key straight
-/// after registration, before the verification email is clicked) and by
-/// `GET /users/{email}/public-key`.
+/// Used by `GET /users/{email}/public-key`, which returns nothing secret.
+/// `GET /auth/me` returns key material and uses [`require_user_session`].
 pub async fn require_auth(
     State(state): State<AppState>,
     mut req: Request,
@@ -236,7 +235,8 @@ pub async fn require_auth(
 
 /// A real user session only — no API tokens, no half-authenticated tokens.
 ///
-/// Use for account management (`/auth/logout`, `/auth/totp/*`, `/auth/tokens`).
+/// Use for account management (`/auth/logout`, `/auth/totp/*`, `/auth/tokens`)
+/// and for `/auth/me`, which returns the sealed key material.
 /// A CI token that could reach these would be able to enrol its own authenticator
 /// on the account, revoke the owner's sessions, or mint fresh tokens for itself.
 pub async fn require_user_session(
