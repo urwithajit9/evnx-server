@@ -373,7 +373,13 @@ pub async fn check_token_limit(
     Ok(())
 }
 
-/// Refuse a push that would exceed the plan's version history.
+/// A vault's version limit, resolved from its owner's plan by [`version_cap`].
+pub struct VersionCap {
+    plan: Plan,
+    limit: Option<u32>,
+}
+
+/// The version-history limit for a push.
 ///
 /// ⚠️ **Refuses rather than pruning, and that is a deliberate choice worth revisiting.**
 /// Pruning the oldest version is what most services do for a history limit and is
@@ -392,11 +398,16 @@ pub async fn check_token_limit(
 /// the pusher would mean a free-tier developer could not contribute to an enterprise
 /// team's vault, and a free-tier owner could raise their own limit by inviting
 /// someone on a bigger plan.
-pub async fn check_version_limit(
+///
+/// Resolves the limit only; [`VersionCap::check`] and [`check_version_limit_in_tx`]
+/// apply it to a count. The two are split so a push can resolve the plan before it
+/// opens its transaction, which must not wait on a second connection, and count
+/// inside the transaction, where the answer is the one that holds at commit.
+pub async fn version_cap(
     db: &sqlx::PgPool,
     quotas: &Quotas,
     vault_id: uuid::Uuid,
-) -> Result<(), AppError> {
+) -> Result<VersionCap, AppError> {
     let owner_id: Option<uuid::Uuid> =
         sqlx::query_scalar("SELECT owner_id FROM vaults WHERE id = $1 AND deleted_at IS NULL")
             .bind(vault_id)
@@ -405,29 +416,56 @@ pub async fn check_version_limit(
     let owner_id = owner_id.ok_or(AppError::NotFound)?;
 
     let plan = plan_for(db, owner_id).await?;
-    let Some(limit) = quotas.for_plan(plan).versions_per_vault else {
+    Ok(VersionCap {
+        plan,
+        limit: quotas.for_plan(plan).versions_per_vault,
+    })
+}
+
+impl VersionCap {
+    /// Refuse when `count` versions already fill the limit.
+    pub fn check(&self, count: i64) -> Result<(), AppError> {
+        let Some(limit) = self.limit else {
+            return Ok(());
+        };
+        if count >= i64::from(limit) {
+            return Err(exceeded(
+                "versions per vault",
+                limit,
+                self.plan,
+                // ⚠️ This used to say "Delete older versions of this vault to make room"
+                // when there was no way to delete a version — no endpoint, no command. An
+                // error that advises an impossible action is worse than one admitting there
+                // is nothing to be done, because it sends people looking for a door that is
+                // not there. Both now exist; keep this sentence and that fact together.
+                "Delete an older version to make room: `evnx cloud history` lists them and \
+                 `evnx cloud delete-version` removes one. The latest cannot be deleted.",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The version count for a push's own transaction.
+///
+/// Call it **after** the vault and membership locks and **before** the insert.
+/// A count taken earlier, on the pool, can be out of date by the time the row is
+/// written; this one is taken while the push holds the locks that order it
+/// against other writers to the vault, so what it refuses on is what the insert
+/// would have added to.
+pub async fn check_version_limit_in_tx(
+    conn: &mut sqlx::PgConnection,
+    cap: &VersionCap,
+    vault_id: uuid::Uuid,
+) -> Result<(), AppError> {
+    if cap.limit.is_none() {
         return Ok(());
-    };
+    }
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vault_versions WHERE vault_id = $1")
         .bind(vault_id)
-        .fetch_one(db)
+        .fetch_one(conn)
         .await?;
-
-    if count >= i64::from(limit) {
-        return Err(exceeded(
-            "versions per vault",
-            limit,
-            plan,
-            // ⚠️ This used to say "Delete older versions of this vault to make room"
-            // when there was no way to delete a version — no endpoint, no command. An
-            // error that advises an impossible action is worse than one admitting there
-            // is nothing to be done, because it sends people looking for a door that is
-            // not there. Both now exist; keep this sentence and that fact together.
-            "Delete an older version to make room: `evnx cloud history` lists them and \
-             `evnx cloud delete-version` removes one. The latest cannot be deleted.",
-        ));
-    }
-    Ok(())
+    cap.check(count)
 }
 
 #[cfg(test)]

@@ -53,8 +53,13 @@ pub async fn push_version(
         vault_id, user_id, ..
     } = access;
 
-    // Before the blob is uploaded, so a refusal leaves no orphan in storage.
-    crate::services::quota::check_version_limit(&state.db, &state.config.quotas, vault_id).await?;
+    // Before the blob is uploaded, so an obvious refusal leaves no orphan in
+    // storage. Like the stale-base check below this is an early, lock-free
+    // refusal and not the guarantee: the count is taken again inside the
+    // transaction, under the locks, and that is the one that holds.
+    let cap =
+        crate::services::quota::version_cap(&state.db, &state.config.quotas, vault_id).await?;
+    cap.check(versions::count(&state.db, vault_id).await?)?;
 
     // 2. Optimistic locking: check base_version matches current latest.
     //
@@ -104,6 +109,7 @@ pub async fn push_version(
     let inserted = commit_version(
         &state.db,
         user_id,
+        &cap,
         current_num,
         req.base_version,
         versions::CreateVersion {
@@ -182,6 +188,9 @@ fn stale_push(remote_at: i32, based_on: i32) -> AppError {
 /// SHARE` until commit makes a concurrent removal or downgrade wait for this
 /// push, and makes a push that starts afterwards see it.
 ///
+/// The version limit is counted after those locks and before the insert, so two
+/// writers cannot each count under the limit and both add a row past it.
+///
 /// `expected_latest` is what the pre-upload read saw. The blob key was named for
 /// `expected_latest + 1`, so if the vault has moved on the push is stale
 /// whether or not the client sent a `base_version`: 409, not a renumbered
@@ -189,6 +198,7 @@ fn stale_push(remote_at: i32, based_on: i32) -> AppError {
 async fn commit_version(
     db: &sqlx::PgPool,
     user_id: Uuid,
+    cap: &crate::services::quota::VersionCap,
     expected_latest: i32,
     base_version: Option<i32>,
     input: versions::CreateVersion,
@@ -229,6 +239,10 @@ async fn commit_version(
     if latest != expected_latest {
         return Err(stale_push(latest, base_version.unwrap_or(expected_latest)));
     }
+
+    // The plan's version limit, counted here so that it is the number that
+    // holds when the row goes in. The answer is the same 403 as the early check.
+    crate::services::quota::check_version_limit_in_tx(&mut tx, cap, vault_id).await?;
 
     let version = match versions::create(&mut *tx, input).await {
         Ok(v) => v,

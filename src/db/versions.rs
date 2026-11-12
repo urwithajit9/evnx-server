@@ -218,3 +218,14 @@ where
     .fetch_all(executor)
     .await
 }
+
+/// How many versions a vault holds.
+pub async fn count<'e, E>(executor: E, vault_id: Uuid) -> Result<i64, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar("SELECT COUNT(*) FROM vault_versions WHERE vault_id = $1")
+        .bind(vault_id)
+        .fetch_one(executor)
+        .await
+}

@@ -10686,6 +10686,93 @@ async fn c4_push_loses_to_a_revocation(downgrade: bool) {
     );
 }
 
+/// The version limit is counted under the push's locks, not before them.
+///
+/// Free plan, limit L: the vault holds L-1 versions with the newest numbered L,
+/// so the push passes the early count and is based on the real latest. While it
+/// waits at its membership lock, another writer adds the missing version (a gap
+/// below the latest, so `latest` does not move and the stale-base check cannot
+/// help). The push must be refused with the plan-limit 403 and add nothing.
+#[tokio::test]
+async fn c4_a_push_is_counted_against_the_version_limit_after_its_locks() {
+    let server = test_app().await;
+    let limit = test_config()
+        .await
+        .quotas
+        .free
+        .versions_per_vault
+        .expect("test: the free plan has a version limit") as i32;
+    assert!(limit >= 3, "test: needs room for a gap");
+
+    let (owner_id, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    let pool = c4_pool().await;
+
+    let insert_version = |n: i32| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO vault_versions
+                    (vault_id, version_num, blob_key, blob_size_bytes, blob_hash, pushed_by)
+                 VALUES ($1, $2, $3, 3, $4, $5)",
+            )
+            .bind(vault_id)
+            .bind(n)
+            .bind(format!("test/{}", Uuid::new_v4()))
+            .bind("a".repeat(64))
+            .bind(owner_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    // 1..=L except L-1: L-1 rows, latest L.
+    for n in (1..=limit).filter(|n| *n != limit - 1) {
+        insert_version(n).await;
+    }
+    assert_eq!(
+        c4_version_count(&pool, vault_id).await,
+        i64::from(limit) - 1
+    );
+
+    // Hold the owner's membership row so the push blocks after its early checks.
+    let mut tx = pool.begin().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT 1 FROM vault_members WHERE vault_id = $1 AND user_id = $2 FOR UPDATE")
+        .bind(vault_id)
+        .bind(owner_id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+
+    let push = c4_push(&server, &jwt, vault_id, Some(limit), "over-the-limit");
+    let release = async {
+        c4_wait_blocked_by(&pool, pid).await;
+        // The other writer lands the missing version, then lets the push go.
+        insert_version(limit - 1).await;
+        tx.commit().await.unwrap();
+    };
+    let (resp, ()) = tokio::join!(push, release);
+
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN, "{}", resp.text());
+    let body = resp.json::<serde_json::Value>();
+    assert_eq!(body["code"], "FORBIDDEN");
+    assert_eq!(body["reason"], "PLAN_LIMIT");
+    assert_eq!(
+        c4_version_count(&pool, vault_id).await,
+        i64::from(limit),
+        "the push went past the limit"
+    );
+    assert_eq!(
+        c4_blob_files(vault_id).await,
+        0,
+        "the refused push left its blob behind"
+    );
+}
+
 #[tokio::test]
 async fn c4_a_member_removed_before_the_push_commits_gets_403_and_no_version() {
     c4_push_loses_to_a_revocation(false).await;
