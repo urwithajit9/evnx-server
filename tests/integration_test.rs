@@ -3618,6 +3618,78 @@ async fn stage(
     )
 }
 
+/// A push or a staged blob with a nonce that is not 12 bytes, or a hash that is
+/// not 64 lowercase hex characters, is a 422 and stores nothing.
+#[tokio::test]
+async fn blobs_with_badly_sized_fixed_fields_are_refused() {
+    use base64ct::Encoding;
+    let server = test_app().await;
+    let (_owner, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    push_versions(&server, &jwt, vault_id, 1).await;
+
+    let raw = b"some-ciphertext".to_vec();
+    let ct = base64ct::Base64::encode_string(&raw);
+    let good_hash = blake3::hash(&raw).to_hex().to_string();
+
+    let nonce_of = |n: usize| base64ct::Base64::encode_string(&vec![0u8; n]);
+    let upper = good_hash.to_uppercase();
+
+    for (what, nonce, hash) in [
+        ("11-byte nonce", nonce_of(11), good_hash.clone()),
+        ("13-byte nonce", nonce_of(13), good_hash.clone()),
+        ("24-byte nonce", nonce_of(24), good_hash.clone()),
+        ("empty nonce", String::new(), good_hash.clone()),
+        ("uppercase hash", nonce_of(12), upper),
+        ("short hash", nonce_of(12), good_hash[..63].to_string()),
+    ] {
+        let push = bearer(
+            server.post(&format!("/api/v1/vaults/{vault_id}/versions")),
+            &jwt,
+        )
+        .json(&serde_json::json!({
+            "nonce": nonce, "ciphertext": ct, "blob_hash": hash,
+            "key_names": ["A"], "key_count": 1, "base_version": 1,
+        }))
+        .await;
+        assert_eq!(
+            push.status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "push with {what}"
+        );
+        assert_eq!(push.json::<serde_json::Value>()["code"], "VALIDATION_ERROR");
+
+        let stage = bearer(
+            server.post(&format!("/api/v1/vaults/{vault_id}/rekey/blobs")),
+            &jwt,
+        )
+        .json(&serde_json::json!({
+            "version_num": 1, "nonce": nonce, "ciphertext": ct, "blob_hash": hash,
+        }))
+        .await;
+        assert_eq!(
+            stage.status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "stage with {what}"
+        );
+    }
+
+    // Nothing was stored: the vault still has exactly the one version.
+    assert_eq!(version_count(&server, &jwt, vault_id).await, 1);
+
+    // And a well-formed push still works.
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/versions")),
+        &jwt,
+    )
+    .json(&serde_json::json!({
+        "nonce": nonce_of(12), "ciphertext": ct, "blob_hash": good_hash,
+        "key_names": ["A"], "key_count": 1, "base_version": 1,
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+}
+
 /// A hybrid wrap — what you produce for somebody else from their public keys.
 fn wrap_for(user_id: Uuid) -> serde_json::Value {
     serde_json::json!({

@@ -81,6 +81,7 @@ pub async fn stage_blob(
         .map_err(|_| AppError::Validation("nonce: invalid base64".into()))?;
     let ciphertext = super::versions::base64_decode(&req.ciphertext)
         .map_err(|_| AppError::Validation("ciphertext: invalid base64".into()))?;
+    super::versions::check_blob_fields(&nonce, &req.blob_hash)?;
 
     // Same integrity check as a push. A staged blob whose hash does not match
     // would fail at the swap instead, after the client had uploaded everything.

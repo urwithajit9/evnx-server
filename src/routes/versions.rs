@@ -77,6 +77,7 @@ pub async fn push_version(
         .map_err(|_| AppError::Validation("nonce: invalid base64".into()))?;
     let ciphertext_bytes = base64_decode(&req.ciphertext)
         .map_err(|_| AppError::Validation("ciphertext: invalid base64".into()))?;
+    check_blob_fields(&nonce_bytes, &req.blob_hash)?;
 
     // Verify the client's declared blob_hash matches the actual ciphertext
     let actual_hash = blake3::hash(&ciphertext_bytes).to_hex().to_string();
@@ -352,6 +353,41 @@ pub async fn download_blob(
         .header("X-Blob-Hash", &version.blob_hash)
         .body(Body::from(blob_bytes))
         .unwrap())
+}
+
+/// Length of the AES-256-GCM nonce stored in front of every blob.
+pub(crate) const BLOB_NONCE_LEN: usize = 12;
+
+/// Length of a hex-encoded BLAKE3 digest.
+const BLOB_HASH_HEX_LEN: usize = 64;
+
+/// Refuse a blob whose fixed-size fields have the wrong size.
+///
+/// Only the ciphertext is hashed, so a nonce of the wrong length used to be
+/// stored without complaint and surface later as a failed download. Shared with
+/// `routes::rekey` so a push and a staged blob are held to the same rules.
+pub(crate) fn check_blob_fields(nonce: &[u8], blob_hash: &str) -> Result<(), AppError> {
+    if nonce.len() != BLOB_NONCE_LEN {
+        return Err(AppError::Validation(format!(
+            "nonce: must be {BLOB_NONCE_LEN} bytes, got {}",
+            nonce.len()
+        )));
+    }
+    check_blob_hash_format(blob_hash)
+}
+
+/// A `blob_hash` is 64 lowercase hex characters.
+pub(crate) fn check_blob_hash_format(blob_hash: &str) -> Result<(), AppError> {
+    let ok = blob_hash.len() == BLOB_HASH_HEX_LEN
+        && blob_hash
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c));
+    if !ok {
+        return Err(AppError::Validation(format!(
+            "blob_hash: must be {BLOB_HASH_HEX_LEN} lowercase hex characters"
+        )));
+    }
+    Ok(())
 }
 
 /// Shared with `routes::rekey`, which stages blobs in the same wire format a
