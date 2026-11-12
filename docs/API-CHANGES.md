@@ -2,12 +2,23 @@
 
 ## 2026-11-12
 
-### Changed: `GET /api/v1/auth/me` is for signed-in sessions only
-The response carries the sealed key material and the Argon2 salt, so an
-`evnx_tok_` API token (any scope) now gets **403** `{"code":"FORBIDDEN"}`, as on
-the other account routes. A session still works before the email is verified.
-A client that read `/auth/me` with a token to unlock a vault needs another way
-to obtain that material.
+### Changed: `GET /api/v1/auth/me` for API tokens is switchable, `AUTH_ME_SESSION_ONLY`
+The response carries the sealed key material and the Argon2 salt. A server
+setting, `AUTH_ME_SESSION_ONLY` (default `false`), decides what an `evnx_tok_`
+API token (any scope) gets. A session works in both modes, also before the email
+is verified, and gets the full response.
+
+* **`false` (default, for the CLI rollout).** A token gets **200** with
+  `{"encrypted_private_key", "argon2_salt"}` only: what the CLI's `unlock` reads,
+  and no `user_id`, `email`, `email_verified`, `totp_enabled` or `has_mlkem_key`.
+  The server logs each token's first read per process start at info level, by
+  token id.
+* **`true`.** A token gets **403** `{"code":"FORBIDDEN"}`, as on the other
+  account routes. An unknown token is 401 in both modes.
+
+Set it to `true` once evnx 0.14.0 is out and CI users have added
+`EVNX_KEY_BUNDLE`. A client that needs the key material in that mode must get it
+another way.
 
 ### Changed: `DELETE /vaults/:id/versions/:n` accepts the latest version
 When an older version exists, the latest can be deleted (admin or above, as

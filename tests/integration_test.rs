@@ -25,7 +25,17 @@ async fn test_config() -> Config {
 }
 
 async fn test_app() -> TestServer {
-    let config = test_config().await;
+    test_app_with(|_| {}).await
+}
+
+/// `/auth/me` in its end state: API tokens are refused.
+async fn test_app_me_session_only() -> TestServer {
+    test_app_with(|c| c.auth_me_session_only = true).await
+}
+
+async fn test_app_with(tweak: impl FnOnce(&mut Config)) -> TestServer {
+    let mut config = test_config().await;
+    tweak(&mut config);
     let db = sqlx::PgPool::connect(&config.database_url)
         .await
         .expect("test: Postgres unreachable — run `docker compose up -d postgres valkey`");
@@ -211,8 +221,8 @@ async fn auth_me_accepts_a_user_jwt() {
 #[tokio::test]
 async fn auth_me_refuses_a_vault_scoped_api_token() {
     // /auth/me returns the sealed key material, which only a signed-in session
-    // should be able to read.
-    let server = test_app().await;
+    // should be able to read once AUTH_ME_SESSION_ONLY is true.
+    let server = test_app_me_session_only().await;
     let (_uid, jwt) = verified_user(&server).await;
     let vault = create_vault(&server, &jwt).await;
     let raw = create_api_token(&server, &jwt, "read", Some(vault)).await;
@@ -227,12 +237,72 @@ async fn auth_me_refuses_a_vault_scoped_api_token() {
 
 #[tokio::test]
 async fn auth_me_refuses_an_unscoped_api_token() {
-    let server = test_app().await;
+    let server = test_app_me_session_only().await;
     let (_uid, jwt) = verified_user(&server).await;
     let raw = create_api_token(&server, &jwt, "read_write", None).await;
 
     let resp = bearer(server.get("/api/v1/auth/me"), &raw).await;
     assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn auth_me_session_only_still_serves_a_session() {
+    let server = test_app_me_session_only().await;
+    let (_uid, jwt) = verified_user(&server).await;
+
+    let resp = bearer(server.get("/api/v1/auth/me"), &jwt).await;
+    resp.assert_status_ok();
+    let body = resp.json::<serde_json::Value>();
+    assert!(body["encrypted_private_key"].is_string());
+    assert!(body["email"].is_string());
+}
+
+#[tokio::test]
+async fn auth_me_default_gives_a_token_the_key_material_only() {
+    // AUTH_ME_SESSION_ONLY unset (false): the transition setting. Both token
+    // kinds work, and neither learns more than `unlock` reads.
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+    let scoped = create_api_token(&server, &jwt, "read", Some(vault)).await;
+    let unscoped = create_api_token(&server, &jwt, "read_write", None).await;
+
+    let session = bearer(server.get("/api/v1/auth/me"), &jwt).await;
+    session.assert_status_ok();
+    let session = session.json::<serde_json::Value>();
+    assert!(session["email"].is_string());
+    assert!(session["user_id"].is_string());
+
+    for raw in [&scoped, &unscoped] {
+        let resp = bearer(server.get("/api/v1/auth/me"), raw).await;
+        resp.assert_status_ok();
+        let body = resp.json::<serde_json::Value>();
+        let keys: std::collections::BTreeSet<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["argon2_salt", "encrypted_private_key"]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(body["argon2_salt"], session["argon2_salt"]);
+        assert_eq!(
+            body["encrypted_private_key"],
+            session["encrypted_private_key"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn auth_me_default_still_refuses_an_unknown_token() {
+    let server = test_app().await;
+    let fake = format!("evnx_tok_{}", "b".repeat(64));
+    let resp = bearer(server.get("/api/v1/auth/me"), &fake).await;
+    assert_eq!(resp.status_code(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -289,7 +359,8 @@ async fn api_token_cannot_reach_account_management() {
         .await;
     assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
 
-    // /auth/me returns key material and is a session-only route like the rest.
+    // With AUTH_ME_SESSION_ONLY=true, /auth/me is a session-only route like the rest.
+    let server = test_app_me_session_only().await;
     let resp = bearer(server.get("/api/v1/auth/me"), &fake).await;
     assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
 }

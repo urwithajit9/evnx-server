@@ -241,6 +241,30 @@ docker compose -f docker/docker-compose.prod.yml --env-file .env.prod up -d
 
 Migrations apply automatically — `main.rs` runs `sqlx::migrate!` at startup.
 
+### `/auth/me` and API tokens: `AUTH_ME_SESSION_ONLY`
+
+`GET /auth/me` returns the Argon2 salt and the sealed private key. CLI versions
+before the one that reads `EVNX_KEY_BUNDLE` fetch them with an API token to
+unlock a vault in CI, so the setting is switchable:
+
+* **`AUTH_ME_SESSION_ONLY=false` (the default).** A user session gets the full
+  response. An API token gets 200 with `argon2_salt` and `encrypted_private_key`
+  only. The first read by each token after a server start is logged at info
+  level: `API token read key material from /auth/me; set AUTH_ME_SESSION_ONLY=true
+  once clients use EVNX_KEY_BUNDLE`, with the token's id, never its value.
+* **`AUTH_ME_SESSION_ONLY=true`.** An API token gets 403, as on the other
+  account routes. Sessions are unchanged.
+
+**When to flip it:** deploy with it `false` (or unset). After evnx 0.14.0 is out
+and CI users have added `EVNX_KEY_BUNDLE`, set it to `true` in `.env.prod` and
+redeploy. The deprecation log lines show which token ids still depend on the
+old behaviour; once they stop appearing it is safe to flip. The value is read at
+startup, so changing it needs a restart:
+
+```bash
+docker compose -f docker/docker-compose.prod.yml --env-file .env.prod up -d server
+```
+
 ### Server data key
 
 `SERVER_DATA_KEY` is 32 random bytes, base64-encoded. The server derives a

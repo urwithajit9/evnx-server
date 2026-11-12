@@ -142,6 +142,16 @@ pub struct Config {
     /// Behind `docker/Caddyfile` this must be `true`; the startup warning says so.
     pub trust_proxy_header: bool,
 
+    /// Serve `GET /auth/me` to signed-in sessions only. From `AUTH_ME_SESSION_ONLY`.
+    ///
+    /// ⚠️ **Defaults to false for the CLI rollout.** Until CI users move to a CLI
+    /// that reads `EVNX_KEY_BUNDLE`, the CLI's `unlock` fetches the salt and the
+    /// sealed seed from `/auth/me` with an API token. While this is false a token
+    /// gets those two fields and nothing else, and each token's first read per
+    /// process start is logged. Set it true once evnx 0.14.0 is out and CI users
+    /// have added `EVNX_KEY_BUNDLE`: a token then gets 403.
+    pub auth_me_session_only: bool,
+
     /// Key material for the audit IP / user-agent digests.
     ///
     /// ⚠️ **Separate from `JWT_SECRET` on purpose.** The digests were keyed off
@@ -628,6 +638,13 @@ impl Config {
             audit_hash_key,
             trust_proxy_header: matches!(
                 optional!("TRUST_PROXY_HEADER", "false")
+                    .trim()
+                    .to_lowercase()
+                    .as_str(),
+                "true" | "1" | "yes"
+            ),
+            auth_me_session_only: matches!(
+                optional!("AUTH_ME_SESSION_ONLY", "false")
                     .trim()
                     .to_lowercase()
                     .as_str(),

@@ -18,7 +18,8 @@
 //! authenticated with an API token, and enforces that token's limits centrally
 //! so no handler has to remember to.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 use crate::{errors::AppError, services::jwt::Claims, state::AppState};
 use axum::{
@@ -71,6 +72,34 @@ pub struct ApiTokenContext {
     pub vault_id: Option<Uuid>,
     /// `api_tokens.scope == "read_write"`.
     pub can_write: bool,
+}
+
+/// Who is calling `GET /auth/me`, injected by [`require_me_access`].
+///
+/// `token_id` is `Some` only for an `evnx_tok_` API token, and only while
+/// `AUTH_ME_SESSION_ONLY` is false. The handler then returns the key material
+/// and nothing else.
+#[derive(Clone, Copy, Debug)]
+pub struct MeCaller {
+    /// Row id in `api_tokens`. Never the token value.
+    pub token_id: Option<Uuid>,
+}
+
+/// Upper bound on remembered token ids, so the set cannot grow without limit.
+/// When it fills it is cleared, which at worst repeats a log line.
+const MAX_LOGGED_TOKENS: usize = 10_000;
+
+/// True the first time this process sees `token_id`, false after.
+fn first_me_read_by(token_id: Uuid) -> bool {
+    static SEEN: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if seen.len() >= MAX_LOGGED_TOKENS {
+        seen.clear();
+    }
+    seen.insert(token_id)
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -218,7 +247,7 @@ async fn authenticate(
 /// only use it on routes where a token's vault scope is irrelevant.
 ///
 /// Used by `GET /users/{email}/public-key`, which returns nothing secret.
-/// `GET /auth/me` returns key material and uses [`require_user_session`].
+/// `GET /auth/me` returns key material and uses [`require_me_access`].
 pub async fn require_auth(
     State(state): State<AppState>,
     mut req: Request,
@@ -236,7 +265,7 @@ pub async fn require_auth(
 /// A real user session only — no API tokens, no half-authenticated tokens.
 ///
 /// Use for account management (`/auth/logout`, `/auth/totp/*`, `/auth/tokens`)
-/// and for `/auth/me`, which returns the sealed key material.
+/// and, while `AUTH_ME_SESSION_ONLY` is true, for `/auth/me` (see [`require_me_access`]).
 /// A CI token that could reach these would be able to enrol its own authenticator
 /// on the account, revoke the owner's sessions, or mint fresh tokens for itself.
 pub async fn require_user_session(
@@ -250,6 +279,41 @@ pub async fn require_user_session(
     let (claims, _) = authenticate(&state, &token, false).await?;
 
     req.extensions_mut().insert(claims);
+    Ok(next.run(req).await)
+}
+
+/// Guard for `GET /auth/me`.
+///
+/// A user session always passes, verified or not. An `evnx_tok_` API token
+/// passes only while `AUTH_ME_SESSION_ONLY` is false, which is the transition
+/// setting for CLI versions that still unlock a vault from CI with a token.
+/// With it true a token gets 403, as on the other account routes.
+///
+/// A token that passes is logged once per process start, by id.
+pub async fn require_me_access(
+    State(state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let token = extract_bearer(&req)
+        .ok_or(AppError::Unauthorized)?
+        .to_owned();
+    let allow_tokens = !state.config.auth_me_session_only;
+    let (claims, api_token) = authenticate(&state, &token, allow_tokens).await?;
+
+    let token_id = api_token.map(|ctx| ctx.token_id);
+    if let Some(id) = token_id {
+        if first_me_read_by(id) {
+            tracing::info!(
+                token_id = %id,
+                "API token read key material from /auth/me; set AUTH_ME_SESSION_ONLY=true \
+                 once clients use EVNX_KEY_BUNDLE"
+            );
+        }
+    }
+
+    req.extensions_mut().insert(claims);
+    req.extensions_mut().insert(MeCaller { token_id });
     Ok(next.run(req).await)
 }
 

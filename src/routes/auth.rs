@@ -1502,11 +1502,21 @@ pub(crate) fn verify_totp_code(secret_base32: &str, code: &str) -> Result<(), Ap
 pub async fn me(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<Claims>,
+    axum::Extension(caller): axum::Extension<crate::middleware::auth::MeCaller>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
     let user = users::find_by_id(&state.db, user_id)
         .await?
         .ok_or(AppError::Unauthorized)?;
+
+    // An API token (possible only while AUTH_ME_SESSION_ONLY is false) gets what
+    // the CLI's `unlock` reads and nothing else.
+    if caller.token_id.is_some() {
+        return Ok(Json(serde_json::json!({
+            "encrypted_private_key": user.encrypted_private_key,
+            "argon2_salt":           user.argon2_salt,
+        })));
+    }
 
     Ok(Json(serde_json::json!({
         "user_id":               user.id,
