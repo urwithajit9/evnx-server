@@ -622,6 +622,19 @@ alone, because a push in flight or a staged re-key looks the same as an orphan;
 like a blob key is counted and never touched. Running it again after `--apply`
 finds nothing.
 
+## 11. What the audit trail does and does not guarantee
+
+`audit_events` is append-only through a trigger (migration 006): the
+application cannot edit or delete a row. Two limits are inherent:
+
+* **The database owner can drop the trigger**, and then edit or delete rows.
+  No application change prevents that. Protect it with database privileges, and
+  keep the off-box backups, which are the copy an owner cannot reach.
+* **Pull events are written in the background and are not retried.** A failed
+  write is logged at `warn` (`could not record a pull event`) and the pull still
+  succeeds. A push event is written in the same transaction as the version, so a
+  push whose audit row cannot be written fails.
+
 ## Troubleshooting
 
 | Symptom | Cause |

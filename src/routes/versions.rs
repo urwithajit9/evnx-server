@@ -109,6 +109,7 @@ pub async fn push_version(
     let inserted = commit_version(
         &state.db,
         user_id,
+        &client,
         &cap,
         current_num,
         req.base_version,
@@ -139,27 +140,6 @@ pub async fn push_version(
             return Err(e);
         }
     };
-
-    // 6. Record audit event (fire-and-forget — don't block response)
-    tokio::spawn({
-        let db = state.db.clone();
-        // vault_id and user_id are Copy — `async move` captures them directly.
-        let version_num = new_version_num;
-        async move {
-            let _ = crate::services::audit::record(
-                &db,
-                crate::services::audit::AuditEvent {
-                    vault_id: Some(vault_id),
-                    user_id: Some(user_id),
-                    event_type: "push".into(),
-                    metadata: Some(serde_json::json!({ "version": version_num })),
-                    ip_hash: client.ip_hash.clone(),
-                    user_agent_hash: client.user_agent_hash.clone(),
-                },
-            )
-            .await;
-        }
-    });
 
     Ok((
         axum::http::StatusCode::CREATED,
@@ -198,6 +178,7 @@ fn stale_push(remote_at: i32, based_on: i32) -> AppError {
 async fn commit_version(
     db: &sqlx::PgPool,
     user_id: Uuid,
+    client: &ClientContext,
     cap: &crate::services::quota::VersionCap,
     expected_latest: i32,
     base_version: Option<i32>,
@@ -256,6 +237,22 @@ async fn commit_version(
         }
         Err(e) => return Err(e.into()),
     };
+
+    // The audit event is part of the push: written in this transaction, so a
+    // push whose event cannot be written does not happen, rather than happening
+    // with nothing to show for it. The caller deletes the uploaded blob.
+    crate::services::audit::record_with(
+        &mut *tx,
+        crate::services::audit::AuditEvent {
+            vault_id: Some(vault_id),
+            user_id: Some(user_id),
+            event_type: "push".into(),
+            metadata: Some(serde_json::json!({ "version": version.version_num })),
+            ip_hash: client.ip_hash.clone(),
+            user_agent_hash: client.user_agent_hash.clone(),
+        },
+    )
+    .await?;
 
     tx.commit().await?;
     Ok(version)
@@ -340,11 +337,13 @@ pub async fn download_blob(
         return Err(AppError::Internal("Blob integrity check failed".into()));
     }
 
-    // Record audit (fire-and-forget)
+    // Record audit (fire-and-forget). A pull must not fail because the audit
+    // write did, so a failure is logged at warn and the pull goes ahead; the
+    // line below is the signal to alert on.
     tokio::spawn({
         let db = state.db.clone();
         async move {
-            let _ = crate::services::audit::record(
+            if let Err(e) = crate::services::audit::record(
                 &db,
                 crate::services::audit::AuditEvent {
                     vault_id: Some(vault_id),
@@ -355,7 +354,13 @@ pub async fn download_blob(
                     user_agent_hash: client.user_agent_hash.clone(),
                 },
             )
-            .await;
+            .await
+            {
+                tracing::warn!(
+                    %vault_id, %user_id, error = %e,
+                    "could not record a pull event"
+                );
+            }
         }
     });
 

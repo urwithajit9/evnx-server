@@ -10864,6 +10864,51 @@ async fn c4_a_push_is_counted_against_the_version_limit_after_its_locks() {
     );
 }
 
+/// A push is audited in its own transaction: when the event cannot be written
+/// the push does not happen, and nothing is left behind.
+///
+/// The write is made to fail with a constraint that rejects push events for this
+/// vault alone, so other tests running against the same database are unaffected.
+#[tokio::test]
+async fn a_push_whose_audit_event_cannot_be_written_fails() {
+    let server = test_app().await;
+    let (_owner, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    let pool = c4_pool().await;
+
+    let name = format!("zz_test_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "ALTER TABLE audit_events ADD CONSTRAINT {name}
+         CHECK (vault_id IS DISTINCT FROM '{vault_id}'::uuid OR event_type <> 'push')"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let refused = c4_push(&server, &jwt, vault_id, None, "unaudited").await;
+    let dropped = sqlx::query(&format!("ALTER TABLE audit_events DROP CONSTRAINT {name}"))
+        .execute(&pool)
+        .await;
+
+    assert_eq!(refused.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(c4_version_count(&pool, vault_id).await, 0);
+    assert_eq!(
+        c4_blob_files(vault_id).await,
+        0,
+        "the failed push left its blob behind"
+    );
+    dropped.unwrap();
+
+    // With the audit table writable again the same push works, and is recorded.
+    c4_push(&server, &jwt, vault_id, None, "audited")
+        .await
+        .assert_status(StatusCode::CREATED);
+    let events = audit_events(vault_id).await;
+    assert_eq!(events.iter().filter(|(t, _)| t == "push").count(), 1);
+    let push = events.iter().find(|(t, _)| t == "push").unwrap();
+    assert_eq!(push.1["version"], 1);
+}
+
 #[tokio::test]
 async fn c4_a_member_removed_before_the_push_commits_gets_403_and_no_version() {
     c4_push_loses_to_a_revocation(false).await;
