@@ -25,7 +25,9 @@ pub mod usage;
 pub mod users;
 pub mod vaults;
 pub mod versions;
-use crate::middleware::auth::{require_auth, require_user_session, require_verified};
+use crate::middleware::auth::{
+    require_auth, require_me_access, require_user_session, require_verified,
+};
 
 pub fn create_router(state: AppState) -> Router {
     // `AllowOrigin::list` rather than `exact`, so one deployment can serve
@@ -228,7 +230,7 @@ pub fn create_router(state: AppState) -> Router {
     // directory; the server cannot wrap a vault key. See migration 010 and
     // `middleware::org_role`.
     //
-    // `require_user_session`, not `require_verified`: an `evnx_tok_` CI token
+    // `require_me_access`, not `require_verified`: an `evnx_tok_` CI token
     // reaching these could invite people, assign seats and change what the
     // account is billed. Same reasoning as `/auth/tokens` and `/auth/account`.
     let org_routes = Router::new()
@@ -276,13 +278,22 @@ pub fn create_router(state: AppState) -> Router {
             require_user_session,
         ));
 
-    // `require_auth`, not `require_verified`: the CLI calls GET /auth/me
+    // `require_me_access`, not `require_verified`: the CLI calls GET /auth/me
     // immediately after registration to fetch `encrypted_private_key` and
     // `argon2_salt`, before the user has clicked the verification email.
     // Requiring a verified email here would make first login impossible.
-    let me_route = Router::new()
-        .route("/me", get(auth::me))
-        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+    //
+    // The response carries key material. With `AUTH_ME_SESSION_ONLY=true` only a
+    // signed-in session may read it and an `evnx_tok_` API token gets 403, as on
+    // the other account routes. With it false (the default, during the CLI
+    // rollout) a token may still read the key material and nothing else.
+    let me_route =
+        Router::new()
+            .route("/me", get(auth::me))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_me_access,
+            ));
 
     let auth_routes = public_auth_routes.merge(account_routes).merge(me_route);
 

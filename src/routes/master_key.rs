@@ -74,7 +74,7 @@ use crate::{
     db::{rotation, users},
     errors::AppError,
     routes::auth::{
-        email_subject, fake_salt, fake_srp_verifier, verify_second_factor, SRP_LOCKOUT_SECONDS,
+        email_subject, fake_srp_verifier, verify_second_factor, SRP_LOCKOUT_SECONDS,
         SRP_MAX_FAILURES,
     },
     services::jwt::Claims,
@@ -307,10 +307,11 @@ pub async fn reauth_verify(
         // next endpoint that needs a second factor has one thing to call rather
         // than a block to remember to paste.
         let code = req.totp_code.as_deref().unwrap_or_default();
-        let secret = user
+        let stored_secret = user
             .totp_secret_enc
-            .clone()
+            .as_deref()
             .ok_or_else(|| AppError::Internal("TOTP enabled but no secret".into()))?;
+        let secret = super::auth::open_totp_secret(&state, user_id, stored_secret).await?;
         verify_second_factor(&state, user_id, &secret, code).await?;
     }
 
@@ -598,12 +599,20 @@ pub async fn undo_init(
             s.prev_argon2_salt,
             true,
         ),
+        // Stable per address, like `srp_init`'s: a fresh random salt on each call
+        // would show that no snapshot exists.
         None => (
             None,
             None,
             fake_srp_verifier(),
-            fake_salt(),
-            fake_salt(),
+            state
+                .config
+                .server_data_key
+                .decoy_salt(&email_lower, "undo-srp"),
+            state
+                .config
+                .server_data_key
+                .decoy_salt(&email_lower, "undo-argon2"),
             false,
         ),
     };

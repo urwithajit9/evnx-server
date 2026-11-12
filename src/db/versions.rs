@@ -199,3 +199,33 @@ where
     .fetch_optional(executor)
     .await
 }
+
+/// Every version of a vault with the object its row points at, ascending.
+///
+/// A plain query rather than `query!`, so it needs no offline cache entry.
+pub async fn blob_keys<'e, E>(
+    executor: E,
+    vault_id: Uuid,
+) -> Result<Vec<(i32, String)>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as::<_, (i32, String)>(
+        "SELECT version_num, blob_key FROM vault_versions
+          WHERE vault_id = $1 ORDER BY version_num ASC",
+    )
+    .bind(vault_id)
+    .fetch_all(executor)
+    .await
+}
+
+/// How many versions a vault holds.
+pub async fn count<'e, E>(executor: E, vault_id: Uuid) -> Result<i64, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar("SELECT COUNT(*) FROM vault_versions WHERE vault_id = $1")
+        .bind(vault_id)
+        .fetch_one(executor)
+        .await
+}

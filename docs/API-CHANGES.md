@@ -1,5 +1,46 @@
 # API changes
 
+## 2026-11-12
+
+### Changed: `GET /api/v1/auth/me` for API tokens is switchable, `AUTH_ME_SESSION_ONLY`
+The response carries the sealed key material and the Argon2 salt. A server
+setting, `AUTH_ME_SESSION_ONLY` (default `false`), decides what an `evnx_tok_`
+API token (any scope) gets. A session works in both modes, also before the email
+is verified, and gets the full response.
+
+* **`false` (default, for the CLI rollout).** A token gets **200** with
+  `{"encrypted_private_key", "argon2_salt"}` only: what the CLI's `unlock` reads,
+  and no `user_id`, `email`, `email_verified`, `totp_enabled` or `has_mlkem_key`.
+  The server logs each token's first read per process start at info level, by
+  token id.
+* **`true`.** A token gets **403** `{"code":"FORBIDDEN"}`, as on the other
+  account routes. An unknown token is 401 in both modes.
+
+Set it to `true` once evnx 0.14.0 is out and CI users have added
+`EVNX_KEY_BUNDLE`. A client that needs the key material in that mode must get it
+another way.
+
+### Changed: `DELETE /vaults/:id/versions/:n` accepts the latest version
+When an older version exists, the latest can be deleted (admin or above, as
+before) and the previous version becomes the latest. The only version is still
+refused with 409. The response gains `was_latest`, and `latest` is the latest
+**after** the deletion. The next push is numbered `latest + 1`, so after deleting
+version N the next push is N again.
+
+### Changed: stricter checks on blobs, 422 `VALIDATION_ERROR`
+* A push, and `POST /vaults/:id/rekey/blobs`, require a 12-byte `nonce` and a
+  `blob_hash` of 64 lowercase hex characters.
+* `POST /vaults/:id/rekey` checks every `blob_key` before swapping: it must be
+  a key returned by staging for this vault and version (422), name an object
+  that exists (409), and hold `blob_size_bytes` bytes whose ciphertext hashes to
+  `blob_hash` (422). It must differ from the blob the version already uses.
+  A refused swap changes nothing.
+* After a successful re-key the replaced blobs are deleted from storage.
+
+### Changed: `POST /auth/srp/init` and `/auth/master-key/undo/init`
+An address with no account now gets the same `srp_salt` and `argon2_salt` on
+every call (derived from the address), in the same shape as a real account's.
+
 ## 2026-11-09
 
 ### New: `GET /api/v1/audit`, activity across every vault you can read

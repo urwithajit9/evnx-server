@@ -265,6 +265,49 @@ pub(crate) async fn verify_second_factor(
     Ok(())
 }
 
+/// The plaintext TOTP secret for `user_id`, from the value stored in
+/// `users.totp_secret_enc`.
+///
+/// A value written before secrets were sealed is accepted and, once it has been
+/// checked to be a usable base32 secret, rewritten in the sealed form. The
+/// rewrite only applies if the column still holds the value that was read, so a
+/// concurrent disable or re-enrol is never overwritten. A failed rewrite is
+/// logged and does not fail the request: the next read tries again.
+pub(crate) async fn open_totp_secret(
+    state: &AppState,
+    user_id: Uuid,
+    stored: &str,
+) -> Result<String, AppError> {
+    let keys = &state.config.server_data_key;
+    let opened = keys.open_totp_secret(user_id, stored).map_err(|e| {
+        AppError::Internal(format!("stored TOTP secret for {user_id} unreadable: {e}"))
+    })?;
+
+    if opened.was_legacy_plaintext
+        && base32::decode(
+            base32::Alphabet::Rfc4648 { padding: false },
+            &opened.plaintext,
+        )
+        .is_some()
+    {
+        let upgraded = keys
+            .seal_totp_secret(user_id, &opened.plaintext)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let r = sqlx::query(
+            "UPDATE users SET totp_secret_enc = $1 WHERE id = $2 AND totp_secret_enc = $3",
+        )
+        .bind(&upgraded)
+        .bind(user_id)
+        .bind(stored)
+        .execute(&state.db)
+        .await;
+        if let Err(e) = r {
+            tracing::warn!(%user_id, error = %e, "could not re-save a TOTP secret in sealed form");
+        }
+    }
+    Ok(opened.plaintext)
+}
+
 /// SRP Step 1 — exchange ephemeral public keys.
 ///
 /// SECURITY CRITICAL: This endpoint must respond identically (same shape, similar timing)
@@ -294,7 +337,19 @@ pub async fn srp_init(
             data.argon2_salt,
             true,
         ),
-        None => (None, fake_srp_verifier(), fake_salt(), fake_salt(), false),
+        // ⚠️ Salts are derived from the address, not drawn fresh. An address with
+        // no account used to get new random salts on every call while a real
+        // account always got its own, so asking twice told the two apart.
+        None => {
+            let keys = &state.config.server_data_key;
+            (
+                None,
+                fake_srp_verifier(),
+                keys.decoy_salt(&email_lower, "srp"),
+                keys.decoy_salt(&email_lower, "argon2"),
+                false,
+            )
+        }
     };
 
     // Decode client public A (hex → bytes)
@@ -830,15 +885,6 @@ pub(crate) fn fake_srp_verifier() -> String {
     hex::encode(bytes)
 }
 
-/// Generate a fake base64 salt for unknown emails.
-pub(crate) fn fake_salt() -> String {
-    use base64ct::{Base64, Encoding};
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    Base64::encode_string(&bytes)
-}
-
 /// Issue a JWT + refresh token pair for a successfully authenticated user.
 /// Returns (access_token_jwt, raw_refresh_token).
 /// Tell the account holder that someone just signed in.
@@ -1132,11 +1178,15 @@ pub async fn totp_confirm(
     // here would only let someone lock themselves out of finishing enrolment.
     verify_totp_code(&secret_base32, code)?;
 
-    // Write secret to DB (encrypt with pgcrypto — server-managed key)
-    // For simplicity, store base32 directly. Production: encrypt with server key.
+    // Stored sealed under the server data key, bound to this user id.
+    let sealed = state
+        .config
+        .server_data_key
+        .seal_totp_secret(user_id, &secret_base32)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     sqlx::query!(
         "UPDATE users SET totp_secret_enc = $1, totp_enabled = true, updated_at = NOW() WHERE id = $2",
-        secret_base32,
+        sealed,
         user_id,
     )
     .execute(&state.db)
@@ -1246,9 +1296,11 @@ pub async fn totp_verify_login(
         .await?
         .ok_or(AppError::Unauthorized)?;
 
-    let secret_base32 = user
+    let stored_secret = user
         .totp_secret_enc
+        .as_deref()
         .ok_or_else(|| AppError::Internal("TOTP enabled but no secret".into()))?;
+    let secret_base32 = open_totp_secret(&state, user_id, stored_secret).await?;
 
     // A recovery code is accepted wherever a TOTP code is. Try TOTP first — it is
     // the common case and costs nothing — then fall back to redeeming a code.
@@ -1342,9 +1394,11 @@ pub async fn totp_disable(
     if !user.totp_enabled {
         return Err(AppError::Conflict("TOTP is not enabled".into()));
     }
-    let secret = user
+    let stored_secret = user
         .totp_secret_enc
+        .as_deref()
         .ok_or_else(|| AppError::Internal("TOTP enabled but no secret".into()))?;
+    let secret = open_totp_secret(&state, user_id, stored_secret).await?;
 
     // Bounded — see `verify_second_factor`. Succeeding here removes the second
     // factor from the account, so an unbounded guess loop was a way to strip 2FA
@@ -1394,9 +1448,11 @@ pub async fn totp_regenerate_backup_codes(
     if !user.totp_enabled {
         return Err(AppError::Conflict("TOTP is not enabled".into()));
     }
-    let secret = user
+    let stored_secret = user
         .totp_secret_enc
+        .as_deref()
         .ok_or_else(|| AppError::Internal("TOTP enabled but no secret".into()))?;
+    let secret = open_totp_secret(&state, user_id, stored_secret).await?;
 
     // Bounded — see `verify_second_factor`. Succeeding here mints ten fresh
     // recovery codes, each of which is itself a second factor, so guessing once
@@ -1446,11 +1502,21 @@ pub(crate) fn verify_totp_code(secret_base32: &str, code: &str) -> Result<(), Ap
 pub async fn me(
     State(state): State<AppState>,
     axum::Extension(claims): axum::Extension<Claims>,
+    axum::Extension(caller): axum::Extension<crate::middleware::auth::MeCaller>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let user_id = claims.user_id().map_err(|_| AppError::Unauthorized)?;
     let user = users::find_by_id(&state.db, user_id)
         .await?
         .ok_or(AppError::Unauthorized)?;
+
+    // An API token (possible only while AUTH_ME_SESSION_ONLY is false) gets what
+    // the CLI's `unlock` reads and nothing else.
+    if caller.token_id.is_some() {
+        return Ok(Json(serde_json::json!({
+            "encrypted_private_key": user.encrypted_private_key,
+            "argon2_salt":           user.argon2_salt,
+        })));
+    }
 
     Ok(Json(serde_json::json!({
         "user_id":               user.id,
@@ -1551,10 +1617,11 @@ pub async fn delete_account(
     // case a second factor exists for.
     if user.totp_enabled {
         let code = req.totp_code.as_deref().unwrap_or_default();
-        let secret = user
+        let stored_secret = user
             .totp_secret_enc
-            .clone()
+            .as_deref()
             .ok_or_else(|| AppError::Internal("TOTP enabled but no secret".into()))?;
+        let secret = open_totp_secret(&state, user_id, stored_secret).await?;
         // Bounded — see `verify_second_factor`. This one is irreversible, and the
         // server cannot undo it: the vaults it deletes hold the only wrapped copies
         // of their keys.

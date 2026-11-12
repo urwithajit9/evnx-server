@@ -228,8 +228,9 @@ cp .env.prod.example .env.prod && chmod 600 .env.prod
 Generate the secrets — do not invent them by hand:
 
 ```bash
-printf 'JWT_SECRET=%s\nPOSTGRES_PASSWORD=%s\nVALKEY_PASSWORD=%s\n' \
-  "$(openssl rand -hex 48)" "$(openssl rand -hex 24)" "$(openssl rand -hex 24)"
+printf 'JWT_SECRET=%s\nPOSTGRES_PASSWORD=%s\nVALKEY_PASSWORD=%s\nSERVER_DATA_KEY=%s\n' \
+  "$(openssl rand -hex 48)" "$(openssl rand -hex 24)" "$(openssl rand -hex 24)" \
+  "$(openssl rand -base64 32)"
 ```
 
 Paste those into `.env.prod` along with the R2 and Resend values, then:
@@ -239,6 +240,53 @@ docker compose -f docker/docker-compose.prod.yml --env-file .env.prod up -d
 ```
 
 Migrations apply automatically — `main.rs` runs `sqlx::migrate!` at startup.
+
+### `/auth/me` and API tokens: `AUTH_ME_SESSION_ONLY`
+
+`GET /auth/me` returns the Argon2 salt and the sealed private key. CLI versions
+before the one that reads `EVNX_KEY_BUNDLE` fetch them with an API token to
+unlock a vault in CI, so the setting is switchable:
+
+* **`AUTH_ME_SESSION_ONLY=false` (the default).** A user session gets the full
+  response. An API token gets 200 with `argon2_salt` and `encrypted_private_key`
+  only. The first read by each token after a server start is logged at info
+  level: `API token read key material from /auth/me; set AUTH_ME_SESSION_ONLY=true
+  once clients use EVNX_KEY_BUNDLE`, with the token's id, never its value.
+* **`AUTH_ME_SESSION_ONLY=true`.** An API token gets 403, as on the other
+  account routes. Sessions are unchanged.
+
+**When to flip it:** deploy with it `false` (or unset). After evnx 0.14.0 is out
+and CI users have added `EVNX_KEY_BUNDLE`, set it to `true` in `.env.prod` and
+redeploy. The deprecation log lines show which token ids still depend on the
+old behaviour; once they stop appearing it is safe to flip. The value is read at
+startup, so changing it needs a restart:
+
+```bash
+docker compose -f docker/docker-compose.prod.yml --env-file .env.prod up -d server
+```
+
+### Server data key
+
+`SERVER_DATA_KEY` is 32 random bytes, base64-encoded. The server derives a
+separate key for each purpose from it: the TOTP secrets stored in
+`users.totp_secret_enc` are sealed under one, and the salts returned for
+addresses with no account come from another.
+
+* **Required outside development.** The server refuses to start without it and
+  says so in the first log line. In development an unset key falls back to a
+  fixed one that is published in the source.
+* **Generate it once:** `openssl rand -base64 32`, then put it in `.env.prod`.
+* **Back it up with `.env.prod`.** It is not in the database backup, by design.
+  Without it every sealed TOTP secret is unreadable, and each account with
+  two-factor on is locked out until that factor is removed by hand.
+* **Do not change it on a running deployment.** There is no re-sealing step yet.
+  Changing the key has the same effect as losing it.
+* **Existing accounts keep working.** A TOTP secret stored before this key
+  existed is read as it is and rewritten sealed the next time it is used, so no
+  migration step is needed.
+* **Rolling back** to an image that predates the key: accounts whose TOTP
+  secret has already been rewritten sealed would fail every second-factor check
+  on the old image, which reads the column as a bare base32 secret.
 
 ### Querying the database
 
@@ -573,6 +621,43 @@ between the running build and the target and says so, but it will not decide
 for you — check before rolling back across one.
 
 ---
+
+## 10. Housekeeping: unreferenced blobs
+
+A re-key deletes the blobs it replaced once it has committed. If that delete
+fails the object stays behind, as does a blob from a push that failed after its
+upload, or a re-key that was staged and never swapped. Nothing reads them, but
+they hold ciphertext, so they are worth clearing now and then.
+
+```bash
+# Lists what would be deleted. Changes nothing.
+docker compose -f docker/docker-compose.prod.yml --env-file .env.prod \
+  exec server evnx-server sweep-blobs
+
+# Deletes it.
+docker compose -f docker/docker-compose.prod.yml --env-file .env.prod \
+  exec server evnx-server sweep-blobs --apply
+```
+
+It lists the storage bucket, then the `vault_versions` table, and offers objects
+under `vaults/` that no row points to. Objects younger than 24 hours are left
+alone, because a push in flight or a staged re-key looks the same as an orphan;
+`--min-age-hours N` changes that. Anything under `vaults/` that is not shaped
+like a blob key is counted and never touched. Running it again after `--apply`
+finds nothing.
+
+## 11. What the audit trail does and does not guarantee
+
+`audit_events` is append-only through a trigger (migration 006): the
+application cannot edit or delete a row. Two limits are inherent:
+
+* **The database owner can drop the trigger**, and then edit or delete rows.
+  No application change prevents that. Protect it with database privileges, and
+  keep the off-box backups, which are the copy an owner cannot reach.
+* **Pull events are written in the background and are not retried.** A failed
+  write is logged at `warn` (`could not record a pull event`) and the pull still
+  succeeds. A push event is written in the same transaction as the version, so a
+  push whose audit row cannot be written fails.
 
 ## Troubleshooting
 

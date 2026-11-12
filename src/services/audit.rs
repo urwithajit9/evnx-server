@@ -12,9 +12,23 @@ pub struct AuditEvent {
     pub metadata: Option<serde_json::Value>,
 }
 
-/// Insert an audit event. Called via `tokio::spawn` — non-blocking.
-/// Errors are logged but not propagated (audit failures shouldn't break operations).
+/// Insert an audit event on the pool.
+///
+/// Callers that must not lose the event (a push) use [`record_with`] on their
+/// own transaction instead; the rest spawn this and log a failure, since an
+/// audit outage should not break the operation it describes.
 pub async fn record(pool: &PgPool, event: AuditEvent) -> Result<(), sqlx::Error> {
+    record_with(pool, event).await
+}
+
+/// Insert an audit event on any executor, including an open transaction.
+///
+/// Inside a transaction the event commits or rolls back with the work it
+/// records, so a failed write fails that work instead of being lost.
+pub async fn record_with<'e, E>(executor: E, event: AuditEvent) -> Result<(), sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query!(
         r#"
         INSERT INTO audit_events
@@ -28,7 +42,7 @@ pub async fn record(pool: &PgPool, event: AuditEvent) -> Result<(), sqlx::Error>
         event.user_agent_hash,
         event.metadata,
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }

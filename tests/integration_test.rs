@@ -25,7 +25,17 @@ async fn test_config() -> Config {
 }
 
 async fn test_app() -> TestServer {
-    let config = test_config().await;
+    test_app_with(|_| {}).await
+}
+
+/// `/auth/me` in its end state: API tokens are refused.
+async fn test_app_me_session_only() -> TestServer {
+    test_app_with(|c| c.auth_me_session_only = true).await
+}
+
+async fn test_app_with(tweak: impl FnOnce(&mut Config)) -> TestServer {
+    let mut config = test_config().await;
+    tweak(&mut config);
     let db = sqlx::PgPool::connect(&config.database_url)
         .await
         .expect("test: Postgres unreachable — run `docker compose up -d postgres valkey`");
@@ -209,6 +219,93 @@ async fn auth_me_accepts_a_user_jwt() {
 }
 
 #[tokio::test]
+async fn auth_me_refuses_a_vault_scoped_api_token() {
+    // /auth/me returns the sealed key material, which only a signed-in session
+    // should be able to read once AUTH_ME_SESSION_ONLY is true.
+    let server = test_app_me_session_only().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+    let raw = create_api_token(&server, &jwt, "read", Some(vault)).await;
+
+    let resp = bearer(server.get("/api/v1/auth/me"), &raw).await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+    let body = resp.json::<serde_json::Value>();
+    assert_eq!(body["code"], "FORBIDDEN");
+    assert!(body.get("encrypted_private_key").is_none());
+    assert!(body.get("argon2_salt").is_none());
+}
+
+#[tokio::test]
+async fn auth_me_refuses_an_unscoped_api_token() {
+    let server = test_app_me_session_only().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let raw = create_api_token(&server, &jwt, "read_write", None).await;
+
+    let resp = bearer(server.get("/api/v1/auth/me"), &raw).await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn auth_me_session_only_still_serves_a_session() {
+    let server = test_app_me_session_only().await;
+    let (_uid, jwt) = verified_user(&server).await;
+
+    let resp = bearer(server.get("/api/v1/auth/me"), &jwt).await;
+    resp.assert_status_ok();
+    let body = resp.json::<serde_json::Value>();
+    assert!(body["encrypted_private_key"].is_string());
+    assert!(body["email"].is_string());
+}
+
+#[tokio::test]
+async fn auth_me_default_gives_a_token_the_key_material_only() {
+    // AUTH_ME_SESSION_ONLY unset (false): the transition setting. Both token
+    // kinds work, and neither learns more than `unlock` reads.
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+    let scoped = create_api_token(&server, &jwt, "read", Some(vault)).await;
+    let unscoped = create_api_token(&server, &jwt, "read_write", None).await;
+
+    let session = bearer(server.get("/api/v1/auth/me"), &jwt).await;
+    session.assert_status_ok();
+    let session = session.json::<serde_json::Value>();
+    assert!(session["email"].is_string());
+    assert!(session["user_id"].is_string());
+
+    for raw in [&scoped, &unscoped] {
+        let resp = bearer(server.get("/api/v1/auth/me"), raw).await;
+        resp.assert_status_ok();
+        let body = resp.json::<serde_json::Value>();
+        let keys: std::collections::BTreeSet<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["argon2_salt", "encrypted_private_key"]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(body["argon2_salt"], session["argon2_salt"]);
+        assert_eq!(
+            body["encrypted_private_key"],
+            session["encrypted_private_key"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn auth_me_default_still_refuses_an_unknown_token() {
+    let server = test_app().await;
+    let fake = format!("evnx_tok_{}", "b".repeat(64));
+    let resp = bearer(server.get("/api/v1/auth/me"), &fake).await;
+    assert_eq!(resp.status_code(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn unverified_email_cannot_reach_vault_routes() {
     let server = test_app().await;
     let user_id = register_user(&server).await;
@@ -262,9 +359,10 @@ async fn api_token_cannot_reach_account_management() {
         .await;
     assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
 
-    // /auth/me allows API tokens by design, so an unknown one is 401, not 403.
+    // With AUTH_ME_SESSION_ONLY=true, /auth/me is a session-only route like the rest.
+    let server = test_app_me_session_only().await;
     let resp = bearer(server.get("/api/v1/auth/me"), &fake).await;
-    assert_eq!(resp.status_code(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -308,6 +406,61 @@ async fn logout_blocklists_the_session_via_valkey() {
 
 /// Login starts allowed per address per window (`routes::auth::SRP_INIT_LIMIT`).
 const SRP_INIT_LIMIT: usize = 30;
+
+async fn srp_init_salts(server: &TestServer, email: &str) -> (String, String) {
+    let ephemeral = generate_client_ephemeral().unwrap();
+    let resp = server
+        .post("/api/v1/auth/srp/init")
+        .json(&serde_json::json!({
+            "email": email,
+            "client_public": hex::encode(&ephemeral.public_a),
+        }))
+        .await;
+    resp.assert_status_ok();
+    let body = resp.json::<serde_json::Value>();
+    (
+        body["srp_salt"].as_str().unwrap().to_string(),
+        body["argon2_salt"].as_str().unwrap().to_string(),
+    )
+}
+
+#[tokio::test]
+async fn srp_init_gives_an_unknown_email_the_same_salts_every_time() {
+    // A known account always gets its own salts, so an address that got fresh
+    // random ones on each call could be told apart by asking twice.
+    let server = test_app().await;
+    let email = unique_email("nobody");
+
+    let first = srp_init_salts(&server, &email).await;
+    let second = srp_init_salts(&server, &email).await;
+    assert_eq!(first, second, "an unknown address got different salts");
+    assert_ne!(first.0, first.1, "the two salts must differ");
+
+    // The same address however it is typed, as the lookup is.
+    let shouty = format!("  {}  ", email.to_uppercase());
+    assert_eq!(first, srp_init_salts(&server, &shouty).await);
+
+    // Different addresses get different salts.
+    let other = srp_init_salts(&server, &unique_email("nobody")).await;
+    assert_ne!(first.0, other.0);
+
+    // And they look like real ones: 32 bytes of base64, as registration requires.
+    for salt in [&first.0, &first.1] {
+        assert_eq!(salt.len(), 44);
+    }
+}
+
+#[tokio::test]
+async fn srp_init_decoy_salts_have_the_shape_of_a_known_accounts() {
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+    let known = srp_init_salts(&server, &account.email).await;
+    assert_eq!(known, srp_init_salts(&server, &account.email).await);
+
+    let decoy = srp_init_salts(&server, &unique_email("nobody")).await;
+    assert_eq!(known.0.len(), decoy.0.len());
+    assert_eq!(known.1.len(), decoy.1.len());
+}
 
 #[tokio::test]
 async fn srp_init_rate_limit_triggers_after_30_attempts() {
@@ -1128,8 +1281,18 @@ async fn log_email_transport_is_refused_outside_development() {
     // first, so neutralise it — otherwise this test would pass on the wrong error.
     std::env::set_var("STORAGE_BACKEND", "s3");
     std::env::set_var("STORAGE_BUCKET", "evnx-test");
+    // SERVER_DATA_KEY is also required outside development and checked before
+    // the email transport; set a throwaway one (32 zero bytes) so this test fails
+    // on the error it is about. A developer's own key in `.env` hid this locally.
+    let prev_data_key = std::env::var("SERVER_DATA_KEY").ok();
+    std::env::set_var("SERVER_DATA_KEY", "A".repeat(43) + "=");
 
     let result = Config::from_env();
+
+    match prev_data_key {
+        Some(v) => std::env::set_var("SERVER_DATA_KEY", v),
+        None => std::env::remove_var("SERVER_DATA_KEY"),
+    }
 
     match previous {
         Some(v) => std::env::set_var("ENVIRONMENT", v),
@@ -1449,6 +1612,106 @@ fn totp_code(secret_base32: &str) -> String {
     .unwrap()
     .generate_current()
     .unwrap()
+}
+
+async fn stored_totp_secret(user_id: Uuid) -> String {
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    sqlx::query_scalar("SELECT totp_secret_enc FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&db)
+        .await
+        .unwrap()
+}
+
+/// Complete a TOTP login for `account` with `secret`, returning the response.
+async fn totp_login(
+    server: &TestServer,
+    account: &SrpAccount,
+    secret: &str,
+) -> axum_test::TestResponse {
+    let body = srp_login(server, account).await;
+    let pending = body["totp_pending_token"].as_str().unwrap().to_string();
+    server
+        .post("/api/v1/auth/totp/verify")
+        .json(&serde_json::json!({
+            "totp_pending_token": pending,
+            "totp_code": totp_code(secret),
+        }))
+        .await
+}
+
+#[tokio::test]
+async fn an_enrolled_totp_secret_is_stored_sealed_and_still_verifies() {
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+    let secret = enable_totp(&server, account.user_id).await;
+
+    let stored = stored_totp_secret(account.user_id).await;
+    assert!(stored.starts_with("v1:"), "stored value is not versioned");
+    assert!(
+        !stored.contains(&secret),
+        "the base32 secret is readable in the column"
+    );
+
+    totp_login(&server, &account, &secret)
+        .await
+        .assert_status_ok();
+}
+
+#[tokio::test]
+async fn an_old_plaintext_totp_secret_is_upgraded_on_read() {
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+    let secret = enable_totp(&server, account.user_id).await;
+
+    // Put the row back the way it was written before secrets were sealed.
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    sqlx::query("UPDATE users SET totp_secret_enc = $1 WHERE id = $2")
+        .bind(&secret)
+        .bind(account.user_id)
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(stored_totp_secret(account.user_id).await, secret);
+
+    // The old value still verifies, and the read rewrites it sealed.
+    totp_login(&server, &account, &secret)
+        .await
+        .assert_status_ok();
+    let stored = stored_totp_secret(account.user_id).await;
+    assert!(stored.starts_with("v1:"), "row was not upgraded: {stored}");
+    assert!(!stored.contains(&secret));
+
+    // And the upgraded value verifies.
+    totp_login(&server, &account, &secret)
+        .await
+        .assert_status_ok();
+}
+
+#[tokio::test]
+async fn a_sealed_totp_secret_copied_to_another_account_does_not_verify() {
+    let server = test_app().await;
+    let a = register_srp_account(&server).await;
+    let b = register_srp_account(&server).await;
+    let secret_a = enable_totp(&server, a.user_id).await;
+    let _secret_b = enable_totp(&server, b.user_id).await;
+
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    sqlx::query("UPDATE users SET totp_secret_enc = $1 WHERE id = $2")
+        .bind(stored_totp_secret(a.user_id).await)
+        .bind(b.user_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let resp = totp_login(&server, &b, &secret_a).await;
+    assert!(
+        !resp.status_code().is_success(),
+        "a ciphertext bound to one user id opened on another's row"
+    );
 }
 
 #[tokio::test]
@@ -3436,6 +3699,521 @@ async fn stage(
     )
 }
 
+/// A push or a staged blob with a nonce that is not 12 bytes, or a hash that is
+/// not 64 lowercase hex characters, is a 422 and stores nothing.
+#[tokio::test]
+async fn blobs_with_badly_sized_fixed_fields_are_refused() {
+    use base64ct::Encoding;
+    let server = test_app().await;
+    let (_owner, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    push_versions(&server, &jwt, vault_id, 1).await;
+
+    let raw = b"some-ciphertext".to_vec();
+    let ct = base64ct::Base64::encode_string(&raw);
+    let good_hash = blake3::hash(&raw).to_hex().to_string();
+
+    let nonce_of = |n: usize| base64ct::Base64::encode_string(&vec![0u8; n]);
+    let upper = good_hash.to_uppercase();
+
+    for (what, nonce, hash) in [
+        ("11-byte nonce", nonce_of(11), good_hash.clone()),
+        ("13-byte nonce", nonce_of(13), good_hash.clone()),
+        ("24-byte nonce", nonce_of(24), good_hash.clone()),
+        ("empty nonce", String::new(), good_hash.clone()),
+        ("uppercase hash", nonce_of(12), upper),
+        ("short hash", nonce_of(12), good_hash[..63].to_string()),
+    ] {
+        let push = bearer(
+            server.post(&format!("/api/v1/vaults/{vault_id}/versions")),
+            &jwt,
+        )
+        .json(&serde_json::json!({
+            "nonce": nonce, "ciphertext": ct, "blob_hash": hash,
+            "key_names": ["A"], "key_count": 1, "base_version": 1,
+        }))
+        .await;
+        assert_eq!(
+            push.status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "push with {what}"
+        );
+        assert_eq!(push.json::<serde_json::Value>()["code"], "VALIDATION_ERROR");
+
+        let stage = bearer(
+            server.post(&format!("/api/v1/vaults/{vault_id}/rekey/blobs")),
+            &jwt,
+        )
+        .json(&serde_json::json!({
+            "version_num": 1, "nonce": nonce, "ciphertext": ct, "blob_hash": hash,
+        }))
+        .await;
+        assert_eq!(
+            stage.status_code(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "stage with {what}"
+        );
+    }
+
+    // Nothing was stored: the vault still has exactly the one version.
+    assert_eq!(version_count(&server, &jwt, vault_id).await, 1);
+
+    // And a well-formed push still works.
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/versions")),
+        &jwt,
+    )
+    .json(&serde_json::json!({
+        "nonce": nonce_of(12), "ciphertext": ct, "blob_hash": good_hash,
+        "key_names": ["A"], "key_count": 1, "base_version": 1,
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+}
+
+async fn db_blob_key(vault_id: Uuid, version_num: i32) -> String {
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    sqlx::query_scalar(
+        "SELECT blob_key FROM vault_versions WHERE vault_id = $1 AND version_num = $2",
+    )
+    .bind(vault_id)
+    .bind(version_num)
+    .fetch_one(&db)
+    .await
+    .unwrap()
+}
+
+/// What the swap must refuse about a staged blob, and that a refusal repoints
+/// nothing.
+#[tokio::test]
+async fn a_rekey_swap_checks_the_blobs_it_is_told_to_use() {
+    let server = test_app().await;
+    let (owner_id, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    let other_vault = create_vault(&server, &jwt).await;
+    push_versions(&server, &jwt, vault_id, 2).await;
+    push_versions(&server, &jwt, other_vault, 1).await;
+
+    let before: Vec<String> = vec![
+        db_blob_key(vault_id, 1).await,
+        db_blob_key(vault_id, 2).await,
+    ];
+
+    let (k1, h1, s1) = stage(&server, &jwt, vault_id, 1).await;
+    let (k2, h2, s2) = stage(&server, &jwt, vault_id, 2).await;
+    let (foreign_key, foreign_hash, foreign_size) = stage(&server, &jwt, other_vault, 1).await;
+    let ver = |n: i32, key: &str, hash: &str, size: i32| {
+        serde_json::json!({
+            "version_num": n, "blob_key": key, "blob_hash": hash, "blob_size_bytes": size,
+        })
+    };
+    let missing_key = format!("vaults/{vault_id}/00000002/{}.enc", Uuid::new_v4());
+    let wrong_hash = blake3::hash(b"something else").to_hex().to_string();
+
+    let cases: Vec<(&str, Vec<serde_json::Value>, StatusCode)> = vec![
+        (
+            "another vault's object",
+            vec![
+                ver(1, &k1, &h1, s1),
+                ver(2, &foreign_key, &foreign_hash, foreign_size),
+            ],
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "another version's object",
+            vec![ver(1, &k2, &h2, s2), ver(2, &k2, &h2, s2)],
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "a path that is not a staged key",
+            vec![
+                ver(1, &k1, &h1, s1),
+                ver(2, "vaults/../etc/passwd", &h2, s2),
+            ],
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "an object that does not exist",
+            vec![ver(1, &k1, &h1, s1), ver(2, &missing_key, &h2, s2)],
+            StatusCode::CONFLICT,
+        ),
+        (
+            "a hash that is not the object's",
+            vec![ver(1, &k1, &h1, s1), ver(2, &k2, &wrong_hash, s2)],
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "a size that is not the object's",
+            vec![ver(1, &k1, &h1, s1), ver(2, &k2, &h2, s2 + 1)],
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "the blob the version already uses",
+            vec![ver(1, &k1, &h1, s1), ver(2, &before[1], &h2, s2)],
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ];
+
+    for (what, versions, expected) in cases {
+        let resp = bearer(
+            server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+            &jwt,
+        )
+        .json(&serde_json::json!({ "versions": versions, "members": [wrap_for(owner_id)] }))
+        .await;
+        assert_eq!(resp.status_code(), expected, "{what}: {}", resp.text());
+        // Nothing moved, not even the version whose blob was fine.
+        assert_eq!(db_blob_key(vault_id, 1).await, before[0], "{what}");
+        assert_eq!(db_blob_key(vault_id, 2).await, before[1], "{what}");
+    }
+
+    // The honest swap still goes through, and then points at the staged blobs.
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &jwt,
+    )
+    .json(&serde_json::json!({
+        "versions": [ver(1, &k1, &h1, s1), ver(2, &k2, &h2, s2)],
+        "members": [wrap_for(owner_id)],
+    }))
+    .await
+    .assert_status_ok();
+    assert_eq!(db_blob_key(vault_id, 1).await, k1);
+    assert_eq!(db_blob_key(vault_id, 2).await, k2);
+}
+
+async fn test_storage() -> evnx_server::services::storage::StorageService {
+    evnx_server::services::storage::StorageService::from_config(&test_config().await).unwrap()
+}
+
+async fn test_pool() -> sqlx::PgPool {
+    sqlx::PgPool::connect(&test_config().await.database_url)
+        .await
+        .unwrap()
+}
+
+/// After a re-key commits the replaced blobs are gone and the new ones stay.
+#[tokio::test]
+async fn a_rekey_deletes_the_blobs_it_replaced() {
+    let server = test_app().await;
+    let storage = test_storage().await;
+    let (owner_id, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    push_versions(&server, &jwt, vault_id, 2).await;
+
+    let old = [
+        db_blob_key(vault_id, 1).await,
+        db_blob_key(vault_id, 2).await,
+    ];
+    for k in &old {
+        assert!(storage.blob_exists(k).await.unwrap(), "setup: {k}");
+    }
+
+    let mut versions = Vec::new();
+    for v in 1..=2 {
+        let (blob_key, blob_hash, size) = stage(&server, &jwt, vault_id, v).await;
+        versions.push(serde_json::json!({
+            "version_num": v, "blob_key": blob_key,
+            "blob_hash": blob_hash, "blob_size_bytes": size,
+        }));
+    }
+
+    // A refused swap deletes nothing: the old blobs are still what the vault
+    // opens with.
+    let refused = bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &jwt,
+    )
+    .json(&serde_json::json!({ "versions": versions, "members": [] }))
+    .await;
+    assert_eq!(refused.status_code(), StatusCode::CONFLICT);
+    for k in &old {
+        assert!(
+            storage.blob_exists(k).await.unwrap(),
+            "{k} deleted by a refused swap"
+        );
+    }
+
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &jwt,
+    )
+    .json(&serde_json::json!({ "versions": versions, "members": [wrap_for(owner_id)] }))
+    .await
+    .assert_status_ok();
+
+    for k in &old {
+        assert!(
+            !storage.blob_exists(k).await.unwrap(),
+            "{k} survived the re-key"
+        );
+    }
+    for v in 1..=2 {
+        let now = db_blob_key(vault_id, v).await;
+        assert!(
+            storage.blob_exists(&now).await.unwrap(),
+            "new blob {now} missing"
+        );
+    }
+
+    // The vault still serves its versions from the new blobs.
+    let resp = bearer(
+        server.get(&format!("/api/v1/vaults/{vault_id}/versions/2/blob")),
+        &jwt,
+    )
+    .await;
+    resp.assert_status_ok();
+}
+
+/// The orphan finder lists unreferenced, old-enough objects, never a
+/// referenced one or a young one, and deleting is idempotent.
+#[tokio::test]
+async fn the_orphan_sweep_finds_only_unreferenced_old_objects() {
+    use evnx_server::services::blob_sweep::{delete_all, find_orphans};
+    let server = test_app().await;
+    let storage = test_storage().await;
+    let db = test_pool().await;
+    let (_owner, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    push_versions(&server, &jwt, vault_id, 1).await;
+    let referenced = db_blob_key(vault_id, 1).await;
+
+    // An object nothing points to, shaped like the server's own keys.
+    let orphan = evnx_server::services::storage::StorageService::blob_key(vault_id, 7);
+    storage
+        .upload_blob(&orphan, bytes::Bytes::from_static(b"stray"))
+        .await
+        .unwrap();
+    // A stray file that is not a blob key at all.
+    let stray = format!("vaults/{vault_id}/README.txt");
+    storage
+        .upload_blob(&stray, bytes::Bytes::from_static(b"hi"))
+        .await
+        .unwrap();
+
+    // Everything is "too new" for a 24 hour minimum.
+    let young = find_orphans(&db, &storage, chrono::Duration::hours(24))
+        .await
+        .unwrap();
+    assert!(
+        !young.orphans.contains(&orphan),
+        "a young object was offered"
+    );
+
+    // With no minimum it is offered; the referenced blob and the stray file
+    // never are.
+    let report = find_orphans(&db, &storage, chrono::Duration::zero())
+        .await
+        .unwrap();
+    assert!(report.orphans.contains(&orphan));
+    assert!(!report.orphans.contains(&referenced));
+    assert!(!report.orphans.contains(&stray));
+    assert!(report.unrecognised >= 1);
+    assert!(report.referenced >= 1);
+
+    // Delete only our own object: other tests are running against this storage.
+    let (deleted, failed) = delete_all(&storage, std::slice::from_ref(&orphan)).await;
+    assert_eq!((deleted, failed.len()), (1, 0));
+    assert!(!storage.blob_exists(&orphan).await.unwrap());
+    assert!(storage.blob_exists(&referenced).await.unwrap());
+    assert!(storage.blob_exists(&stray).await.unwrap());
+
+    // Again, with the object already gone: still fine.
+    let (_, failed) = delete_all(&storage, std::slice::from_ref(&orphan)).await;
+    assert!(failed.is_empty());
+    let again = find_orphans(&db, &storage, chrono::Duration::zero())
+        .await
+        .unwrap();
+    assert!(!again.orphans.contains(&orphan));
+
+    storage.delete_blob(&stray).await.unwrap();
+}
+
+/// The command is a dry run unless told otherwise, and rejects what it does not
+/// understand.
+#[tokio::test]
+async fn the_sweep_command_defaults_to_a_dry_run() {
+    use evnx_server::services::blob_sweep::run_command;
+    let storage = test_storage().await;
+    let db = test_pool().await;
+    let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    let orphan = evnx_server::services::storage::StorageService::blob_key(Uuid::new_v4(), 1);
+    storage
+        .upload_blob(&orphan, bytes::Bytes::from_static(b"stray"))
+        .await
+        .unwrap();
+
+    // Dry run with no minimum age: lists it, deletes nothing.
+    assert_eq!(
+        run_command(&db, &storage, &args(&["--min-age-hours", "0"])).await,
+        0
+    );
+    assert!(
+        storage.blob_exists(&orphan).await.unwrap(),
+        "a dry run deleted"
+    );
+
+    // --apply with a minimum no object can meet deletes nothing either.
+    assert_eq!(
+        run_command(
+            &db,
+            &storage,
+            &args(&["--apply", "--min-age-hours", "100000"])
+        )
+        .await,
+        0
+    );
+    assert!(storage.blob_exists(&orphan).await.unwrap());
+
+    assert_eq!(run_command(&db, &storage, &args(&["--wat"])).await, 2);
+    assert_eq!(
+        run_command(&db, &storage, &args(&["--min-age-hours"])).await,
+        2
+    );
+    assert_eq!(
+        run_command(&db, &storage, &args(&["--min-age-hours", "-3"])).await,
+        2
+    );
+
+    storage.delete_blob(&orphan).await.unwrap();
+}
+
+const MIGRATION_016: &str = include_str!("../migrations/016_wrap_is_whole_is_validated.sql");
+
+/// Put a vault_members row into the state migration 004 left old databases in:
+/// the CHECK dropped, a row that violates it inserted, the CHECK back as NOT VALID.
+/// Runs inside the caller's transaction, which the caller then rolls back.
+async fn insert_pre_hybrid_row(
+    tx: &mut sqlx::PgConnection,
+    vault_id: Uuid,
+    user_id: Uuid,
+    role: &str,
+    eph: Option<&str>,
+    mlkem: Option<&str>,
+) {
+    sqlx::query("INSERT INTO vault_members (vault_id, user_id, role, encrypted_vault_key, eph_pub_key, mlkem_ciphertext)
+                 VALUES ($1, $2, $3, 'Zm9v', $4, $5)")
+        .bind(vault_id)
+        .bind(user_id)
+        .bind(role)
+        .bind(eph)
+        .bind(mlkem)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+}
+
+async fn wrap_check_is_validated(tx: &mut sqlx::PgConnection) -> bool {
+    sqlx::query_scalar(
+        "SELECT convalidated FROM pg_constraint WHERE conname = 'vault_members_wrap_is_whole'",
+    )
+    .fetch_one(tx)
+    .await
+    .unwrap()
+}
+
+async fn with_constraint_not_valid(tx: &mut sqlx::PgConnection) {
+    sqlx::query("ALTER TABLE vault_members DROP CONSTRAINT IF EXISTS vault_members_wrap_is_whole")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+}
+
+async fn restore_constraint_not_valid(tx: &mut sqlx::PgConnection) {
+    sqlx::query(
+        "ALTER TABLE vault_members ADD CONSTRAINT vault_members_wrap_is_whole
+         CHECK ((eph_pub_key IS NULL AND mlkem_ciphertext IS NULL)
+             OR (eph_pub_key IS NOT NULL AND mlkem_ciphertext IS NOT NULL)) NOT VALID",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+}
+
+/// The cleanup migration removes shares the client can never open, leaves every
+/// working wrap alone and validates the constraint. Rolled back afterwards.
+#[tokio::test]
+async fn migration_016_removes_unopenable_shares_and_validates_the_check() {
+    let server = test_app().await;
+    let (owner_id, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    let (good_id, _j) = member_at(&server, &jwt, vault_id, "developer").await;
+    let (no_kem, _, _) = verified_user_with_email(&server, "nokem").await;
+    let (no_eph, _, _) = verified_user_with_email(&server, "noeph").await;
+
+    let pool = test_pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    with_constraint_not_valid(&mut tx).await;
+    // Pre-hybrid share: an ephemeral key and no ML-KEM ciphertext.
+    insert_pre_hybrid_row(&mut tx, vault_id, no_kem, "viewer", Some("YmFy"), None).await;
+    // The converse, which no code path writes.
+    insert_pre_hybrid_row(&mut tx, vault_id, no_eph, "viewer", None, Some("Y")).await;
+    restore_constraint_not_valid(&mut tx).await;
+
+    assert!(
+        !wrap_check_is_validated(&mut tx).await,
+        "setup: the check should be NOT VALID"
+    );
+
+    sqlx::raw_sql(MIGRATION_016)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    let members: Vec<Uuid> =
+        sqlx::query_scalar("SELECT user_id FROM vault_members WHERE vault_id = $1")
+            .bind(vault_id)
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+    assert!(
+        members.contains(&owner_id),
+        "the owner's own copy was removed"
+    );
+    assert!(
+        members.contains(&good_id),
+        "a working hybrid share was removed"
+    );
+    assert!(!members.contains(&no_kem), "an unopenable share was kept");
+    assert!(!members.contains(&no_eph), "a half-wrap was kept");
+    assert!(
+        wrap_check_is_validated(&mut tx).await,
+        "the check was not validated"
+    );
+
+    // Running it again changes nothing.
+    sqlx::raw_sql(MIGRATION_016)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+}
+
+/// An owner row that violates the check stops the migration instead of being
+/// deleted.
+#[tokio::test]
+async fn migration_016_stops_rather_than_delete_an_owner_row() {
+    let server = test_app().await;
+    let (_owner, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    let (other, _, _) = verified_user_with_email(&server, "odd-owner").await;
+
+    let pool = test_pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    with_constraint_not_valid(&mut tx).await;
+    insert_pre_hybrid_row(&mut tx, vault_id, other, "owner", Some("YmFy"), None).await;
+    restore_constraint_not_valid(&mut tx).await;
+
+    let err = sqlx::raw_sql(MIGRATION_016)
+        .execute(&mut *tx)
+        .await
+        .expect_err("the migration should have stopped");
+    assert!(err.to_string().contains("owner row"), "{err}");
+    // Transaction is aborted; dropping it rolls the whole setup back.
+}
+
 /// A hybrid wrap — what you produce for somebody else from their public keys.
 fn wrap_for(user_id: Uuid) -> serde_json::Value {
     serde_json::json!({
@@ -5061,6 +5839,203 @@ async fn a_rotation_can_be_undone_with_the_old_password() {
     );
 }
 
+/// (closed, outcome, holds any previous material) for each of a user's
+/// rotation snapshots, oldest first.
+async fn snapshot_state(user_id: Uuid) -> Vec<(bool, Option<String>, bool)> {
+    sqlx::query_as::<_, (bool, Option<String>, bool)>(
+        "SELECT consumed_at IS NOT NULL, outcome,
+                (prev_srp_salt IS NOT NULL OR prev_srp_verifier IS NOT NULL
+                 OR prev_argon2_salt IS NOT NULL
+                 OR prev_encrypted_private_key IS NOT NULL OR prev_wraps IS NOT NULL)
+           FROM master_key_rotations WHERE user_id = $1 ORDER BY rotated_at",
+    )
+    .bind(user_id)
+    .fetch_all(&test_pool().await)
+    .await
+    .unwrap()
+}
+
+/// A snapshot holds the previous material while it is live and nothing once it
+/// has been used.
+#[tokio::test]
+async fn a_restored_snapshot_keeps_no_secret_material() {
+    let server = test_app().await;
+    let original = Credential::new(b"clear me after the undo");
+    let (email, user_id) = register_with(&server, &original).await;
+    let access = verified_jwt(user_id).await;
+    let vault = create_vault(&server, &access).await;
+
+    assert_eq!(
+        reauth(&server, &email, &access, &original).await,
+        StatusCode::OK
+    );
+    bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(
+            &email,
+            &Credential::new(b"temporary"),
+            &[vault],
+            "routine",
+        ))
+        .await
+        .assert_status_ok();
+    assert_eq!(snapshot_state(user_id).await, vec![(false, None, true)]);
+
+    assert_eq!(undo(&server, &email, &original).await.0, StatusCode::OK);
+    assert_eq!(
+        snapshot_state(user_id).await,
+        vec![(true, Some("restored".to_string()), false)]
+    );
+}
+
+/// An expired snapshot is closed and emptied by the timed pass, whether or not
+/// its account rotates again, and the pass can be repeated.
+#[tokio::test]
+async fn an_expired_snapshot_is_cleared_without_waiting_for_another_rotation() {
+    let server = test_app().await;
+    let original = Credential::new(b"expire me");
+    let (email, user_id) = register_with(&server, &original).await;
+    let access = verified_jwt(user_id).await;
+
+    assert_eq!(
+        reauth(&server, &email, &access, &original).await,
+        StatusCode::OK
+    );
+    bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(
+            &email,
+            &Credential::new(b"next"),
+            &[],
+            "routine",
+        ))
+        .await
+        .assert_status_ok();
+
+    let db = test_pool().await;
+    // Still inside its window: the pass leaves it alone.
+    evnx_server::db::rotation::expire_all_stale_snapshots(&db)
+        .await
+        .unwrap();
+    assert_eq!(snapshot_state(user_id).await, vec![(false, None, true)]);
+
+    sqlx::query(
+        "UPDATE master_key_rotations SET expires_at = NOW() - interval '1 minute'
+          WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .execute(&db)
+    .await
+    .unwrap();
+    // Past its window but not yet swept: it must not be restorable either.
+    assert_eq!(
+        undo(&server, &email, &original).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let swept = evnx_server::db::rotation::expire_all_stale_snapshots(&db)
+        .await
+        .unwrap();
+    assert!(swept >= 1);
+    assert_eq!(
+        snapshot_state(user_id).await,
+        vec![(true, Some("expired".to_string()), false)]
+    );
+
+    // Repeating changes nothing.
+    evnx_server::db::rotation::expire_all_stale_snapshots(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot_state(user_id).await,
+        vec![(true, Some("expired".to_string()), false)]
+    );
+}
+
+/// The same clearing happens when the account rotates again after the window.
+#[tokio::test]
+async fn rotating_again_after_the_window_clears_the_expired_snapshot() {
+    let server = test_app().await;
+    let first = Credential::new(b"first password");
+    let (email, user_id) = register_with(&server, &first).await;
+    let access = verified_jwt(user_id).await;
+
+    assert_eq!(
+        reauth(&server, &email, &access, &first).await,
+        StatusCode::OK
+    );
+    let second = Credential::new(b"second password");
+    bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(&email, &second, &[], "routine"))
+        .await
+        .assert_status_ok();
+
+    sqlx::query(
+        "UPDATE master_key_rotations SET expires_at = NOW() - interval '1 minute'
+          WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .execute(&test_pool().await)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        reauth(&server, &email, &access, &second).await,
+        StatusCode::OK
+    );
+    bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(
+            &email,
+            &Credential::new(b"third password"),
+            &[],
+            "routine",
+        ))
+        .await
+        .assert_status_ok();
+
+    // The old one is closed and empty; the new one is live and whole.
+    assert_eq!(
+        snapshot_state(user_id).await,
+        vec![
+            (true, Some("expired".to_string()), false),
+            (false, None, true)
+        ]
+    );
+}
+
+/// The table refuses a closed snapshot that still holds material, and a live
+/// one that does not.
+#[tokio::test]
+async fn the_database_refuses_a_closed_snapshot_with_material() {
+    let server = test_app().await;
+    let original = Credential::new(b"constraint");
+    let (email, user_id) = register_with(&server, &original).await;
+    let access = verified_jwt(user_id).await;
+    assert_eq!(
+        reauth(&server, &email, &access, &original).await,
+        StatusCode::OK
+    );
+    bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(&email, &Credential::new(b"x"), &[], "routine"))
+        .await
+        .assert_status_ok();
+
+    let db = test_pool().await;
+    let close_without_clearing = sqlx::query(
+        "UPDATE master_key_rotations SET consumed_at = NOW(), outcome = 'expired'
+          WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .execute(&db)
+    .await;
+    assert!(close_without_clearing.is_err());
+
+    let empty_but_live =
+        sqlx::query("UPDATE master_key_rotations SET prev_srp_verifier = NULL WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&db)
+            .await;
+    assert!(empty_but_live.is_err());
+}
+
 /// An undo is one-shot.
 #[tokio::test]
 async fn a_snapshot_can_only_be_restored_once() {
@@ -5165,6 +6140,26 @@ async fn a_compromised_rotation_keeps_no_way_back() {
         undo(&server, &email, &leaked).await.0,
         StatusCode::UNAUTHORIZED
     );
+}
+
+#[tokio::test]
+async fn undo_init_gives_an_address_with_no_snapshot_the_same_salts_every_time() {
+    let server = test_app().await;
+    let email = unique_email("no-snapshot");
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let ephemeral = generate_client_ephemeral().unwrap();
+        let body = server
+            .post("/api/v1/auth/master-key/undo/init")
+            .json(&serde_json::json!({
+                "email": email,
+                "client_public": hex::encode(&ephemeral.public_a),
+            }))
+            .await
+            .json::<serde_json::Value>();
+        seen.push((body["srp_salt"].clone(), body["argon2_salt"].clone()));
+    }
+    assert_eq!(seen[0], seen[1]);
 }
 
 /// ⚠️ `/master-key/undo/init` is unauthenticated, so it must not say which
@@ -5323,31 +6318,122 @@ async fn an_old_version_can_be_deleted() {
     assert_eq!(version_count(&server, &jwt, vault).await, 1);
 }
 
-/// ⚠️ The invariant the rest of the system leans on: the latest version is the one
-/// most recently pushed. Deleting it would silently change what `cloud pull` and
-/// `cloud run` return — the next deploy would pick up older secrets with nobody
-/// having asked, and nothing in the output would say so.
+/// The only version cannot be deleted: that would leave an empty vault with no
+/// way to tell a consumer why.
 #[tokio::test]
-async fn the_latest_version_cannot_be_deleted() {
+async fn the_only_version_cannot_be_deleted() {
     let server = test_app().await;
     let (_uid, jwt) = verified_user(&server).await;
     let vault = create_vault(&server, &jwt).await;
+    assert_eq!(push_one(&server, &jwt, vault, 0).await, StatusCode::CREATED);
 
+    let resp = bearer(
+        server.delete(&format!("/api/v1/vaults/{vault}/versions/1")),
+        &jwt,
+    )
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::CONFLICT);
+    assert!(
+        resp.text().contains("only version"),
+        "the refusal must say why: {}",
+        resp.text()
+    );
+    assert_eq!(version_count(&server, &jwt, vault).await, 1);
+}
+
+/// A bad latest can be rolled back: the previous version becomes the latest, the
+/// blob goes, the next push carries on from there, and it is audited.
+#[tokio::test]
+async fn an_admin_can_delete_the_latest_version_when_an_older_one_exists() {
+    let server = test_app().await;
+    let storage = test_storage().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
     assert_eq!(push_one(&server, &jwt, vault, 0).await, StatusCode::CREATED);
     assert_eq!(push_one(&server, &jwt, vault, 1).await, StatusCode::CREATED);
+    let bad_key = db_blob_key(vault, 2).await;
+    let good_key = db_blob_key(vault, 1).await;
 
     let resp = bearer(
         server.delete(&format!("/api/v1/vaults/{vault}/versions/2")),
         &jwt,
     )
     .await;
-    assert_eq!(resp.status_code(), StatusCode::CONFLICT);
-    assert!(
-        resp.text().contains("latest"),
-        "the refusal must say why: {}",
-        resp.text()
-    );
+    resp.assert_status_ok();
+    let body = resp.json::<serde_json::Value>();
+    assert_eq!(body["deleted"], 2);
+    assert_eq!(body["latest"], 1);
+    assert_eq!(body["was_latest"], true);
+
+    assert_eq!(version_count(&server, &jwt, vault).await, 1);
+    let latest = bearer(
+        server.get(&format!("/api/v1/vaults/{vault}/versions/latest")),
+        &jwt,
+    )
+    .await
+    .json::<serde_json::Value>();
+    assert_eq!(latest["version_num"], 1);
+    assert!(!storage.blob_exists(&bad_key).await.unwrap());
+    assert!(storage.blob_exists(&good_key).await.unwrap());
+
+    // Pushing resumes from the version that is now the latest.
+    assert_eq!(push_one(&server, &jwt, vault, 1).await, StatusCode::CREATED);
     assert_eq!(version_count(&server, &jwt, vault).await, 2);
+
+    let events = audit_events(vault).await;
+    let deleted: Vec<_> = events
+        .iter()
+        .filter(|(t, _)| t == "version_deleted")
+        .collect();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0].1["version_num"], 2);
+    assert_eq!(deleted[0].1["was_latest"], true);
+    assert_eq!(deleted[0].1["latest_after"], 1);
+}
+
+/// Deleting an older version leaves the latest alone and says so.
+#[tokio::test]
+async fn deleting_an_older_version_reports_it_was_not_the_latest() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+    assert_eq!(push_one(&server, &jwt, vault, 0).await, StatusCode::CREATED);
+    assert_eq!(push_one(&server, &jwt, vault, 1).await, StatusCode::CREATED);
+
+    let body = bearer(
+        server.delete(&format!("/api/v1/vaults/{vault}/versions/1")),
+        &jwt,
+    )
+    .await
+    .json::<serde_json::Value>();
+    assert_eq!(body["deleted"], 1);
+    assert_eq!(body["latest"], 2);
+    assert_eq!(body["was_latest"], false);
+}
+
+/// Rolling back is an admin act, like every other deletion.
+#[tokio::test]
+async fn a_developer_cannot_delete_the_latest_version() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &owner_jwt).await;
+    assert_eq!(
+        push_one(&server, &owner_jwt, vault, 0).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        push_one(&server, &owner_jwt, vault, 1).await,
+        StatusCode::CREATED
+    );
+    let (_id, dev_jwt) = member_at(&server, &owner_jwt, vault, "developer").await;
+
+    let resp = bearer(
+        server.delete(&format!("/api/v1/vaults/{vault}/versions/2")),
+        &dev_jwt,
+    )
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+    assert_eq!(version_count(&server, &owner_jwt, vault).await, 2);
 }
 
 /// ⚠️ **The whole reason this endpoint exists.** The quota tells people to delete
@@ -9904,6 +10990,138 @@ async fn c4_push_loses_to_a_revocation(downgrade: bool) {
         0,
         "the refused push left its blob behind"
     );
+}
+
+/// The version limit is counted under the push's locks, not before them.
+///
+/// Free plan, limit L: the vault holds L-1 versions with the newest numbered L,
+/// so the push passes the early count and is based on the real latest. While it
+/// waits at its membership lock, another writer adds the missing version (a gap
+/// below the latest, so `latest` does not move and the stale-base check cannot
+/// help). The push must be refused with the plan-limit 403 and add nothing.
+#[tokio::test]
+async fn c4_a_push_is_counted_against_the_version_limit_after_its_locks() {
+    let server = test_app().await;
+    let limit = test_config()
+        .await
+        .quotas
+        .free
+        .versions_per_vault
+        .expect("test: the free plan has a version limit") as i32;
+    assert!(limit >= 3, "test: needs room for a gap");
+
+    let (owner_id, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    let pool = c4_pool().await;
+
+    let insert_version = |n: i32| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO vault_versions
+                    (vault_id, version_num, blob_key, blob_size_bytes, blob_hash, pushed_by)
+                 VALUES ($1, $2, $3, 3, $4, $5)",
+            )
+            .bind(vault_id)
+            .bind(n)
+            .bind(format!("test/{}", Uuid::new_v4()))
+            .bind("a".repeat(64))
+            .bind(owner_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    // 1..=L except L-1: L-1 rows, latest L.
+    for n in (1..=limit).filter(|n| *n != limit - 1) {
+        insert_version(n).await;
+    }
+    assert_eq!(
+        c4_version_count(&pool, vault_id).await,
+        i64::from(limit) - 1
+    );
+
+    // Hold the owner's membership row so the push blocks after its early checks.
+    let mut tx = pool.begin().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT 1 FROM vault_members WHERE vault_id = $1 AND user_id = $2 FOR UPDATE")
+        .bind(vault_id)
+        .bind(owner_id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+
+    let push = c4_push(&server, &jwt, vault_id, Some(limit), "over-the-limit");
+    let release = async {
+        c4_wait_blocked_by(&pool, pid).await;
+        // The other writer lands the missing version, then lets the push go.
+        insert_version(limit - 1).await;
+        tx.commit().await.unwrap();
+    };
+    let (resp, ()) = tokio::join!(push, release);
+
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN, "{}", resp.text());
+    let body = resp.json::<serde_json::Value>();
+    assert_eq!(body["code"], "FORBIDDEN");
+    assert_eq!(body["reason"], "PLAN_LIMIT");
+    assert_eq!(
+        c4_version_count(&pool, vault_id).await,
+        i64::from(limit),
+        "the push went past the limit"
+    );
+    assert_eq!(
+        c4_blob_files(vault_id).await,
+        0,
+        "the refused push left its blob behind"
+    );
+}
+
+/// A push is audited in its own transaction: when the event cannot be written
+/// the push does not happen, and nothing is left behind.
+///
+/// The write is made to fail with a constraint that rejects push events for this
+/// vault alone, so other tests running against the same database are unaffected.
+#[tokio::test]
+async fn a_push_whose_audit_event_cannot_be_written_fails() {
+    let server = test_app().await;
+    let (_owner, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    let pool = c4_pool().await;
+
+    let name = format!("zz_test_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "ALTER TABLE audit_events ADD CONSTRAINT {name}
+         CHECK (vault_id IS DISTINCT FROM '{vault_id}'::uuid OR event_type <> 'push')"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let refused = c4_push(&server, &jwt, vault_id, None, "unaudited").await;
+    let dropped = sqlx::query(&format!("ALTER TABLE audit_events DROP CONSTRAINT {name}"))
+        .execute(&pool)
+        .await;
+
+    assert_eq!(refused.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(c4_version_count(&pool, vault_id).await, 0);
+    assert_eq!(
+        c4_blob_files(vault_id).await,
+        0,
+        "the failed push left its blob behind"
+    );
+    dropped.unwrap();
+
+    // With the audit table writable again the same push works, and is recorded.
+    c4_push(&server, &jwt, vault_id, None, "audited")
+        .await
+        .assert_status(StatusCode::CREATED);
+    let events = audit_events(vault_id).await;
+    assert_eq!(events.iter().filter(|(t, _)| t == "push").count(), 1);
+    let push = events.iter().find(|(t, _)| t == "push").unwrap();
+    assert_eq!(push.1["version"], 1);
 }
 
 #[tokio::test]

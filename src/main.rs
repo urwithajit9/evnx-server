@@ -34,6 +34,28 @@ async fn main() {
 
     tracing::info!(environment = ?config.environment, "Configuration loaded");
 
+    // `evnx-server sweep-blobs [--apply]`: an admin command that needs the
+    // database and object storage and nothing else, so it runs before Valkey
+    // and the migrations and never starts the server.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("sweep-blobs") {
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&config.database_url)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to connect to database: {e}");
+                std::process::exit(1);
+            });
+        let storage = StorageService::from_config(&config).unwrap_or_else(|e| {
+            eprintln!("Object storage configuration error: {e}");
+            std::process::exit(1);
+        });
+        std::process::exit(
+            evnx_server::services::blob_sweep::run_command(&db, &storage, &args[1..]).await,
+        );
+    }
+
     let db = sqlx::postgres::PgPoolOptions::new()
         .max_connections(config.database_max_connections)
         .connect(&config.database_url)
@@ -71,6 +93,10 @@ async fn main() {
         });
 
     tracing::info!("✓ Migrations applied");
+
+    // Closes master-key rotation snapshots whose undo window has run out and
+    // clears the old account material in them. Hourly, and once now.
+    spawn_snapshot_expiry(db.clone());
 
     let jwt = JwtService::new(&config.jwt_secret, config.jwt_expiry_minutes);
 
@@ -131,6 +157,22 @@ async fn main() {
     .unwrap_or_else(|e| {
         tracing::error!("Server error: {}", e);
         std::process::exit(1);
+    });
+}
+
+/// Expire stale rotation snapshots on a timer. A failure is logged and retried
+/// at the next tick; nothing depends on this running promptly.
+fn spawn_snapshot_expiry(db: sqlx::PgPool) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            tick.tick().await;
+            match evnx_server::db::rotation::expire_all_stale_snapshots(&db).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(count = n, "expired master-key rotation snapshots"),
+                Err(e) => tracing::warn!(error = %e, "could not expire rotation snapshots"),
+            }
+        }
     });
 }
 

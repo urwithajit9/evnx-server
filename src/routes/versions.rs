@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::middleware::client_ip::ClientContext;
+use crate::services::transport::{stored_blob_hash, transport_hash, NONCE_LEN};
 use crate::{
     db::versions,
     errors::AppError,
@@ -53,8 +54,13 @@ pub async fn push_version(
         vault_id, user_id, ..
     } = access;
 
-    // Before the blob is uploaded, so a refusal leaves no orphan in storage.
-    crate::services::quota::check_version_limit(&state.db, &state.config.quotas, vault_id).await?;
+    // Before the blob is uploaded, so an obvious refusal leaves no orphan in
+    // storage. Like the stale-base check below this is an early, lock-free
+    // refusal and not the guarantee: the count is taken again inside the
+    // transaction, under the locks, and that is the one that holds.
+    let cap =
+        crate::services::quota::version_cap(&state.db, &state.config.quotas, vault_id).await?;
+    cap.check(versions::count(&state.db, vault_id).await?)?;
 
     // 2. Optimistic locking: check base_version matches current latest.
     //
@@ -77,9 +83,10 @@ pub async fn push_version(
         .map_err(|_| AppError::Validation("nonce: invalid base64".into()))?;
     let ciphertext_bytes = base64_decode(&req.ciphertext)
         .map_err(|_| AppError::Validation("ciphertext: invalid base64".into()))?;
+    check_blob_fields(&nonce_bytes, &req.blob_hash)?;
 
     // Verify the client's declared blob_hash matches the actual ciphertext
-    let actual_hash = blake3::hash(&ciphertext_bytes).to_hex().to_string();
+    let actual_hash = transport_hash(&ciphertext_bytes);
     if actual_hash != req.blob_hash {
         return Err(AppError::Validation(
             "blob_hash does not match ciphertext content".into(),
@@ -103,6 +110,8 @@ pub async fn push_version(
     let inserted = commit_version(
         &state.db,
         user_id,
+        &client,
+        &cap,
         current_num,
         req.base_version,
         versions::CreateVersion {
@@ -133,27 +142,6 @@ pub async fn push_version(
         }
     };
 
-    // 6. Record audit event (fire-and-forget — don't block response)
-    tokio::spawn({
-        let db = state.db.clone();
-        // vault_id and user_id are Copy — `async move` captures them directly.
-        let version_num = new_version_num;
-        async move {
-            let _ = crate::services::audit::record(
-                &db,
-                crate::services::audit::AuditEvent {
-                    vault_id: Some(vault_id),
-                    user_id: Some(user_id),
-                    event_type: "push".into(),
-                    metadata: Some(serde_json::json!({ "version": version_num })),
-                    ip_hash: client.ip_hash.clone(),
-                    user_agent_hash: client.user_agent_hash.clone(),
-                },
-            )
-            .await;
-        }
-    });
-
     Ok((
         axum::http::StatusCode::CREATED,
         Json(PushVersionResponse {
@@ -181,6 +169,9 @@ fn stale_push(remote_at: i32, based_on: i32) -> AppError {
 /// SHARE` until commit makes a concurrent removal or downgrade wait for this
 /// push, and makes a push that starts afterwards see it.
 ///
+/// The version limit is counted after those locks and before the insert, so two
+/// writers cannot each count under the limit and both add a row past it.
+///
 /// `expected_latest` is what the pre-upload read saw. The blob key was named for
 /// `expected_latest + 1`, so if the vault has moved on the push is stale
 /// whether or not the client sent a `base_version`: 409, not a renumbered
@@ -188,6 +179,8 @@ fn stale_push(remote_at: i32, based_on: i32) -> AppError {
 async fn commit_version(
     db: &sqlx::PgPool,
     user_id: Uuid,
+    client: &ClientContext,
+    cap: &crate::services::quota::VersionCap,
     expected_latest: i32,
     base_version: Option<i32>,
     input: versions::CreateVersion,
@@ -229,6 +222,10 @@ async fn commit_version(
         return Err(stale_push(latest, base_version.unwrap_or(expected_latest)));
     }
 
+    // The plan's version limit, counted here so that it is the number that
+    // holds when the row goes in. The answer is the same 403 as the early check.
+    crate::services::quota::check_version_limit_in_tx(&mut tx, cap, vault_id).await?;
+
     let version = match versions::create(&mut *tx, input).await {
         Ok(v) => v,
         // Two pushes read the same latest under shared locks; the second INSERT
@@ -241,6 +238,22 @@ async fn commit_version(
         }
         Err(e) => return Err(e.into()),
     };
+
+    // The audit event is part of the push: written in this transaction, so a
+    // push whose event cannot be written does not happen, rather than happening
+    // with nothing to show for it. The caller deletes the uploaded blob.
+    crate::services::audit::record_with(
+        &mut *tx,
+        crate::services::audit::AuditEvent {
+            vault_id: Some(vault_id),
+            user_id: Some(user_id),
+            event_type: "push".into(),
+            metadata: Some(serde_json::json!({ "version": version.version_num })),
+            ip_hash: client.ip_hash.clone(),
+            user_agent_hash: client.user_agent_hash.clone(),
+        },
+    )
+    .await?;
 
     tx.commit().await?;
     Ok(version)
@@ -315,8 +328,7 @@ pub async fn download_blob(
     let blob_bytes = state.storage.download_blob(&version.blob_key).await?;
 
     // Verify integrity before sending to client
-    let download_hash = blake3::hash(&blob_bytes[12..]).to_hex().to_string(); // skip 12-byte nonce prefix
-    if download_hash != version.blob_hash {
+    if stored_blob_hash(&blob_bytes).as_deref() != Some(version.blob_hash.as_str()) {
         tracing::error!(
             vault_id = %vault_id,
             version = version_num,
@@ -325,11 +337,13 @@ pub async fn download_blob(
         return Err(AppError::Internal("Blob integrity check failed".into()));
     }
 
-    // Record audit (fire-and-forget)
+    // Record audit (fire-and-forget). A pull must not fail because the audit
+    // write did, so a failure is logged at warn and the pull goes ahead; the
+    // line below is the signal to alert on.
     tokio::spawn({
         let db = state.db.clone();
         async move {
-            let _ = crate::services::audit::record(
+            if let Err(e) = crate::services::audit::record(
                 &db,
                 crate::services::audit::AuditEvent {
                     vault_id: Some(vault_id),
@@ -340,7 +354,13 @@ pub async fn download_blob(
                     user_agent_hash: client.user_agent_hash.clone(),
                 },
             )
-            .await;
+            .await
+            {
+                tracing::warn!(
+                    %vault_id, %user_id, error = %e,
+                    "could not record a pull event"
+                );
+            }
         }
     });
 
@@ -352,6 +372,38 @@ pub async fn download_blob(
         .header("X-Blob-Hash", &version.blob_hash)
         .body(Body::from(blob_bytes))
         .unwrap())
+}
+
+/// Length of a hex-encoded BLAKE3 digest.
+const BLOB_HASH_HEX_LEN: usize = 64;
+
+/// Refuse a blob whose fixed-size fields have the wrong size.
+///
+/// Only the ciphertext is hashed, so a nonce of the wrong length used to be
+/// stored without complaint and surface later as a failed download. Shared with
+/// `routes::rekey` so a push and a staged blob are held to the same rules.
+pub(crate) fn check_blob_fields(nonce: &[u8], blob_hash: &str) -> Result<(), AppError> {
+    if nonce.len() != NONCE_LEN {
+        return Err(AppError::Validation(format!(
+            "nonce: must be {NONCE_LEN} bytes, got {}",
+            nonce.len()
+        )));
+    }
+    check_blob_hash_format(blob_hash)
+}
+
+/// A `blob_hash` is 64 lowercase hex characters.
+pub(crate) fn check_blob_hash_format(blob_hash: &str) -> Result<(), AppError> {
+    let ok = blob_hash.len() == BLOB_HASH_HEX_LEN
+        && blob_hash
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c));
+    if !ok {
+        return Err(AppError::Validation(format!(
+            "blob_hash: must be {BLOB_HASH_HEX_LEN} lowercase hex characters"
+        )));
+    }
+    Ok(())
 }
 
 /// Shared with `routes::rekey`, which stages blobs in the same wire format a
@@ -408,16 +460,25 @@ pub async fn list_versions(
 /// from object storage and no server-side action brings it back, because the server
 /// never held anything that could reconstruct it.
 ///
-/// ─── Why the latest version cannot be deleted ────────────────────────────────
+/// ─── The latest version, and when it can go ─────────────────────────────────
 ///
-/// `cloud pull` and `cloud run` fetch the latest. Deleting it would silently change
-/// what every consumer of this vault receives — the next deploy would pick up older
-/// secrets with nobody having asked for that, and nothing in the output would say
-/// so. Refusing keeps one invariant that the rest of the system leans on: the latest
-/// version is the one that was most recently pushed.
+/// `cloud pull` and `cloud run` fetch the latest, so deleting it changes what every
+/// consumer of the vault receives: the previous version becomes the latest. That is
+/// the point when the latest is a bad push — undecryptable, or wrong — and the only
+/// way back otherwise is another push, which can only move forward. It is also why
+/// this stays an admin action, and why it is audited with `was_latest`.
 ///
-/// It also costs nothing. The limit is reached by accumulating old versions, so
-/// making room only ever means deleting old ones.
+/// It is refused when it is the only version, since that would leave a vault with
+/// nothing in it and no way to tell a consumer why. The vault itself is deleted
+/// through its own endpoint.
+///
+/// ⚠️ The version number is not retired. The next push is numbered
+/// `latest + 1`, so after deleting version N the next push is N again. A client
+/// that remembers having seen N may report that the vault went backwards.
+///
+/// The decision is taken under the vault lock, so two admins deleting the last
+/// two versions at once cannot empty the vault between them, and a push cannot
+/// land in the middle of it.
 pub async fn delete_version(
     State(state): State<AppState>,
     client: ClientContext,
@@ -428,21 +489,35 @@ pub async fn delete_version(
         vault_id, user_id, ..
     } = access;
 
-    let latest = versions::get_latest_version_num(&state.db, vault_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let mut tx = state.db.begin().await?;
+    if !crate::db::locks::lock_vault_exclusive(&mut tx, vault_id).await? {
+        return Err(AppError::NotFound);
+    }
 
-    if version_num == latest {
+    let nums = versions::all_version_nums(&mut *tx, vault_id).await?;
+    let latest = *nums.last().ok_or(AppError::NotFound)?;
+    let was_latest = version_num == latest;
+
+    if was_latest && nums.len() == 1 {
         return Err(AppError::Conflict(format!(
-            "version {version_num} is the latest, and deleting it would change what \
-             `evnx cloud pull` returns without anyone asking. Push a newer version \
-             first, or delete the whole vault. Nothing has been changed."
+            "version {version_num} is the only version, and deleting it would leave the \
+             vault empty. Push a newer version first, or delete the whole vault. \
+             Nothing has been changed."
         )));
     }
 
-    let blob_key = versions::delete_by_num(&state.db, vault_id, version_num)
+    let blob_key = versions::delete_by_num(&mut *tx, vault_id, version_num)
         .await?
         .ok_or(AppError::NotFound)?;
+
+    // What `cloud pull` returns from now on.
+    let new_latest = if was_latest {
+        nums[nums.len() - 2]
+    } else {
+        latest
+    };
+
+    tx.commit().await?;
 
     // Recorded before the blob goes, and awaited rather than spawned: this is the
     // only remaining evidence that the version existed at all.
@@ -454,7 +529,11 @@ pub async fn delete_version(
             event_type: "version_deleted".into(),
             ip_hash: client.ip_hash.clone(),
             user_agent_hash: client.user_agent_hash.clone(),
-            metadata: Some(serde_json::json!({ "version_num": version_num })),
+            metadata: Some(serde_json::json!({
+                "version_num": version_num,
+                "was_latest": was_latest,
+                "latest_after": new_latest,
+            })),
         },
     )
     .await
@@ -473,10 +552,13 @@ pub async fn delete_version(
         );
     }
 
-    tracing::info!(%vault_id, version_num, "version deleted");
+    tracing::info!(%vault_id, version_num, was_latest, "version deleted");
 
     Ok(Json(serde_json::json!({
-        "deleted": version_num,
-        "latest":  latest,
+        "deleted":    version_num,
+        // The latest after this deletion, which is the previous version when the
+        // latest was the one deleted.
+        "latest":     new_latest,
+        "was_latest": was_latest,
     })))
 }
