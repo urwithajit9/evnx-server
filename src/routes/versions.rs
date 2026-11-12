@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::middleware::client_ip::ClientContext;
+use crate::services::transport::{stored_blob_hash, transport_hash, NONCE_LEN};
 use crate::{
     db::versions,
     errors::AppError,
@@ -85,7 +86,7 @@ pub async fn push_version(
     check_blob_fields(&nonce_bytes, &req.blob_hash)?;
 
     // Verify the client's declared blob_hash matches the actual ciphertext
-    let actual_hash = blake3::hash(&ciphertext_bytes).to_hex().to_string();
+    let actual_hash = transport_hash(&ciphertext_bytes);
     if actual_hash != req.blob_hash {
         return Err(AppError::Validation(
             "blob_hash does not match ciphertext content".into(),
@@ -327,8 +328,7 @@ pub async fn download_blob(
     let blob_bytes = state.storage.download_blob(&version.blob_key).await?;
 
     // Verify integrity before sending to client
-    let download_hash = blake3::hash(&blob_bytes[12..]).to_hex().to_string(); // skip 12-byte nonce prefix
-    if download_hash != version.blob_hash {
+    if stored_blob_hash(&blob_bytes).as_deref() != Some(version.blob_hash.as_str()) {
         tracing::error!(
             vault_id = %vault_id,
             version = version_num,
@@ -374,9 +374,6 @@ pub async fn download_blob(
         .unwrap())
 }
 
-/// Length of the AES-256-GCM nonce stored in front of every blob.
-pub(crate) const BLOB_NONCE_LEN: usize = 12;
-
 /// Length of a hex-encoded BLAKE3 digest.
 const BLOB_HASH_HEX_LEN: usize = 64;
 
@@ -386,9 +383,9 @@ const BLOB_HASH_HEX_LEN: usize = 64;
 /// stored without complaint and surface later as a failed download. Shared with
 /// `routes::rekey` so a push and a staged blob are held to the same rules.
 pub(crate) fn check_blob_fields(nonce: &[u8], blob_hash: &str) -> Result<(), AppError> {
-    if nonce.len() != BLOB_NONCE_LEN {
+    if nonce.len() != NONCE_LEN {
         return Err(AppError::Validation(format!(
-            "nonce: must be {BLOB_NONCE_LEN} bytes, got {}",
+            "nonce: must be {NONCE_LEN} bytes, got {}",
             nonce.len()
         )));
     }

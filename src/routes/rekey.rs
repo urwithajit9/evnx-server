@@ -44,6 +44,7 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::middleware::client_ip::ClientContext;
+use crate::services::transport::{stored_blob_hash, transport_hash};
 use crate::{
     db::{members, versions},
     errors::AppError,
@@ -85,7 +86,7 @@ pub async fn stage_blob(
 
     // Same integrity check as a push. A staged blob whose hash does not match
     // would fail at the swap instead, after the client had uploaded everything.
-    if blake3::hash(&ciphertext).to_hex().to_string() != req.blob_hash {
+    if transport_hash(&ciphertext) != req.blob_hash {
         return Err(AppError::Validation(
             "blob_hash does not match ciphertext content".into(),
         ));
@@ -273,13 +274,13 @@ async fn verify_staged_blobs(
             )));
         }
         let object = state.storage.download_blob(&v.blob_key).await?;
-        let Some(ciphertext) = object.get(super::versions::BLOB_NONCE_LEN..) else {
+        let Some(actual) = stored_blob_hash(&object) else {
             return Err(AppError::Validation(format!(
                 "version {}: the staged blob is shorter than its nonce",
                 v.version_num
             )));
         };
-        if blake3::hash(ciphertext).to_hex().to_string() != v.blob_hash {
+        if actual != v.blob_hash {
             return Err(AppError::Validation(format!(
                 "version {}: blob_hash does not match the staged blob",
                 v.version_num
