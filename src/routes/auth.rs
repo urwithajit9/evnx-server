@@ -337,7 +337,19 @@ pub async fn srp_init(
             data.argon2_salt,
             true,
         ),
-        None => (None, fake_srp_verifier(), fake_salt(), fake_salt(), false),
+        // ⚠️ Salts are derived from the address, not drawn fresh. An address with
+        // no account used to get new random salts on every call while a real
+        // account always got its own, so asking twice told the two apart.
+        None => {
+            let keys = &state.config.server_data_key;
+            (
+                None,
+                fake_srp_verifier(),
+                keys.decoy_salt(&email_lower, "srp"),
+                keys.decoy_salt(&email_lower, "argon2"),
+                false,
+            )
+        }
     };
 
     // Decode client public A (hex → bytes)
@@ -871,15 +883,6 @@ pub(crate) fn fake_srp_verifier() -> String {
     let mut bytes = vec![0u8; 256];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     hex::encode(bytes)
-}
-
-/// Generate a fake base64 salt for unknown emails.
-pub(crate) fn fake_salt() -> String {
-    use base64ct::{Base64, Encoding};
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    Base64::encode_string(&bytes)
 }
 
 /// Issue a JWT + refresh token pair for a successfully authenticated user.

@@ -161,15 +161,20 @@ impl DataKey {
         stored.starts_with(SEALED_PREFIX)
     }
 
-    /// HMAC-SHA256 under the decoy-salt purpose key, over the lowercased email.
+    /// A salt for an address that has no account, in the same shape a real one
+    /// has (32 bytes, base64).
     ///
-    /// Stable for a given email and key, unpredictable without the key. Used to
-    /// give an address with no account the same salt on every call.
-    pub fn decoy_salt_material(&self, email_lower: &str) -> [u8; 32] {
+    /// HMAC-SHA256 under the decoy-salt purpose key over `label || 0x00 ||
+    /// email`, so the same address gets the same value on every call, a
+    /// different value per `label`, and nobody without the key can predict or
+    /// recompute it. `email_lower` must already be trimmed and lowercased.
+    pub fn decoy_salt(&self, email_lower: &str, label: &str) -> String {
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.purpose_key(PURPOSE_DECOY_SALT))
             .expect("HMAC accepts any key length");
+        mac.update(label.as_bytes());
+        mac.update(&[0]);
         mac.update(email_lower.as_bytes());
-        mac.finalize().into_bytes().into()
+        Base64::encode_string(&mac.finalize().into_bytes())
     }
 }
 
@@ -259,15 +264,23 @@ mod tests {
     }
 
     #[test]
-    fn decoy_material_is_stable_per_email_and_differs_between_emails() {
+    fn a_decoy_salt_is_stable_per_email_and_label() {
         let k = key();
-        assert_eq!(
-            k.decoy_salt_material("a@example.test"),
-            k.decoy_salt_material("a@example.test")
-        );
+        let a = k.decoy_salt("a@example.test", "srp");
+        assert_eq!(a, k.decoy_salt("a@example.test", "srp"));
+        assert_ne!(a, k.decoy_salt("b@example.test", "srp"));
+        assert_ne!(a, k.decoy_salt("a@example.test", "argon2"));
         assert_ne!(
-            k.decoy_salt_material("a@example.test"),
-            k.decoy_salt_material("b@example.test")
+            a,
+            DataKey::from_bytes([8u8; 32]).decoy_salt("a@example.test", "srp")
         );
+    }
+
+    #[test]
+    fn a_decoy_salt_has_the_shape_of_a_real_one() {
+        // Registration requires exactly 44 base64 characters.
+        let s = key().decoy_salt("a@example.test", "srp");
+        assert_eq!(s.len(), 44);
+        assert_eq!(Base64::decode_vec(&s).unwrap().len(), 32);
     }
 }

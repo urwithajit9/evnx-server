@@ -74,7 +74,7 @@ use crate::{
     db::{rotation, users},
     errors::AppError,
     routes::auth::{
-        email_subject, fake_salt, fake_srp_verifier, verify_second_factor, SRP_LOCKOUT_SECONDS,
+        email_subject, fake_srp_verifier, verify_second_factor, SRP_LOCKOUT_SECONDS,
         SRP_MAX_FAILURES,
     },
     services::jwt::Claims,
@@ -599,12 +599,20 @@ pub async fn undo_init(
             s.prev_argon2_salt,
             true,
         ),
+        // Stable per address, like `srp_init`'s: a fresh random salt on each call
+        // would show that no snapshot exists.
         None => (
             None,
             None,
             fake_srp_verifier(),
-            fake_salt(),
-            fake_salt(),
+            state
+                .config
+                .server_data_key
+                .decoy_salt(&email_lower, "undo-srp"),
+            state
+                .config
+                .server_data_key
+                .decoy_salt(&email_lower, "undo-argon2"),
             false,
         ),
     };

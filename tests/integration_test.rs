@@ -336,6 +336,61 @@ async fn logout_blocklists_the_session_via_valkey() {
 /// Login starts allowed per address per window (`routes::auth::SRP_INIT_LIMIT`).
 const SRP_INIT_LIMIT: usize = 30;
 
+async fn srp_init_salts(server: &TestServer, email: &str) -> (String, String) {
+    let ephemeral = generate_client_ephemeral().unwrap();
+    let resp = server
+        .post("/api/v1/auth/srp/init")
+        .json(&serde_json::json!({
+            "email": email,
+            "client_public": hex::encode(&ephemeral.public_a),
+        }))
+        .await;
+    resp.assert_status_ok();
+    let body = resp.json::<serde_json::Value>();
+    (
+        body["srp_salt"].as_str().unwrap().to_string(),
+        body["argon2_salt"].as_str().unwrap().to_string(),
+    )
+}
+
+#[tokio::test]
+async fn srp_init_gives_an_unknown_email_the_same_salts_every_time() {
+    // A known account always gets its own salts, so an address that got fresh
+    // random ones on each call could be told apart by asking twice.
+    let server = test_app().await;
+    let email = unique_email("nobody");
+
+    let first = srp_init_salts(&server, &email).await;
+    let second = srp_init_salts(&server, &email).await;
+    assert_eq!(first, second, "an unknown address got different salts");
+    assert_ne!(first.0, first.1, "the two salts must differ");
+
+    // The same address however it is typed, as the lookup is.
+    let shouty = format!("  {}  ", email.to_uppercase());
+    assert_eq!(first, srp_init_salts(&server, &shouty).await);
+
+    // Different addresses get different salts.
+    let other = srp_init_salts(&server, &unique_email("nobody")).await;
+    assert_ne!(first.0, other.0);
+
+    // And they look like real ones: 32 bytes of base64, as registration requires.
+    for salt in [&first.0, &first.1] {
+        assert_eq!(salt.len(), 44);
+    }
+}
+
+#[tokio::test]
+async fn srp_init_decoy_salts_have_the_shape_of_a_known_accounts() {
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+    let known = srp_init_salts(&server, &account.email).await;
+    assert_eq!(known, srp_init_salts(&server, &account.email).await);
+
+    let decoy = srp_init_salts(&server, &unique_email("nobody")).await;
+    assert_eq!(known.0.len(), decoy.0.len());
+    assert_eq!(known.1.len(), decoy.1.len());
+}
+
 #[tokio::test]
 async fn srp_init_rate_limit_triggers_after_30_attempts() {
     // Exercises INCR + EXPIRE. The key is per-email, so a unique address keeps
@@ -5292,6 +5347,26 @@ async fn a_compromised_rotation_keeps_no_way_back() {
         undo(&server, &email, &leaked).await.0,
         StatusCode::UNAUTHORIZED
     );
+}
+
+#[tokio::test]
+async fn undo_init_gives_an_address_with_no_snapshot_the_same_salts_every_time() {
+    let server = test_app().await;
+    let email = unique_email("no-snapshot");
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let ephemeral = generate_client_ephemeral().unwrap();
+        let body = server
+            .post("/api/v1/auth/master-key/undo/init")
+            .json(&serde_json::json!({
+                "email": email,
+                "client_public": hex::encode(&ephemeral.public_a),
+            }))
+            .await
+            .json::<serde_json::Value>();
+        seen.push((body["srp_salt"].clone(), body["argon2_salt"].clone()));
+    }
+    assert_eq!(seen[0], seen[1]);
 }
 
 /// ⚠️ `/master-key/undo/init` is unauthenticated, so it must not say which
