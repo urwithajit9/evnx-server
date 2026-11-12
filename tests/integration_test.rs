@@ -1478,6 +1478,106 @@ fn totp_code(secret_base32: &str) -> String {
     .unwrap()
 }
 
+async fn stored_totp_secret(user_id: Uuid) -> String {
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    sqlx::query_scalar("SELECT totp_secret_enc FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&db)
+        .await
+        .unwrap()
+}
+
+/// Complete a TOTP login for `account` with `secret`, returning the response.
+async fn totp_login(
+    server: &TestServer,
+    account: &SrpAccount,
+    secret: &str,
+) -> axum_test::TestResponse {
+    let body = srp_login(server, account).await;
+    let pending = body["totp_pending_token"].as_str().unwrap().to_string();
+    server
+        .post("/api/v1/auth/totp/verify")
+        .json(&serde_json::json!({
+            "totp_pending_token": pending,
+            "totp_code": totp_code(secret),
+        }))
+        .await
+}
+
+#[tokio::test]
+async fn an_enrolled_totp_secret_is_stored_sealed_and_still_verifies() {
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+    let secret = enable_totp(&server, account.user_id).await;
+
+    let stored = stored_totp_secret(account.user_id).await;
+    assert!(stored.starts_with("v1:"), "stored value is not versioned");
+    assert!(
+        !stored.contains(&secret),
+        "the base32 secret is readable in the column"
+    );
+
+    totp_login(&server, &account, &secret)
+        .await
+        .assert_status_ok();
+}
+
+#[tokio::test]
+async fn an_old_plaintext_totp_secret_is_upgraded_on_read() {
+    let server = test_app().await;
+    let account = register_srp_account(&server).await;
+    let secret = enable_totp(&server, account.user_id).await;
+
+    // Put the row back the way it was written before secrets were sealed.
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    sqlx::query("UPDATE users SET totp_secret_enc = $1 WHERE id = $2")
+        .bind(&secret)
+        .bind(account.user_id)
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(stored_totp_secret(account.user_id).await, secret);
+
+    // The old value still verifies, and the read rewrites it sealed.
+    totp_login(&server, &account, &secret)
+        .await
+        .assert_status_ok();
+    let stored = stored_totp_secret(account.user_id).await;
+    assert!(stored.starts_with("v1:"), "row was not upgraded: {stored}");
+    assert!(!stored.contains(&secret));
+
+    // And the upgraded value verifies.
+    totp_login(&server, &account, &secret)
+        .await
+        .assert_status_ok();
+}
+
+#[tokio::test]
+async fn a_sealed_totp_secret_copied_to_another_account_does_not_verify() {
+    let server = test_app().await;
+    let a = register_srp_account(&server).await;
+    let b = register_srp_account(&server).await;
+    let secret_a = enable_totp(&server, a.user_id).await;
+    let _secret_b = enable_totp(&server, b.user_id).await;
+
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    sqlx::query("UPDATE users SET totp_secret_enc = $1 WHERE id = $2")
+        .bind(stored_totp_secret(a.user_id).await)
+        .bind(b.user_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let resp = totp_login(&server, &b, &secret_a).await;
+    assert!(
+        !resp.status_code().is_success(),
+        "a ciphertext bound to one user id opened on another's row"
+    );
+}
+
 #[tokio::test]
 async fn totp_user_can_complete_login() {
     // The B2 regression: this was impossible, because srp_verify handed back the

@@ -265,6 +265,49 @@ pub(crate) async fn verify_second_factor(
     Ok(())
 }
 
+/// The plaintext TOTP secret for `user_id`, from the value stored in
+/// `users.totp_secret_enc`.
+///
+/// A value written before secrets were sealed is accepted and, once it has been
+/// checked to be a usable base32 secret, rewritten in the sealed form. The
+/// rewrite only applies if the column still holds the value that was read, so a
+/// concurrent disable or re-enrol is never overwritten. A failed rewrite is
+/// logged and does not fail the request: the next read tries again.
+pub(crate) async fn open_totp_secret(
+    state: &AppState,
+    user_id: Uuid,
+    stored: &str,
+) -> Result<String, AppError> {
+    let keys = &state.config.server_data_key;
+    let opened = keys.open_totp_secret(user_id, stored).map_err(|e| {
+        AppError::Internal(format!("stored TOTP secret for {user_id} unreadable: {e}"))
+    })?;
+
+    if opened.was_legacy_plaintext
+        && base32::decode(
+            base32::Alphabet::Rfc4648 { padding: false },
+            &opened.plaintext,
+        )
+        .is_some()
+    {
+        let upgraded = keys
+            .seal_totp_secret(user_id, &opened.plaintext)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let r = sqlx::query(
+            "UPDATE users SET totp_secret_enc = $1 WHERE id = $2 AND totp_secret_enc = $3",
+        )
+        .bind(&upgraded)
+        .bind(user_id)
+        .bind(stored)
+        .execute(&state.db)
+        .await;
+        if let Err(e) = r {
+            tracing::warn!(%user_id, error = %e, "could not re-save a TOTP secret in sealed form");
+        }
+    }
+    Ok(opened.plaintext)
+}
+
 /// SRP Step 1 — exchange ephemeral public keys.
 ///
 /// SECURITY CRITICAL: This endpoint must respond identically (same shape, similar timing)
@@ -1132,11 +1175,15 @@ pub async fn totp_confirm(
     // here would only let someone lock themselves out of finishing enrolment.
     verify_totp_code(&secret_base32, code)?;
 
-    // Write secret to DB (encrypt with pgcrypto — server-managed key)
-    // For simplicity, store base32 directly. Production: encrypt with server key.
+    // Stored sealed under the server data key, bound to this user id.
+    let sealed = state
+        .config
+        .server_data_key
+        .seal_totp_secret(user_id, &secret_base32)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     sqlx::query!(
         "UPDATE users SET totp_secret_enc = $1, totp_enabled = true, updated_at = NOW() WHERE id = $2",
-        secret_base32,
+        sealed,
         user_id,
     )
     .execute(&state.db)
@@ -1246,9 +1293,11 @@ pub async fn totp_verify_login(
         .await?
         .ok_or(AppError::Unauthorized)?;
 
-    let secret_base32 = user
+    let stored_secret = user
         .totp_secret_enc
+        .as_deref()
         .ok_or_else(|| AppError::Internal("TOTP enabled but no secret".into()))?;
+    let secret_base32 = open_totp_secret(&state, user_id, stored_secret).await?;
 
     // A recovery code is accepted wherever a TOTP code is. Try TOTP first — it is
     // the common case and costs nothing — then fall back to redeeming a code.
@@ -1342,9 +1391,11 @@ pub async fn totp_disable(
     if !user.totp_enabled {
         return Err(AppError::Conflict("TOTP is not enabled".into()));
     }
-    let secret = user
+    let stored_secret = user
         .totp_secret_enc
+        .as_deref()
         .ok_or_else(|| AppError::Internal("TOTP enabled but no secret".into()))?;
+    let secret = open_totp_secret(&state, user_id, stored_secret).await?;
 
     // Bounded — see `verify_second_factor`. Succeeding here removes the second
     // factor from the account, so an unbounded guess loop was a way to strip 2FA
@@ -1394,9 +1445,11 @@ pub async fn totp_regenerate_backup_codes(
     if !user.totp_enabled {
         return Err(AppError::Conflict("TOTP is not enabled".into()));
     }
-    let secret = user
+    let stored_secret = user
         .totp_secret_enc
+        .as_deref()
         .ok_or_else(|| AppError::Internal("TOTP enabled but no secret".into()))?;
+    let secret = open_totp_secret(&state, user_id, stored_secret).await?;
 
     // Bounded — see `verify_second_factor`. Succeeding here mints ten fresh
     // recovery codes, each of which is itself a second factor, so guessing once
@@ -1551,10 +1604,11 @@ pub async fn delete_account(
     // case a second factor exists for.
     if user.totp_enabled {
         let code = req.totp_code.as_deref().unwrap_or_default();
-        let secret = user
+        let stored_secret = user
             .totp_secret_enc
-            .clone()
+            .as_deref()
             .ok_or_else(|| AppError::Internal("TOTP enabled but no secret".into()))?;
+        let secret = open_totp_secret(&state, user_id, stored_secret).await?;
         // Bounded — see `verify_second_factor`. This one is irreversible, and the
         // server cannot undo it: the vaults it deletes hold the only wrapped copies
         // of their keys.

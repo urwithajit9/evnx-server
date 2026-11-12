@@ -92,6 +92,17 @@ Published tags are short commit SHAs plus 'latest' on main. Find one with:
 [ -f "$COMPOSE_FILE" ] || die "$COMPOSE_FILE not found — run this from the repository root"
 [ -f "$ENV_FILE" ] || die "$ENV_FILE not found — this is the production env file and is never committed"
 
+# ⚠️ SERVER_DATA_KEY seals the stored TOTP secrets, and the server refuses to
+# start without it. Checked here, before anything is pulled or restarted, so a
+# missing key fails this script rather than leaving the old container serving
+# while the new one crash-loops. Generate: openssl rand -base64 32
+DATA_KEY="$(sed -n 's/^SERVER_DATA_KEY=//p' "$ENV_FILE" | tail -n1 | tr -d '"'"'"' ')"
+[ -n "$DATA_KEY" ] || die "SERVER_DATA_KEY is not set in $ENV_FILE.
+Generate one and add it before deploying (and back it up with the file):
+  echo \"SERVER_DATA_KEY=\$(openssl rand -base64 32)\" >> $ENV_FILE"
+[ "$(printf '%s' "$DATA_KEY" | base64 -d 2>/dev/null | wc -c)" -eq 32 ] \
+  || die "SERVER_DATA_KEY in $ENV_FILE is not 32 bytes of base64 (openssl rand -base64 32)"
+
 IMAGE="${REGISTRY_IMAGE}:${TARGET}"
 dc() { docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"; }
 

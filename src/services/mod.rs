@@ -5,4 +5,5 @@ pub mod email;
 pub mod jwt;
 pub mod paddle;
 pub mod quota;
+pub mod secrets;
 pub mod storage;

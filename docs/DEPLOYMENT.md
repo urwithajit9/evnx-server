@@ -228,8 +228,9 @@ cp .env.prod.example .env.prod && chmod 600 .env.prod
 Generate the secrets — do not invent them by hand:
 
 ```bash
-printf 'JWT_SECRET=%s\nPOSTGRES_PASSWORD=%s\nVALKEY_PASSWORD=%s\n' \
-  "$(openssl rand -hex 48)" "$(openssl rand -hex 24)" "$(openssl rand -hex 24)"
+printf 'JWT_SECRET=%s\nPOSTGRES_PASSWORD=%s\nVALKEY_PASSWORD=%s\nSERVER_DATA_KEY=%s\n' \
+  "$(openssl rand -hex 48)" "$(openssl rand -hex 24)" "$(openssl rand -hex 24)" \
+  "$(openssl rand -base64 32)"
 ```
 
 Paste those into `.env.prod` along with the R2 and Resend values, then:
@@ -239,6 +240,29 @@ docker compose -f docker/docker-compose.prod.yml --env-file .env.prod up -d
 ```
 
 Migrations apply automatically — `main.rs` runs `sqlx::migrate!` at startup.
+
+### Server data key
+
+`SERVER_DATA_KEY` is 32 random bytes, base64-encoded. The server derives a
+separate key for each purpose from it: the TOTP secrets stored in
+`users.totp_secret_enc` are sealed under one, and the salts returned for
+addresses with no account come from another.
+
+* **Required outside development.** The server refuses to start without it and
+  says so in the first log line. In development an unset key falls back to a
+  fixed one that is published in the source.
+* **Generate it once:** `openssl rand -base64 32`, then put it in `.env.prod`.
+* **Back it up with `.env.prod`.** It is not in the database backup, by design.
+  Without it every sealed TOTP secret is unreadable, and each account with
+  two-factor on is locked out until that factor is removed by hand.
+* **Do not change it on a running deployment.** There is no re-sealing step yet.
+  Changing the key has the same effect as losing it.
+* **Existing accounts keep working.** A TOTP secret stored before this key
+  existed is read as it is and rewritten sealed the next time it is used, so no
+  migration step is needed.
+* **Rolling back** to an image that predates the key: accounts whose TOTP
+  secret has already been rewritten sealed would fail every second-factor check
+  on the old image, which reads the column as a bare base32 secret.
 
 ### Querying the database
 

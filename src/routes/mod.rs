@@ -284,12 +284,13 @@ pub fn create_router(state: AppState) -> Router {
     // The response carries key material, so only a signed-in session may read it.
     // An `evnx_tok_` API token is refused with 403, the same answer the other
     // account routes give.
-    let me_route = Router::new()
-        .route("/me", get(auth::me))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_user_session,
-        ));
+    let me_route =
+        Router::new()
+            .route("/me", get(auth::me))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_user_session,
+            ));
 
     let auth_routes = public_auth_routes.merge(account_routes).merge(me_route);
 

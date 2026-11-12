@@ -307,10 +307,11 @@ pub async fn reauth_verify(
         // next endpoint that needs a second factor has one thing to call rather
         // than a block to remember to paste.
         let code = req.totp_code.as_deref().unwrap_or_default();
-        let secret = user
+        let stored_secret = user
             .totp_secret_enc
-            .clone()
+            .as_deref()
             .ok_or_else(|| AppError::Internal("TOTP enabled but no secret".into()))?;
+        let secret = super::auth::open_totp_secret(&state, user_id, stored_secret).await?;
         verify_second_factor(&state, user_id, &secret, code).await?;
     }
 

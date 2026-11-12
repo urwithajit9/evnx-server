@@ -106,6 +106,10 @@ pub struct Config {
     pub jwt_expiry_minutes: i64,
     pub refresh_token_expiry_days: i64,
 
+    /// Root key for secrets the server stores (TOTP secrets) and for values it
+    /// derives (decoy salts). From `SERVER_DATA_KEY`. See `services::secrets`.
+    pub server_data_key: crate::services::secrets::DataKey,
+
     // Frontend (for CORS)
     pub frontend_url: String,
     /// `frontend_url` split into individual origins, trimmed and validated.
@@ -363,6 +367,29 @@ impl Config {
             )));
         }
 
+        // ── Server data key ───────────────────────────────────────────────────
+        //
+        // Required outside development: a deployment without it would store
+        // secrets under a key that is published in the source. A set but
+        // malformed value is an error in every environment.
+        let server_data_key = match env::var("SERVER_DATA_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(raw) => crate::services::secrets::DataKey::from_base64(&raw)
+                .map_err(|e| ConfigError::Invalid(e.to_string()))?,
+            None if environment == Environment::Development => {
+                crate::services::secrets::DataKey::development()
+            }
+            None => {
+                return Err(ConfigError::Invalid(format!(
+                    "SERVER_DATA_KEY is required when ENVIRONMENT={environment:?}. \
+                     Generate one with `openssl rand -base64 32` and keep it with the \
+                     other secrets; see docs/DEPLOYMENT.md"
+                )))
+            }
+        };
+
         let port: u16 = optional!("SERVER_PORT", "8080").parse().unwrap_or(8080);
 
         // ── Plan limits ───────────────────────────────────────────────────────
@@ -577,6 +604,7 @@ impl Config {
             refresh_token_expiry_days: optional!("REFRESH_TOKEN_EXPIRY_DAYS", "30")
                 .parse()
                 .unwrap_or(30),
+            server_data_key,
             frontend_url,
             frontend_origins,
             resend_api_key,
