@@ -5624,6 +5624,203 @@ async fn a_rotation_can_be_undone_with_the_old_password() {
     );
 }
 
+/// (closed, outcome, holds any previous material) for each of a user's
+/// rotation snapshots, oldest first.
+async fn snapshot_state(user_id: Uuid) -> Vec<(bool, Option<String>, bool)> {
+    sqlx::query_as::<_, (bool, Option<String>, bool)>(
+        "SELECT consumed_at IS NOT NULL, outcome,
+                (prev_srp_salt IS NOT NULL OR prev_srp_verifier IS NOT NULL
+                 OR prev_argon2_salt IS NOT NULL
+                 OR prev_encrypted_private_key IS NOT NULL OR prev_wraps IS NOT NULL)
+           FROM master_key_rotations WHERE user_id = $1 ORDER BY rotated_at",
+    )
+    .bind(user_id)
+    .fetch_all(&test_pool().await)
+    .await
+    .unwrap()
+}
+
+/// A snapshot holds the previous material while it is live and nothing once it
+/// has been used.
+#[tokio::test]
+async fn a_restored_snapshot_keeps_no_secret_material() {
+    let server = test_app().await;
+    let original = Credential::new(b"clear me after the undo");
+    let (email, user_id) = register_with(&server, &original).await;
+    let access = verified_jwt(user_id).await;
+    let vault = create_vault(&server, &access).await;
+
+    assert_eq!(
+        reauth(&server, &email, &access, &original).await,
+        StatusCode::OK
+    );
+    bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(
+            &email,
+            &Credential::new(b"temporary"),
+            &[vault],
+            "routine",
+        ))
+        .await
+        .assert_status_ok();
+    assert_eq!(snapshot_state(user_id).await, vec![(false, None, true)]);
+
+    assert_eq!(undo(&server, &email, &original).await.0, StatusCode::OK);
+    assert_eq!(
+        snapshot_state(user_id).await,
+        vec![(true, Some("restored".to_string()), false)]
+    );
+}
+
+/// An expired snapshot is closed and emptied by the timed pass, whether or not
+/// its account rotates again, and the pass can be repeated.
+#[tokio::test]
+async fn an_expired_snapshot_is_cleared_without_waiting_for_another_rotation() {
+    let server = test_app().await;
+    let original = Credential::new(b"expire me");
+    let (email, user_id) = register_with(&server, &original).await;
+    let access = verified_jwt(user_id).await;
+
+    assert_eq!(
+        reauth(&server, &email, &access, &original).await,
+        StatusCode::OK
+    );
+    bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(
+            &email,
+            &Credential::new(b"next"),
+            &[],
+            "routine",
+        ))
+        .await
+        .assert_status_ok();
+
+    let db = test_pool().await;
+    // Still inside its window: the pass leaves it alone.
+    evnx_server::db::rotation::expire_all_stale_snapshots(&db)
+        .await
+        .unwrap();
+    assert_eq!(snapshot_state(user_id).await, vec![(false, None, true)]);
+
+    sqlx::query(
+        "UPDATE master_key_rotations SET expires_at = NOW() - interval '1 minute'
+          WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .execute(&db)
+    .await
+    .unwrap();
+    // Past its window but not yet swept: it must not be restorable either.
+    assert_eq!(
+        undo(&server, &email, &original).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let swept = evnx_server::db::rotation::expire_all_stale_snapshots(&db)
+        .await
+        .unwrap();
+    assert!(swept >= 1);
+    assert_eq!(
+        snapshot_state(user_id).await,
+        vec![(true, Some("expired".to_string()), false)]
+    );
+
+    // Repeating changes nothing.
+    evnx_server::db::rotation::expire_all_stale_snapshots(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot_state(user_id).await,
+        vec![(true, Some("expired".to_string()), false)]
+    );
+}
+
+/// The same clearing happens when the account rotates again after the window.
+#[tokio::test]
+async fn rotating_again_after_the_window_clears_the_expired_snapshot() {
+    let server = test_app().await;
+    let first = Credential::new(b"first password");
+    let (email, user_id) = register_with(&server, &first).await;
+    let access = verified_jwt(user_id).await;
+
+    assert_eq!(
+        reauth(&server, &email, &access, &first).await,
+        StatusCode::OK
+    );
+    let second = Credential::new(b"second password");
+    bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(&email, &second, &[], "routine"))
+        .await
+        .assert_status_ok();
+
+    sqlx::query(
+        "UPDATE master_key_rotations SET expires_at = NOW() - interval '1 minute'
+          WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .execute(&test_pool().await)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        reauth(&server, &email, &access, &second).await,
+        StatusCode::OK
+    );
+    bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(
+            &email,
+            &Credential::new(b"third password"),
+            &[],
+            "routine",
+        ))
+        .await
+        .assert_status_ok();
+
+    // The old one is closed and empty; the new one is live and whole.
+    assert_eq!(
+        snapshot_state(user_id).await,
+        vec![
+            (true, Some("expired".to_string()), false),
+            (false, None, true)
+        ]
+    );
+}
+
+/// The table refuses a closed snapshot that still holds material, and a live
+/// one that does not.
+#[tokio::test]
+async fn the_database_refuses_a_closed_snapshot_with_material() {
+    let server = test_app().await;
+    let original = Credential::new(b"constraint");
+    let (email, user_id) = register_with(&server, &original).await;
+    let access = verified_jwt(user_id).await;
+    assert_eq!(
+        reauth(&server, &email, &access, &original).await,
+        StatusCode::OK
+    );
+    bearer(server.post("/api/v1/auth/master-key"), &access)
+        .json(&rotate_body(&email, &Credential::new(b"x"), &[], "routine"))
+        .await
+        .assert_status_ok();
+
+    let db = test_pool().await;
+    let close_without_clearing = sqlx::query(
+        "UPDATE master_key_rotations SET consumed_at = NOW(), outcome = 'expired'
+          WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .execute(&db)
+    .await;
+    assert!(close_without_clearing.is_err());
+
+    let empty_but_live =
+        sqlx::query("UPDATE master_key_rotations SET prev_srp_verifier = NULL WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&db)
+            .await;
+    assert!(empty_but_live.is_err());
+}
+
 /// An undo is one-shot.
 #[tokio::test]
 async fn a_snapshot_can_only_be_restored_once() {

@@ -194,24 +194,52 @@ where
 /// chain of rotations erasing the owner's real material — but it would also stop
 /// a legitimate rotation months later if expired rows were left open. Closing
 /// them here keeps both properties.
+///
+/// Closing a snapshot also clears the material in it (see [`CLEAR_MATERIAL`]).
 pub async fn expire_stale_snapshots<'e, E>(executor: E, user_id: Uuid) -> Result<u64, sqlx::Error>
 where
     E: sqlx::PgExecutor<'e>,
 {
-    let r = sqlx::query!(
-        r#"
-        UPDATE master_key_rotations
-           SET consumed_at = NOW(), outcome = 'expired'
-         WHERE user_id = $1
-           AND consumed_at IS NULL
-           AND expires_at <= NOW()
-        "#,
-        user_id
-    )
+    let r = sqlx::query(&format!(
+        "UPDATE master_key_rotations
+            SET consumed_at = NOW(), outcome = 'expired', {CLEAR_MATERIAL}
+          WHERE user_id = $1
+            AND consumed_at IS NULL
+            AND expires_at <= NOW()"
+    ))
+    .bind(user_id)
     .execute(executor)
     .await?;
     Ok(r.rows_affected())
 }
+
+/// [`expire_stale_snapshots`] for every account at once.
+///
+/// Run on a timer. Expiry used to happen only when the same account rotated
+/// again, so the previous verifier, salts and sealed seed of an account that
+/// never did stayed in the table indefinitely. Idempotent.
+pub async fn expire_all_stale_snapshots<'e, E>(executor: E) -> Result<u64, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let r = sqlx::query(&format!(
+        "UPDATE master_key_rotations
+            SET consumed_at = NOW(), outcome = 'expired', {CLEAR_MATERIAL}
+          WHERE consumed_at IS NULL
+            AND expires_at <= NOW()"
+    ))
+    .execute(executor)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+/// The assignments that empty a snapshot of its secret material.
+///
+/// Every statement that sets `consumed_at` includes these: the table refuses a
+/// closed row that still holds any of it (migration 015). They are plain
+/// queries rather than `query!` so they need no offline cache entry.
+const CLEAR_MATERIAL: &str = "prev_srp_salt = NULL, prev_srp_verifier = NULL, \
+     prev_argon2_salt = NULL, prev_encrypted_private_key = NULL, prev_wraps = NULL";
 
 /// Record the material this rotation is about to replace.
 ///
@@ -278,7 +306,12 @@ pub async fn live_snapshot_for_email(
     pool: &sqlx::PgPool,
     email: &str,
 ) -> Result<Option<LiveSnapshot>, sqlx::Error> {
-    let row = sqlx::query!(
+    use sqlx::Row;
+
+    // A plain query: the `prev_*` columns are nullable since migration 015 (a
+    // closed snapshot holds nothing), but a live one always has them, and the
+    // `consumed_at IS NULL` filter below is what guarantees that.
+    let row = sqlx::query(
         r#"
         SELECT r.id, r.user_id, r.prev_srp_salt, r.prev_srp_verifier,
                r.prev_argon2_salt, r.prev_encrypted_private_key, r.prev_wraps
@@ -290,41 +323,43 @@ pub async fn live_snapshot_for_email(
          ORDER BY r.rotated_at ASC
          LIMIT 1
         "#,
-        email
     )
+    .bind(email)
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(|r| LiveSnapshot {
-        id: r.id,
-        user_id: r.user_id,
-        prev_srp_salt: r.prev_srp_salt,
-        prev_srp_verifier: r.prev_srp_verifier,
-        prev_argon2_salt: r.prev_argon2_salt,
-        prev_encrypted_private_key: r.prev_encrypted_private_key,
+    let Some(r) = row else {
+        return Ok(None);
+    };
+    let prev_wraps: serde_json::Value = r.try_get("prev_wraps")?;
+    Ok(Some(LiveSnapshot {
+        id: r.try_get("id")?,
+        user_id: r.try_get("user_id")?,
+        prev_srp_salt: r.try_get("prev_srp_salt")?,
+        prev_srp_verifier: r.try_get("prev_srp_verifier")?,
+        prev_argon2_salt: r.try_get("prev_argon2_salt")?,
+        prev_encrypted_private_key: r.try_get("prev_encrypted_private_key")?,
         // A snapshot that cannot be parsed is a snapshot that cannot be
         // restored, and an empty list would silently restore the account
         // material while leaving every vault under the new key. Treated as
         // "no wraps" here and caught by the restore's own count check.
-        prev_wraps: serde_json::from_value(r.prev_wraps).unwrap_or_default(),
+        prev_wraps: serde_json::from_value(prev_wraps).unwrap_or_default(),
     }))
 }
 
-/// Close a snapshot once it has been restored.
+/// Close a snapshot once it has been restored, clearing the material in it.
 pub async fn consume<'e, E>(executor: E, id: Uuid, outcome: &str) -> Result<bool, sqlx::Error>
 where
     E: sqlx::PgExecutor<'e>,
 {
-    let r = sqlx::query!(
-        r#"
-        UPDATE master_key_rotations
-           SET consumed_at = NOW(), outcome = $2
-         WHERE id = $1
-           AND consumed_at IS NULL
-        "#,
-        id,
-        outcome,
-    )
+    let r = sqlx::query(&format!(
+        "UPDATE master_key_rotations
+            SET consumed_at = NOW(), outcome = $2, {CLEAR_MATERIAL}
+          WHERE id = $1
+            AND consumed_at IS NULL"
+    ))
+    .bind(id)
+    .bind(outcome)
     .execute(executor)
     .await?;
     Ok(r.rows_affected() == 1)

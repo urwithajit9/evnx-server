@@ -94,6 +94,10 @@ async fn main() {
 
     tracing::info!("✓ Migrations applied");
 
+    // Closes master-key rotation snapshots whose undo window has run out and
+    // clears the old account material in them. Hourly, and once now.
+    spawn_snapshot_expiry(db.clone());
+
     let jwt = JwtService::new(&config.jwt_secret, config.jwt_expiry_minutes);
 
     let storage = StorageService::from_config(&config).unwrap_or_else(|e| {
@@ -153,6 +157,22 @@ async fn main() {
     .unwrap_or_else(|e| {
         tracing::error!("Server error: {}", e);
         std::process::exit(1);
+    });
+}
+
+/// Expire stale rotation snapshots on a timer. A failure is logged and retried
+/// at the next tick; nothing depends on this running promptly.
+fn spawn_snapshot_expiry(db: sqlx::PgPool) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            tick.tick().await;
+            match evnx_server::db::rotation::expire_all_stale_snapshots(&db).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(count = n, "expired master-key rotation snapshots"),
+                Err(e) => tracing::warn!(error = %e, "could not expire rotation snapshots"),
+            }
+        }
     });
 }
 
