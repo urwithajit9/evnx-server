@@ -1281,8 +1281,18 @@ async fn log_email_transport_is_refused_outside_development() {
     // first, so neutralise it — otherwise this test would pass on the wrong error.
     std::env::set_var("STORAGE_BACKEND", "s3");
     std::env::set_var("STORAGE_BUCKET", "evnx-test");
+    // SERVER_DATA_KEY is also required outside development and checked before
+    // the email transport; set a throwaway one (32 zero bytes) so this test fails
+    // on the error it is about. A developer's own key in `.env` hid this locally.
+    let prev_data_key = std::env::var("SERVER_DATA_KEY").ok();
+    std::env::set_var("SERVER_DATA_KEY", "A".repeat(43) + "=");
 
     let result = Config::from_env();
+
+    match prev_data_key {
+        Some(v) => std::env::set_var("SERVER_DATA_KEY", v),
+        None => std::env::remove_var("SERVER_DATA_KEY"),
+    }
 
     match previous {
         Some(v) => std::env::set_var("ENVIRONMENT", v),
