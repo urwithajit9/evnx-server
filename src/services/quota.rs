@@ -439,7 +439,8 @@ impl VersionCap {
                 // is nothing to be done, because it sends people looking for a door that is
                 // not there. Both now exist; keep this sentence and that fact together.
                 "Delete an older version to make room: `evnx cloud history` lists them and \
-                 `evnx cloud delete-version` removes one. The latest cannot be deleted.",
+                 `evnx cloud delete-version` removes one. The latest can be deleted only while an \
+                 older version exists.",
             ));
         }
         Ok(())

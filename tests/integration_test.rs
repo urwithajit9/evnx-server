@@ -6103,31 +6103,122 @@ async fn an_old_version_can_be_deleted() {
     assert_eq!(version_count(&server, &jwt, vault).await, 1);
 }
 
-/// ⚠️ The invariant the rest of the system leans on: the latest version is the one
-/// most recently pushed. Deleting it would silently change what `cloud pull` and
-/// `cloud run` return — the next deploy would pick up older secrets with nobody
-/// having asked, and nothing in the output would say so.
+/// The only version cannot be deleted: that would leave an empty vault with no
+/// way to tell a consumer why.
 #[tokio::test]
-async fn the_latest_version_cannot_be_deleted() {
+async fn the_only_version_cannot_be_deleted() {
     let server = test_app().await;
     let (_uid, jwt) = verified_user(&server).await;
     let vault = create_vault(&server, &jwt).await;
+    assert_eq!(push_one(&server, &jwt, vault, 0).await, StatusCode::CREATED);
 
+    let resp = bearer(
+        server.delete(&format!("/api/v1/vaults/{vault}/versions/1")),
+        &jwt,
+    )
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::CONFLICT);
+    assert!(
+        resp.text().contains("only version"),
+        "the refusal must say why: {}",
+        resp.text()
+    );
+    assert_eq!(version_count(&server, &jwt, vault).await, 1);
+}
+
+/// A bad latest can be rolled back: the previous version becomes the latest, the
+/// blob goes, the next push carries on from there, and it is audited.
+#[tokio::test]
+async fn an_admin_can_delete_the_latest_version_when_an_older_one_exists() {
+    let server = test_app().await;
+    let storage = test_storage().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
     assert_eq!(push_one(&server, &jwt, vault, 0).await, StatusCode::CREATED);
     assert_eq!(push_one(&server, &jwt, vault, 1).await, StatusCode::CREATED);
+    let bad_key = db_blob_key(vault, 2).await;
+    let good_key = db_blob_key(vault, 1).await;
 
     let resp = bearer(
         server.delete(&format!("/api/v1/vaults/{vault}/versions/2")),
         &jwt,
     )
     .await;
-    assert_eq!(resp.status_code(), StatusCode::CONFLICT);
-    assert!(
-        resp.text().contains("latest"),
-        "the refusal must say why: {}",
-        resp.text()
-    );
+    resp.assert_status_ok();
+    let body = resp.json::<serde_json::Value>();
+    assert_eq!(body["deleted"], 2);
+    assert_eq!(body["latest"], 1);
+    assert_eq!(body["was_latest"], true);
+
+    assert_eq!(version_count(&server, &jwt, vault).await, 1);
+    let latest = bearer(
+        server.get(&format!("/api/v1/vaults/{vault}/versions/latest")),
+        &jwt,
+    )
+    .await
+    .json::<serde_json::Value>();
+    assert_eq!(latest["version_num"], 1);
+    assert!(!storage.blob_exists(&bad_key).await.unwrap());
+    assert!(storage.blob_exists(&good_key).await.unwrap());
+
+    // Pushing resumes from the version that is now the latest.
+    assert_eq!(push_one(&server, &jwt, vault, 1).await, StatusCode::CREATED);
     assert_eq!(version_count(&server, &jwt, vault).await, 2);
+
+    let events = audit_events(vault).await;
+    let deleted: Vec<_> = events
+        .iter()
+        .filter(|(t, _)| t == "version_deleted")
+        .collect();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0].1["version_num"], 2);
+    assert_eq!(deleted[0].1["was_latest"], true);
+    assert_eq!(deleted[0].1["latest_after"], 1);
+}
+
+/// Deleting an older version leaves the latest alone and says so.
+#[tokio::test]
+async fn deleting_an_older_version_reports_it_was_not_the_latest() {
+    let server = test_app().await;
+    let (_uid, jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &jwt).await;
+    assert_eq!(push_one(&server, &jwt, vault, 0).await, StatusCode::CREATED);
+    assert_eq!(push_one(&server, &jwt, vault, 1).await, StatusCode::CREATED);
+
+    let body = bearer(
+        server.delete(&format!("/api/v1/vaults/{vault}/versions/1")),
+        &jwt,
+    )
+    .await
+    .json::<serde_json::Value>();
+    assert_eq!(body["deleted"], 1);
+    assert_eq!(body["latest"], 2);
+    assert_eq!(body["was_latest"], false);
+}
+
+/// Rolling back is an admin act, like every other deletion.
+#[tokio::test]
+async fn a_developer_cannot_delete_the_latest_version() {
+    let server = test_app().await;
+    let (_owner, owner_jwt) = verified_user(&server).await;
+    let vault = create_vault(&server, &owner_jwt).await;
+    assert_eq!(
+        push_one(&server, &owner_jwt, vault, 0).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        push_one(&server, &owner_jwt, vault, 1).await,
+        StatusCode::CREATED
+    );
+    let (_id, dev_jwt) = member_at(&server, &owner_jwt, vault, "developer").await;
+
+    let resp = bearer(
+        server.delete(&format!("/api/v1/vaults/{vault}/versions/2")),
+        &dev_jwt,
+    )
+    .await;
+    assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+    assert_eq!(version_count(&server, &owner_jwt, vault).await, 2);
 }
 
 /// ⚠️ **The whole reason this endpoint exists.** The quota tells people to delete

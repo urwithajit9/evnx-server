@@ -458,16 +458,25 @@ pub async fn list_versions(
 /// from object storage and no server-side action brings it back, because the server
 /// never held anything that could reconstruct it.
 ///
-/// ─── Why the latest version cannot be deleted ────────────────────────────────
+/// ─── The latest version, and when it can go ─────────────────────────────────
 ///
-/// `cloud pull` and `cloud run` fetch the latest. Deleting it would silently change
-/// what every consumer of this vault receives — the next deploy would pick up older
-/// secrets with nobody having asked for that, and nothing in the output would say
-/// so. Refusing keeps one invariant that the rest of the system leans on: the latest
-/// version is the one that was most recently pushed.
+/// `cloud pull` and `cloud run` fetch the latest, so deleting it changes what every
+/// consumer of the vault receives: the previous version becomes the latest. That is
+/// the point when the latest is a bad push — undecryptable, or wrong — and the only
+/// way back otherwise is another push, which can only move forward. It is also why
+/// this stays an admin action, and why it is audited with `was_latest`.
 ///
-/// It also costs nothing. The limit is reached by accumulating old versions, so
-/// making room only ever means deleting old ones.
+/// It is refused when it is the only version, since that would leave a vault with
+/// nothing in it and no way to tell a consumer why. The vault itself is deleted
+/// through its own endpoint.
+///
+/// ⚠️ The version number is not retired. The next push is numbered
+/// `latest + 1`, so after deleting version N the next push is N again. A client
+/// that remembers having seen N may report that the vault went backwards.
+///
+/// The decision is taken under the vault lock, so two admins deleting the last
+/// two versions at once cannot empty the vault between them, and a push cannot
+/// land in the middle of it.
 pub async fn delete_version(
     State(state): State<AppState>,
     client: ClientContext,
@@ -478,21 +487,35 @@ pub async fn delete_version(
         vault_id, user_id, ..
     } = access;
 
-    let latest = versions::get_latest_version_num(&state.db, vault_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let mut tx = state.db.begin().await?;
+    if !crate::db::locks::lock_vault_exclusive(&mut tx, vault_id).await? {
+        return Err(AppError::NotFound);
+    }
 
-    if version_num == latest {
+    let nums = versions::all_version_nums(&mut *tx, vault_id).await?;
+    let latest = *nums.last().ok_or(AppError::NotFound)?;
+    let was_latest = version_num == latest;
+
+    if was_latest && nums.len() == 1 {
         return Err(AppError::Conflict(format!(
-            "version {version_num} is the latest, and deleting it would change what \
-             `evnx cloud pull` returns without anyone asking. Push a newer version \
-             first, or delete the whole vault. Nothing has been changed."
+            "version {version_num} is the only version, and deleting it would leave the \
+             vault empty. Push a newer version first, or delete the whole vault. \
+             Nothing has been changed."
         )));
     }
 
-    let blob_key = versions::delete_by_num(&state.db, vault_id, version_num)
+    let blob_key = versions::delete_by_num(&mut *tx, vault_id, version_num)
         .await?
         .ok_or(AppError::NotFound)?;
+
+    // What `cloud pull` returns from now on.
+    let new_latest = if was_latest {
+        nums[nums.len() - 2]
+    } else {
+        latest
+    };
+
+    tx.commit().await?;
 
     // Recorded before the blob goes, and awaited rather than spawned: this is the
     // only remaining evidence that the version existed at all.
@@ -504,7 +527,11 @@ pub async fn delete_version(
             event_type: "version_deleted".into(),
             ip_hash: client.ip_hash.clone(),
             user_agent_hash: client.user_agent_hash.clone(),
-            metadata: Some(serde_json::json!({ "version_num": version_num })),
+            metadata: Some(serde_json::json!({
+                "version_num": version_num,
+                "was_latest": was_latest,
+                "latest_after": new_latest,
+            })),
         },
     )
     .await
@@ -523,10 +550,13 @@ pub async fn delete_version(
         );
     }
 
-    tracing::info!(%vault_id, version_num, "version deleted");
+    tracing::info!(%vault_id, version_num, was_latest, "version deleted");
 
     Ok(Json(serde_json::json!({
-        "deleted": version_num,
-        "latest":  latest,
+        "deleted":    version_num,
+        // The latest after this deletion, which is the previous version when the
+        // latest was the one deleted.
+        "latest":     new_latest,
+        "was_latest": was_latest,
     })))
 }
