@@ -1,5 +1,35 @@
 # API changes
 
+## 2026-11-12
+
+### Changed: `GET /api/v1/auth/me` is for signed-in sessions only
+The response carries the sealed key material and the Argon2 salt, so an
+`evnx_tok_` API token (any scope) now gets **403** `{"code":"FORBIDDEN"}`, as on
+the other account routes. A session still works before the email is verified.
+A client that read `/auth/me` with a token to unlock a vault needs another way
+to obtain that material.
+
+### Changed: `DELETE /vaults/:id/versions/:n` accepts the latest version
+When an older version exists, the latest can be deleted (admin or above, as
+before) and the previous version becomes the latest. The only version is still
+refused with 409. The response gains `was_latest`, and `latest` is the latest
+**after** the deletion. The next push is numbered `latest + 1`, so after deleting
+version N the next push is N again.
+
+### Changed: stricter checks on blobs, 422 `VALIDATION_ERROR`
+* A push, and `POST /vaults/:id/rekey/blobs`, require a 12-byte `nonce` and a
+  `blob_hash` of 64 lowercase hex characters.
+* `POST /vaults/:id/rekey` checks every `blob_key` before swapping: it must be
+  a key returned by staging for this vault and version (422), name an object
+  that exists (409), and hold `blob_size_bytes` bytes whose ciphertext hashes to
+  `blob_hash` (422). It must differ from the blob the version already uses.
+  A refused swap changes nothing.
+* After a successful re-key the replaced blobs are deleted from storage.
+
+### Changed: `POST /auth/srp/init` and `/auth/master-key/undo/init`
+An address with no account now gets the same `srp_salt` and `argon2_salt` on
+every call (derived from the address), in the same shape as a real account's.
+
 ## 2026-11-09
 
 ### New: `GET /api/v1/audit`, activity across every vault you can read
