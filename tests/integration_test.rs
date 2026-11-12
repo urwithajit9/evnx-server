@@ -3999,6 +3999,140 @@ async fn the_sweep_command_defaults_to_a_dry_run() {
     storage.delete_blob(&orphan).await.unwrap();
 }
 
+const MIGRATION_016: &str = include_str!("../migrations/016_wrap_is_whole_is_validated.sql");
+
+/// Put a vault_members row into the state migration 004 left old databases in:
+/// the CHECK dropped, a row that violates it inserted, the CHECK back as NOT VALID.
+/// Runs inside the caller's transaction, which the caller then rolls back.
+async fn insert_pre_hybrid_row(
+    tx: &mut sqlx::PgConnection,
+    vault_id: Uuid,
+    user_id: Uuid,
+    role: &str,
+    eph: Option<&str>,
+    mlkem: Option<&str>,
+) {
+    sqlx::query("INSERT INTO vault_members (vault_id, user_id, role, encrypted_vault_key, eph_pub_key, mlkem_ciphertext)
+                 VALUES ($1, $2, $3, 'Zm9v', $4, $5)")
+        .bind(vault_id)
+        .bind(user_id)
+        .bind(role)
+        .bind(eph)
+        .bind(mlkem)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+}
+
+async fn wrap_check_is_validated(tx: &mut sqlx::PgConnection) -> bool {
+    sqlx::query_scalar(
+        "SELECT convalidated FROM pg_constraint WHERE conname = 'vault_members_wrap_is_whole'",
+    )
+    .fetch_one(tx)
+    .await
+    .unwrap()
+}
+
+async fn with_constraint_not_valid(tx: &mut sqlx::PgConnection) {
+    sqlx::query("ALTER TABLE vault_members DROP CONSTRAINT IF EXISTS vault_members_wrap_is_whole")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+}
+
+async fn restore_constraint_not_valid(tx: &mut sqlx::PgConnection) {
+    sqlx::query(
+        "ALTER TABLE vault_members ADD CONSTRAINT vault_members_wrap_is_whole
+         CHECK ((eph_pub_key IS NULL AND mlkem_ciphertext IS NULL)
+             OR (eph_pub_key IS NOT NULL AND mlkem_ciphertext IS NOT NULL)) NOT VALID",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+}
+
+/// The cleanup migration removes shares the client can never open, leaves every
+/// working wrap alone and validates the constraint. Rolled back afterwards.
+#[tokio::test]
+async fn migration_016_removes_unopenable_shares_and_validates_the_check() {
+    let server = test_app().await;
+    let (owner_id, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    let (good_id, _j) = member_at(&server, &jwt, vault_id, "developer").await;
+    let (no_kem, _, _) = verified_user_with_email(&server, "nokem").await;
+    let (no_eph, _, _) = verified_user_with_email(&server, "noeph").await;
+
+    let pool = test_pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    with_constraint_not_valid(&mut tx).await;
+    // Pre-hybrid share: an ephemeral key and no ML-KEM ciphertext.
+    insert_pre_hybrid_row(&mut tx, vault_id, no_kem, "viewer", Some("YmFy"), None).await;
+    // The converse, which no code path writes.
+    insert_pre_hybrid_row(&mut tx, vault_id, no_eph, "viewer", None, Some("Y")).await;
+    restore_constraint_not_valid(&mut tx).await;
+
+    assert!(
+        !wrap_check_is_validated(&mut tx).await,
+        "setup: the check should be NOT VALID"
+    );
+
+    sqlx::raw_sql(MIGRATION_016)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    let members: Vec<Uuid> =
+        sqlx::query_scalar("SELECT user_id FROM vault_members WHERE vault_id = $1")
+            .bind(vault_id)
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+    assert!(
+        members.contains(&owner_id),
+        "the owner's own copy was removed"
+    );
+    assert!(
+        members.contains(&good_id),
+        "a working hybrid share was removed"
+    );
+    assert!(!members.contains(&no_kem), "an unopenable share was kept");
+    assert!(!members.contains(&no_eph), "a half-wrap was kept");
+    assert!(
+        wrap_check_is_validated(&mut tx).await,
+        "the check was not validated"
+    );
+
+    // Running it again changes nothing.
+    sqlx::raw_sql(MIGRATION_016)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+}
+
+/// An owner row that violates the check stops the migration instead of being
+/// deleted.
+#[tokio::test]
+async fn migration_016_stops_rather_than_delete_an_owner_row() {
+    let server = test_app().await;
+    let (_owner, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    let (other, _, _) = verified_user_with_email(&server, "odd-owner").await;
+
+    let pool = test_pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    with_constraint_not_valid(&mut tx).await;
+    insert_pre_hybrid_row(&mut tx, vault_id, other, "owner", Some("YmFy"), None).await;
+    restore_constraint_not_valid(&mut tx).await;
+
+    let err = sqlx::raw_sql(MIGRATION_016)
+        .execute(&mut *tx)
+        .await
+        .expect_err("the migration should have stopped");
+    assert!(err.to_string().contains("owner row"), "{err}");
+    // Transaction is aborted; dropping it rolls the whole setup back.
+}
+
 /// A hybrid wrap — what you produce for somebody else from their public keys.
 fn wrap_for(user_id: Uuid) -> serde_json::Value {
     serde_json::json!({
