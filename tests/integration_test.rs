@@ -3690,6 +3690,118 @@ async fn blobs_with_badly_sized_fixed_fields_are_refused() {
     .assert_status(StatusCode::CREATED);
 }
 
+async fn db_blob_key(vault_id: Uuid, version_num: i32) -> String {
+    let config = test_config().await;
+    let db = sqlx::PgPool::connect(&config.database_url).await.unwrap();
+    sqlx::query_scalar(
+        "SELECT blob_key FROM vault_versions WHERE vault_id = $1 AND version_num = $2",
+    )
+    .bind(vault_id)
+    .bind(version_num)
+    .fetch_one(&db)
+    .await
+    .unwrap()
+}
+
+/// What the swap must refuse about a staged blob, and that a refusal repoints
+/// nothing.
+#[tokio::test]
+async fn a_rekey_swap_checks_the_blobs_it_is_told_to_use() {
+    let server = test_app().await;
+    let (owner_id, jwt) = verified_user(&server).await;
+    let vault_id = create_vault(&server, &jwt).await;
+    let other_vault = create_vault(&server, &jwt).await;
+    push_versions(&server, &jwt, vault_id, 2).await;
+    push_versions(&server, &jwt, other_vault, 1).await;
+
+    let before: Vec<String> = vec![
+        db_blob_key(vault_id, 1).await,
+        db_blob_key(vault_id, 2).await,
+    ];
+
+    let (k1, h1, s1) = stage(&server, &jwt, vault_id, 1).await;
+    let (k2, h2, s2) = stage(&server, &jwt, vault_id, 2).await;
+    let (foreign_key, foreign_hash, foreign_size) = stage(&server, &jwt, other_vault, 1).await;
+    let ver = |n: i32, key: &str, hash: &str, size: i32| {
+        serde_json::json!({
+            "version_num": n, "blob_key": key, "blob_hash": hash, "blob_size_bytes": size,
+        })
+    };
+    let missing_key = format!("vaults/{vault_id}/00000002/{}.enc", Uuid::new_v4());
+    let wrong_hash = blake3::hash(b"something else").to_hex().to_string();
+
+    let cases: Vec<(&str, Vec<serde_json::Value>, StatusCode)> = vec![
+        (
+            "another vault's object",
+            vec![
+                ver(1, &k1, &h1, s1),
+                ver(2, &foreign_key, &foreign_hash, foreign_size),
+            ],
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "another version's object",
+            vec![ver(1, &k2, &h2, s2), ver(2, &k2, &h2, s2)],
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "a path that is not a staged key",
+            vec![
+                ver(1, &k1, &h1, s1),
+                ver(2, "vaults/../etc/passwd", &h2, s2),
+            ],
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "an object that does not exist",
+            vec![ver(1, &k1, &h1, s1), ver(2, &missing_key, &h2, s2)],
+            StatusCode::CONFLICT,
+        ),
+        (
+            "a hash that is not the object's",
+            vec![ver(1, &k1, &h1, s1), ver(2, &k2, &wrong_hash, s2)],
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "a size that is not the object's",
+            vec![ver(1, &k1, &h1, s1), ver(2, &k2, &h2, s2 + 1)],
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "the blob the version already uses",
+            vec![ver(1, &k1, &h1, s1), ver(2, &before[1], &h2, s2)],
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ];
+
+    for (what, versions, expected) in cases {
+        let resp = bearer(
+            server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+            &jwt,
+        )
+        .json(&serde_json::json!({ "versions": versions, "members": [wrap_for(owner_id)] }))
+        .await;
+        assert_eq!(resp.status_code(), expected, "{what}: {}", resp.text());
+        // Nothing moved, not even the version whose blob was fine.
+        assert_eq!(db_blob_key(vault_id, 1).await, before[0], "{what}");
+        assert_eq!(db_blob_key(vault_id, 2).await, before[1], "{what}");
+    }
+
+    // The honest swap still goes through, and then points at the staged blobs.
+    bearer(
+        server.post(&format!("/api/v1/vaults/{vault_id}/rekey")),
+        &jwt,
+    )
+    .json(&serde_json::json!({
+        "versions": [ver(1, &k1, &h1, s1), ver(2, &k2, &h2, s2)],
+        "members": [wrap_for(owner_id)],
+    }))
+    .await
+    .assert_status_ok();
+    assert_eq!(db_blob_key(vault_id, 1).await, k1);
+    assert_eq!(db_blob_key(vault_id, 2).await, k2);
+}
+
 /// A hybrid wrap — what you produce for somebody else from their public keys.
 fn wrap_for(user_id: Uuid) -> serde_json::Value {
     serde_json::json!({

@@ -124,6 +124,23 @@ impl StorageService {
         )
     }
 
+    /// Whether `key` has the shape `blob_key` produces for this vault and
+    /// version: `vaults/{vault_id}/{version:08}/{uuid}.enc`, nothing else.
+    ///
+    /// The re-key swap quotes keys back from the client, so this is what stops a
+    /// version being pointed at another vault's object, another version's, or a
+    /// path that only looks like one.
+    pub fn is_blob_key_for(key: &str, vault_id: Uuid, version_num: i32) -> bool {
+        let prefix = format!("vaults/{}/{:08}/", vault_id, version_num);
+        key.strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".enc"))
+            .is_some_and(|stem| {
+                // Uuid::parse_str also accepts braces and bare hex, so compare
+                // the canonical form back to the input.
+                Uuid::parse_str(stem).is_ok_and(|u| u.to_string() == stem)
+            })
+    }
+
     pub async fn upload_blob(&self, key: &str, data: Bytes) -> Result<(), StorageError> {
         self.store
             .put(&ObjectPath::from(key), PutPayload::from_bytes(data))
@@ -172,5 +189,44 @@ impl From<StorageError> for crate::errors::AppError {
     fn from(e: StorageError) -> Self {
         tracing::error!(error = %e, "Object storage error");
         crate::errors::AppError::Internal(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_key_made_for_this_vault_and_version_is_accepted() {
+        let vault = Uuid::new_v4();
+        let key = StorageService::blob_key(vault, 3);
+        assert!(StorageService::is_blob_key_for(&key, vault, 3));
+
+        // Another version, another vault.
+        assert!(!StorageService::is_blob_key_for(&key, vault, 4));
+        assert!(!StorageService::is_blob_key_for(&key, Uuid::new_v4(), 3));
+        let other = StorageService::blob_key(Uuid::new_v4(), 3);
+        assert!(!StorageService::is_blob_key_for(&other, vault, 3));
+    }
+
+    #[test]
+    fn a_key_that_only_resembles_one_is_refused() {
+        let vault = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let ok = format!("vaults/{vault}/00000001/{id}.enc");
+        assert!(StorageService::is_blob_key_for(&ok, vault, 1));
+        for bad in [
+            format!("vaults/{vault}/00000001/{id}.enc/extra"),
+            format!("vaults/{vault}/00000001/../00000001/{id}.enc"),
+            format!("vaults/{vault}/00000001/{id}"),
+            format!("vaults/{vault}/00000001/not-a-uuid.enc"),
+            format!("vaults/{vault}/00000001/{}.enc", id.simple()),
+            format!("/vaults/{vault}/00000001/{id}.enc"),
+            format!("vaults/{vault}/1/{id}.enc"),
+            format!("vaults/{vault}/00000001/{id}.enc ").to_string(),
+            String::new(),
+        ] {
+            assert!(!StorageService::is_blob_key_for(&bad, vault, 1), "{bad:?}");
+        }
     }
 }

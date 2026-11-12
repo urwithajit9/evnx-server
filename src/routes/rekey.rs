@@ -225,6 +225,76 @@ fn check_removable(
     Ok(())
 }
 
+/// Check every staged blob a swap quotes, before anything is locked or written.
+///
+/// The swap takes `blob_key` and `blob_hash` from the client, and a staged key
+/// is only a string until something looks at the object. Each one must:
+///
+/// * have the shape `StorageService::blob_key` gives this vault and this
+///   version, so it cannot name another vault's or version's object;
+/// * be quoted once;
+/// * exist;
+/// * hold `blob_size_bytes` bytes whose ciphertext (everything after the nonce)
+///   hashes to the `blob_hash` sent, which is what a download will check.
+///
+/// Runs before the transaction: it reads storage, and no storage IO may happen
+/// under the vault lock (see `db::locks`). The objects it reads have fresh UUID
+/// keys that nothing else writes, so they cannot change between here and the
+/// commit.
+async fn verify_staged_blobs(
+    state: &AppState,
+    vault_id: Uuid,
+    versions: &[RekeyedVersion],
+) -> Result<(), AppError> {
+    use crate::services::storage::StorageService;
+
+    let mut seen = HashSet::new();
+    for v in versions {
+        if !StorageService::is_blob_key_for(&v.blob_key, vault_id, v.version_num) {
+            return Err(AppError::Validation(format!(
+                "version {}: blob_key is not a key staged for this vault and version",
+                v.version_num
+            )));
+        }
+        super::versions::check_blob_hash_format(&v.blob_hash)?;
+        if !seen.insert(v.blob_key.as_str()) {
+            return Err(AppError::Validation(format!(
+                "version {}: blob_key is used twice in `versions`",
+                v.version_num
+            )));
+        }
+    }
+
+    for v in versions {
+        if !state.storage.blob_exists(&v.blob_key).await? {
+            return Err(AppError::Conflict(format!(
+                "version {}: the staged blob is not in storage. Stage it again.",
+                v.version_num
+            )));
+        }
+        let object = state.storage.download_blob(&v.blob_key).await?;
+        let Some(ciphertext) = object.get(super::versions::BLOB_NONCE_LEN..) else {
+            return Err(AppError::Validation(format!(
+                "version {}: the staged blob is shorter than its nonce",
+                v.version_num
+            )));
+        };
+        if blake3::hash(ciphertext).to_hex().to_string() != v.blob_hash {
+            return Err(AppError::Validation(format!(
+                "version {}: blob_hash does not match the staged blob",
+                v.version_num
+            )));
+        }
+        if i64::from(v.blob_size_bytes) != object.len() as i64 {
+            return Err(AppError::Validation(format!(
+                "version {}: blob_size_bytes does not match the staged blob",
+                v.version_num
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Rotate a vault's key: repoint every version and re-wrap for every member.
 ///
 /// ⚠️ **Validated whole, then committed whole.** Every check below runs before
@@ -258,6 +328,11 @@ pub async fn rekey(
             .ok_or(AppError::NotFound)?;
         check_removable(access.role, &stored)?;
     }
+
+    // ── The staged blobs are what the client says they are ───────────────────
+    //
+    // Before the lock: this reads object storage.
+    verify_staged_blobs(&state, vault_id, &req.versions).await?;
 
     // ── Lock, then validate against what will still be there at commit ───────
     //
@@ -316,6 +391,24 @@ pub async fn rekey(
             "a re-key must cover every version at once. missing: {missing:?}, unknown: {unknown:?}. \
              A vault whose versions are split across two keys cannot be opened by anyone."
         )));
+    }
+
+    // ⚠️ A swap must change every blob. Quoting the object a version already
+    // points at would pass every check above and leave it under the old key
+    // while the members are re-wrapped to the new one.
+    let current_keys: std::collections::HashMap<i32, String> =
+        versions::blob_keys(&mut *tx, vault_id)
+            .await?
+            .into_iter()
+            .collect();
+    for v in &req.versions {
+        if current_keys.get(&v.version_num) == Some(&v.blob_key) {
+            return Err(AppError::Validation(format!(
+                "version {}: blob_key is the blob the version already uses; stage a \
+                 re-encrypted blob for it",
+                v.version_num
+            )));
+        }
     }
 
     // ── Every remaining member, exactly once ─────────────────────────────────
